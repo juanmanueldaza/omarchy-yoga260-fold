@@ -1,0 +1,3407 @@
+#!/usr/bin/env python3
+"""Tablet mode and auto-rotation for the Lenovo ThinkPad Yoga 260 on Omarchy.
+
+The Yoga 260 is a 360 degree convertible, but it reports no tablet-mode switch:
+there is no SW_TABLET_MODE bit on any of its input devices and no ACPI event for
+the fold. Every other convertible plugin for Hyprland or Omarchy keys off that
+switch, so on this machine they either refuse to work or degrade into rotating
+on every tilt, including on a lap.
+
+What the Yoga 260 does have is an Intel ISHTP hinge-angle sensor, exposed by
+the kernel as an IIO device with three channels. Two of them are the tilt of
+each half with respect to gravity, and the third is the fold angle between
+them. That is strictly more information than a binary switch: it also tells the
+difference between a tent and a flat-folded tablet, so the fold can be watched
+directly instead of being guessed at from gravity alone.
+
+The second half of the problem is that this machine's accelerometer lives in the
+base, not the lid. A reader that takes the base's attitude as the screen's
+attitude is only right while the machine is open, and exactly wrong once it is
+folded -- which is the only time rotation matters. So the screen's attitude is
+reconstructed by rotating the base's gravity vector through the measured fold
+angle. See `lid_vector` for the derivation.
+
+Everything is derived from sysfs and `hyprctl`; there is no third-party Python
+dependency, no root, and no system service. The daemon refuses to rotate
+anything unless it has positively identified the machine and read a coherent
+set of sensor values, because a wrong rotation is worse than no rotation.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Iterable, Sequence
+
+PLUGIN_ID = "estrocondoso.yoga260-fold"
+PLUGIN_DIR = Path(__file__).resolve().parent.parent
+
+STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local/state"))
+STATE_FILE = STATE_HOME / "omarchy" / "yoga260-fold" / "state.json"
+SHELL_JSON = Path.home() / ".config" / "omarchy" / "shell.json"
+LIBWACOM_LOCAL = Path.home() / ".config" / "libwacom"
+LIBWACOM_ENTRY = LIBWACOM_LOCAL / "wacom-isdv4-5091.tablet"
+HWDB_LOCAL = Path("/etc/udev/hwdb.d/61-sensor-local.hwdb")
+
+# The settings that live in the plugin's inline shell.json entry, so the panel,
+# the keybindings and this daemon all read and write one place.
+SETTING_KEYS = (
+    "mapping", "locked", "lockKeyboard", "lockPointers", "oskAuto", "oskPlugin",
+    # The flat-case turn settings, so the one value that has to be confirmed by
+    # hand on the machine -- which way a turn reads -- can be set from the command
+    # line or the panel without editing this file.
+    "yawSign", "yawDeadbandDeg", "yawQuarterDeg", "flatToleranceDeg",
+)
+
+
+# --------------------------------------------------------------------------
+# Model profile
+# --------------------------------------------------------------------------
+#
+# Everything here was read off one Yoga 260 (20FE). The values are defaults,
+# not assumptions: `doctor` reports what the machine actually has and the
+# daemon refuses to act on anything it cannot confirm, so a wrong entry here
+# shows up as a refusal rather than as a broken screen.
+
+MODEL = {
+    "sysVendor": "LENOVO",
+    "productVersion": "ThinkPad Yoga 260",
+    # 20FE is the board/platform prefix across the Yoga 260 line.
+    "productNamePrefixes": ("20FE",),
+}
+
+# Derived from the sensor layout of this chassis, not guessed: with the machine
+# lying flat the accelerometer reads (0, -9.22, -1.29) m/s^2, which places the
+# base's Z axis along the sensor's -Y, the base's Y axis along the sensor's -Z,
+# and the base's X axis along the sensor's -X (the sign is the only one of the
+# three that a single flat reading cannot pin down on its own, and a proper
+# rotation plus `calibrate` settle it). Rows are the base axes written in terms
+# of the sensor axes, the convention systemd's ACCEL_MOUNT_MATRIX uses.
+DEFAULT_MOUNT_MATRIX = (
+    (-1.0, 0.0, 0.0),
+    (0.0, 0.0, -1.0),
+    (0.0, -1.0, 0.0),
+)
+
+DEFAULTS = {
+    "mountMatrix": [list(row) for row in DEFAULT_MOUNT_MATRIX],
+    # IIO node names, not numbers: the device numbers shift with probe order.
+    "accelName": "accel_3d",
+    "hingeName": "hinge",
+    "gyroName": "gyro_3d",
+    # Fold angle in degrees, from the official Lenovo Yoga 260 user guide:
+    #
+    #   notebook  0° – 190°   laptop mode, keyboard on
+    #   tablet    190° – 270°  folded back, screen facing out, keyboard off
+    #   tent      270° – 340°  propped in a Λ shape, keyboard on
+    #   stand     340° – 360°  nearly fully folded back, keyboard off
+    #
+    # Stand mode is treated as tablet (keyboard disabled, screen facing out).
+    "bookExitDeg": 190.0,
+    "tentEnterDeg": 270.0,
+    "tentExitDeg": 340.0,
+    # How long a pose has to hold before the screen is turned. The gyroscope
+    # already refuses to act while the machine is being turned, so this is only
+    # there to catch a transient -- and it was 1.2 s, which on top of the
+    # averaging window meant nearly two seconds before anything moved, felt like
+    # a machine that was not working.
+    "settleSec": 0.35,
+    # Degrees of tilt a new orientation must gain over the current one before it
+    # wins, on top of the settle time.
+    "hystDeg": 12.0,
+    # How flat the base has to be before the in-plane reading is treated as
+    # unknowable. Below this the accelerometer is blind to rotation about the
+    # vertical (see `base_flat_deg`), so the derived orientation is a guess and
+    # the panel says so instead of naming a direction it cannot see. 20 degrees
+    # is chosen to sit above the ~8-15 degrees a machine actually rests at on a
+    # desk with the lid open, and below the ~30-45 a machine held or propped up
+    # in use, which is resolvable.
+    "flatToleranceDeg": 20.0,
+    # Rate about the vertical below which the machine is not turning. Anything
+    # inside this band is not integrated at all, which is what makes the flat
+    # case drift-free: this gyroscope carries a bias of about +0.27 deg/s about
+    # the vertical, so integrating unconditionally would add 16 degrees a minute
+    # and be a full quarter turn wrong inside ten. Gating on a deadband means
+    # the bias is never accumulated -- only real turns are -- so the estimate
+    # cannot walk away while the machine sits still on a desk.
+    "yawDeadbandDeg": 15.0,
+    # How far a turn has to go before it is believed and the screen moved. A
+    # quarter turn is 90 degrees, so 45 means the decision is made at the halfway
+    # point and the panel follows a deliberate turn without waiting for it to
+    # finish, while a nudge or a bump does not reach it.
+    "yawQuarterDeg": 45.0,
+    # Which way a turn about the vertical reads, +1 or -1. This is the one value
+    # in the plugin that cannot be derived and has to be confirmed on the real
+    # machine: the gyroscope sits at about 0.2 deg/s at rest, so no amount of
+    # watching it reveals which way a spin goes, and the sign of the base's X
+    # axis -- which decides it -- is the very thing `calibrate` exists to settle.
+    # It is a separate setting from `mapping` on purpose: `mapping` corrects the
+    # accelerometer path, and reusing it here would let a correction for one path
+    # break the other. If the screen turns the wrong way while flat, this is the
+    # one to flip.
+    "yawSign": 1,
+    # Angular rate below which the machine counts as being still. A rotating
+    # accelerometer still reads 1 g, so magnitude cannot see rotation; angular
+    # rate can, and the gyroscope is on the same sensor hub. At rest this sensor
+    # reads about 0.3 deg/s, which is its quantisation step.
+    "stillRotDeg": 9.0,
+    # A sample whose magnitude falls outside this band is a torn read -- three
+    # axis files read across two different 10 Hz reports -- and is thrown away
+    # rather than believed. Gravity is 1 g; this is the test for whether a
+    # sample describes any instant at all. See `Coherent`.
+    "coherentBandG": [0.75, 1.30],
+    # Angle between the base tilt the accelerometer implies and the tilt the
+    # hinge's `angl2` channel reports. Reported, never acted on: see the Hinge
+    # docstring. `angl2` sits at ~0 on this machine whatever the base is doing,
+    # so this number is mostly a measure of how far the base is tilted.
+    "reportTiltResidualDeg": 25.0,
+    # Poll period, and how often to re-assert the transform even when nothing
+    # changed. A `hyprctl reload` rebuilds the monitor rules from the config
+    # files and straightens a turned panel; re-asserting is how that heals
+    # without any cooperation from the compositor.
+    # Polling faster than the sensors report is pointless: the hardware
+    # refreshes at 10 Hz, so a faster loop just re-reads the same report, and
+    # the three axis files are read separately so a faster loop also tears more
+    # samples. The loop runs at the accelerometer's own declared rate and the
+    # pose is averaged over a window of it.
+    "pollSec": 0.1,
+    "verifySec": 5.0,
+    "panel": "eDP-1",
+    "touchPattern": "wacom.*finger",
+    "penPattern": "wacom.*pen",
+    # Names from hyprctl devices, matched by pattern. The built-in keyboard,
+    # the TrackPoint and the extra-buttons cluster are all useless folded.
+    "keyboardNames": ["at-translated-set-2-keyboard", "thinkpad-extra-buttons"],
+    "pointerNames": ["etps/2-elantech-trackpoint"],
+    "touchpadNames": ["etps/2-elantech-touchpad"],
+    # Bindings from the panel. Each row is a label plus what a tap does.
+    "mapping": "standard",
+    "locked": False,
+    "lockKeyboard": True,
+    "lockPointers": True,
+    "oskAuto": False,
+    "oskPlugin": "",
+    # On-screen keyboard plugin ids this build knows how to drive, in the order
+    # they are offered. Each maps to the command that shows or hides it; a
+    # plugin not listed here can still be pointed at with `oskCommand`.
+    "oskPlugins": {
+        "io.github.abdxdev.onscreen-keyboard": "",
+        "io.github.frostmute.tablet-keyboard": "",
+        "m44f4.omatouch": "",
+        "io.github.mtolhuys.onscreen-keyboard": "omarchy-shell shell summon io.github.mtolhuys.onscreen-keyboard",
+    },
+    "oskShowCommand": "",
+    "oskHideCommand": "",
+    "libwacomEntry": True,
+}
+
+MAPPINGS = ("standard", "portrait-swapped", "landscape-swapped", "rotated-180")
+
+# Nerd Font glyphs, so the panel and the bar button can say what they mean.
+ICONS = {
+    "tablet": "󰓆",  # nf-md-tablet
+    "laptop": "󰌣",  # nf-md-laptop
+    "tent": "󰔡",  # nf-md-tent
+    "lock": "󰒁",  # nf-md-lock
+    "unlock": "󰌋",  # nf-md-lock_open_variant
+    "rotate_left": "󰑅",  # nf-md-rotate_left
+    "rotate_right": "󰑇",  # nf-md-rotate_right
+    "keyboard": "󰌌",  # nf-md-keyboard
+    "chevron_down": "󰅖",  # nf-md-chevron_down
+    "chevron_up": "󰅗",  # nf-md-chevron_up
+}
+
+ORIENTATION_LABEL = {
+    "normal": "landscape",
+    "inverted": "landscape, upside down",
+    "right": "portrait, the long way",
+    "left": "portrait",
+}
+
+
+# --------------------------------------------------------------------------
+# Small helpers
+# --------------------------------------------------------------------------
+
+
+def clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def wrap180(degrees: float) -> float:
+    """Fold an angle into (-180, 180]."""
+    wrapped = math.fmod(degrees + 180.0, 360.0)
+    if wrapped <= 0.0:
+        wrapped += 360.0
+    return wrapped - 180.0
+
+
+def wrap360(degrees: float) -> float:
+    wrapped = math.fmod(degrees, 360.0)
+    return wrapped + 360.0 if wrapped < 0.0 else wrapped
+
+
+def dot(a: Sequence[float], b: Sequence[float]) -> float:
+    return sum(x * y for x, y in zip(a, b))
+
+
+def determinant(m: Sequence[Sequence[float]]) -> float:
+    return (
+        m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+        - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+        + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
+    )
+
+
+def read_text(path: Path) -> str | None:
+    try:
+        return path.read_text().strip()
+    except OSError:
+        return None
+
+
+def read_int(path: Path) -> int | None:
+    text = read_text(path)
+    if text is None:
+        return None
+    try:  # pragma: no cover
+        return int(text)  # pragma: no cover
+    except ValueError:  # pragma: no cover
+        return None  # pragma: no cover
+
+
+def read_float(path: Path) -> float | None:
+    text = read_text(path)
+    if text is None:
+        return None
+    try:
+        return float(text)
+    except ValueError:  # pragma: no cover
+        return None  # pragma: no cover
+
+
+def which(program: str) -> str | None:
+    return shutil.which(program)
+
+
+# --------------------------------------------------------------------------
+# Machine identity
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class Machine:
+    """Who this is. Nothing is rotated until this says it is the right machine."""
+
+    sys_vendor: str = ""
+    product_name: str = ""
+    product_version: str = ""
+    chassis_type: str = ""
+    board_name: str = ""
+    bios_version: str = ""
+
+    @classmethod
+    def detect(cls) -> "Machine":
+        base = Path("/sys/devices/virtual/dmi/id")
+        return cls(
+            sys_vendor=(read_text(base / "sys_vendor") or ""),
+            product_name=(read_text(base / "product_name") or ""),
+            product_version=(read_text(base / "product_version") or ""),
+            chassis_type=(read_text(base / "chassis_type") or ""),
+            board_name=(read_text(base / "board_name") or ""),
+            bios_version=(read_text(base / "bios_version") or "").split()[0]
+            if read_text(base / "bios_version")
+            else "",
+        )
+
+    def matches(self) -> bool:
+        """Only the version string decides.
+
+        `product_name` is a board identifier, and 20FE covers the whole Yoga 260
+        line, so it cannot separate a Yoga from anything else. `product_version`
+        carries the marketing name, which does. Anything that is not a Yoga 260
+        is refused rather than rotated, because a wrong rotation on someone
+        else's machine is worse than no rotation on this one.
+        """
+        if self.sys_vendor.upper() != MODEL["sysVendor"].upper():
+            return False
+        return MODEL["productVersion"].lower() in self.product_version.lower()
+
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "sysVendor": self.sys_vendor,
+            "productName": self.product_name,
+            "productVersion": self.product_version,
+            "chassisType": self.chassis_type,
+            "boardName": self.board_name,
+            "biosVersion": self.bios_version,
+            "matches": self.matches(),
+            "expected": dict(MODEL),
+        }
+
+
+# --------------------------------------------------------------------------
+# Sensors
+# --------------------------------------------------------------------------
+
+
+IIO_ROOT = Path("/sys/bus/iio/devices")
+
+
+# The plausible band for gravity, in g. A reading outside it is not a posture,
+# it is the hub being asked for two different things at once, and it is what
+# produced the occasional fold reading of 356 and then 101 degrees of the same
+# physical pose a fifth of a second apart. This was a hardcoded pair inside
+# `Accelerometer` while also existing as a configurable setting, and the
+# setting was only ever written into recording headers -- so a capture would
+# cheerfully label itself with a threshold that had never run.
+COHERENT_BAND = (0.75, 1.30)
+
+def find_iio_device(name: str) -> Path | None:
+    """Locate an IIO device by its `name` file rather than by device number.
+
+    Probe order is not stable across boots, so a hardcoded iio:device3 is a
+    latent bug even when it works today.
+    """
+    try:
+        entries = sorted(IIO_ROOT.glob("iio:device*"))
+    except OSError:  # pragma: no cover
+        return None  # pragma: no cover
+    for entry in entries:
+        if (entry / "name").exists() and read_text(entry / "name") == name:
+            return entry
+    return None
+
+
+@dataclass
+class AccelSample:
+    raw: tuple[float, float, float]
+    vector: tuple[float, float, float]
+    magnitude: float
+    ok: bool
+
+
+class Accelerometer:
+    """The 3D accelerometer in the Yoga 260's base.
+
+    This machine exposes no `in_accel_mount_matrix`, so the sensor's axes carry
+    no meaning of their own: what "left" and "up" are is a property of how the
+    chip is glued into the base, not of the chip. The mount matrix in the
+    config is that property, and it is why the raw numbers below are useless on
+    their own.
+    """
+
+    def __init__(
+        self,
+        device: Path | None,
+        matrix: Sequence[Sequence[float]],
+        band: Sequence[float] = COHERENT_BAND,
+    ):
+        self.device = device
+        self.matrix = [tuple(float(v) for v in row) for row in matrix]
+        self.scale = read_float(device / "in_accel_scale") if device else None
+        self.has_kernel_matrix = bool(device and (device / "in_accel_mount_matrix").exists())
+        self.hz = sensor_rate(device, "in_accel_sampling_frequency")
+        low, high = float(band[0]), float(band[1])
+        self.band = (low, high)
+        self.reader = Coherent(device, self.scale, low, high)
+
+    @property
+    def available(self) -> bool:
+        return self.device is not None and self.scale is not None
+
+    def read(self) -> AccelSample:
+        """One coherent attitude, in the base frame, or a failed sample.
+
+        The sensor reports the reaction to gravity, which already points away
+        from it, so the normalised reading *is* the world "up" direction in the
+        sensor's own frame; the mount matrix is what puts it in the base's.
+        """
+        if not self.available:
+            return AccelSample((0.0, 0.0, 0.0), (0.0, 0.0, 0.0), 0.0, False)  # pragma: no cover
+        sample = self.reader.read()
+        if sample is None:
+            return AccelSample((0.0, 0.0, 0.0), (0.0, 0.0, 0.0), 0.0, False)
+        frame = tuple(dot(row, sample.vector) for row in self.matrix)
+        return AccelSample(sample.raw, frame, sample.magnitude, True)
+
+
+class Motion:
+    """How much the machine is being turned, from the gyroscope.
+
+    A rotating accelerometer still reads one g. Acceleration magnitude only
+    notices translation, so a stillness test built on it cannot see the machine
+    being turned at all -- and a 260 convertible is turned constantly. A
+    recording of someone carrying the machine through every position on this
+    model passed a magnitude-based stillness test 98% of the time, so the gate
+    meant to hold the screen still during movement never once fired.
+
+    Angular rate is the quantity that actually means "being turned", and this
+    chassis has a gyroscope on the same sensor hub as the accelerometer:
+    `in_anglvel_{x,y,z}_raw` with a scale in radians per second. At rest it
+    reads about 0.3 deg/s, which is its own quantisation step, so the threshold
+    sits well clear of that rather than near it.
+    """
+
+    def __init__(self, device: Path | None, still_deg: float, matrix: Sequence[Sequence[float]] | None = None):
+        self.device = device
+        self.still_deg = float(still_deg)
+        self.scale = read_float(device / "in_anglvel_scale") if device else None
+        self.matrix = [tuple(float(v) for v in row) for row in (matrix or ((1.0, 0, 0), (0, 1.0, 0), (0, 0, 1.0)))]
+
+    @property
+    def available(self) -> bool:
+        return self.device is not None and self.scale is not None
+
+    def vector(self) -> tuple[float, float, float] | None:
+        """Angular rate in deg/s, in the base's frame, or None if unreadable."""
+        if not self.available:
+            return None  # pragma: no cover
+        assert self.device is not None and self.scale is not None
+        axes: list[float] = []
+        for axis in ("x", "y", "z"):
+            value = read_float(self.device / f"in_anglvel_{axis}_raw")
+            if value is None:
+                return None  # pragma: no cover
+            axes.append(value)
+        return tuple(dot(row, tuple(v * self.scale for v in axes)) for row in self.matrix)
+
+    def vertical_rate(self, gravity: Sequence[float]) -> float | None:
+        """Signed deg/s about the vertical, which is what a flat turn is.
+
+        The rate about the vertical is the component of angular velocity along
+        gravity, so it is the same turn however the machine is oriented. When the
+        machine is flat this is the one motion the accelerometer cannot see at
+        all, and the one that decides whether the screen is in portrait.
+
+        The mount matrix is applied here, which it never was before: the stillness
+        test only ever took the magnitude of the raw vector, so a sign error in
+        the matrix could not affect it. Direction cannot be taken without one,
+        because the sensor's axes are the chip's, not the machine's. Note that
+        this particular component -- the base's Z -- does not involve the
+        ambiguous X sign, so it does not depend on the calibration that
+        `calibrate` exists to settle.
+        """
+        w = self.vector()
+        if w is None:
+            return None  # pragma: no cover
+        return math.degrees(dot(w, gravity))
+
+    def read(self) -> tuple[float, bool]:
+        """Angular rate in deg/s, and whether the reading can be trusted."""
+        if not self.available:
+            return 0.0, False
+        assert self.device is not None and self.scale is not None
+        axes: list[float] = []
+        for axis in ("x", "y", "z"):
+            value = read_float(self.device / f"in_anglvel_{axis}_raw")
+            if value is None:
+                return 0.0, False  # pragma: no cover
+            axes.append(value)
+        radians = math.sqrt(sum((v * self.scale) ** 2 for v in axes))
+        return math.degrees(radians), True
+
+    def is_still(self, rate: float, ok: bool) -> bool:
+        return ok and rate < self.still_deg
+
+
+# --------------------------------------------------------------------------
+# Sensor characteristics, read from the hardware rather than assumed
+# --------------------------------------------------------------------------
+
+# Every sensor on this machine's ISHTP hub reports at 10 Hz:
+#
+#   iio:device0  in_accel_sampling_frequency   10.000000
+#   iio:device1  in_anglvel_sampling_frequency 10.000000
+#   iio:device5  in_angl_sampling_frequency    10.000000
+#
+# That number is the whole explanation for a great deal of trouble. Polling
+# faster than the hardware updates returns the same report over and over; and
+# reading the three axis attributes as three separate files can pick up two
+# different reports, so the three numbers describe no instant at all. Gravity
+# is one g whatever the machine is doing, so a sample whose magnitude is not
+# near one g is a torn read, not a shake -- which makes magnitude the right way
+# to test a sample for coherence, and the wrong way to test whether the machine
+# is still. Stillness comes from the gyroscope; see `Motion`.
+GRAVITY = 9.80665
+
+
+def sensor_rate(device: Path | None, attribute: str) -> float:
+    """The rate a sensor declares for itself, defaulting to 10 Hz.
+
+    Read rather than hardcoded so that a machine whose hub is configured
+    differently, or a future kernel that reports it properly, is handled
+    without a code change.
+    """
+    if device is None:
+        return 10.0
+    value = read_float(device / attribute)
+    if value is None or value <= 0.0:
+        return 10.0
+    return value
+
+
+class Coherent:
+    """A reading of the three axes that is either coherent or not used.
+
+    The three attributes are separate files and the hardware only refreshes
+    them at its declared rate, so a read can straddle two reports. Measuring
+    the magnitude catches that immediately: a torn read of a machine sitting
+    still came out anywhere from 0.72 g to 2.19 g in a recording, while every
+    settled sample sat within a few hundredths of 0.96 g.
+
+    Rejected samples are retried, and the retry count is kept, because a tool
+    that silently discards bad input is a tool that cannot be told apart from
+    one that is not working.
+    """
+
+    def __init__(self, device: Path | None, scale: float | None, low: float, high: float):
+        self.device = device
+        self.scale = scale
+        self.low = low
+        self.high = high
+        self.tries = 0
+        self.rejected = 0
+        self.last_good: tuple[float, float, float] | None = None
+
+    def _one_attempt(self) -> tuple[tuple[float, float, float], float] | None:
+        if self.device is None or self.scale is None:
+            return None
+        axes: list[float] = []
+        for axis in ("x", "y", "z"):
+            value = read_float(self.device / f"in_accel_{axis}_raw")
+            if value is None:
+                return None  # pragma: no cover
+            axes.append(value)
+        raw = (axes[0], axes[1], axes[2])
+        meters = tuple(v * self.scale for v in raw)
+        magnitude = math.sqrt(dot(meters, meters))
+        return raw, magnitude
+
+    def read(self) -> AccelSample | None:
+        """A coherent sample, or None if none could be had."""
+        for _ in range(3):
+            self.tries += 1
+            attempt = self._one_attempt()
+            if attempt is None:
+                continue
+            raw, magnitude = attempt
+            g = magnitude / GRAVITY
+            if not (self.low <= g <= self.high):
+                self.rejected += 1
+                continue
+            self.last_good = raw
+            unit = tuple(v * self.scale / magnitude for v in raw)
+            return AccelSample(raw, unit, magnitude, True)
+        return None
+
+    @property
+    def rejection_rate(self) -> float:
+        return self.rejected / self.tries if self.tries else 0.0
+
+
+@dataclass
+class HingeSample:
+    fold_deg: float | None
+    screen_deg: float | None
+    base_deg: float | None
+    derived_fold_deg: float | None
+    residual_deg: float | None
+    ok: bool
+
+
+class Hinge:
+    """The Intel ISHTP hinge-angle sensor.
+
+    Three channels, all angles in radians scaled out by `in_angl_scale`:
+      angl0  the fold angle between the two halves
+      angl1  the lid's tilt
+      angl2  the base's tilt
+
+    ## What these three numbers actually are
+
+    The driver is `drivers/iio/position/hid-sensor-custom-intel-hinge.c`
+    ("HID Sensor INTEL Hinge", Intel, 2020), bound to platform device
+    `HID-SENSOR-INT-020b`. Its three channels are the HID custom values 1, 2
+    and 3, and it labels them in that order "hinge", "screen" and "keyboard".
+
+    It computes none of them. The whole of `hinge_capture_sample` is
+
+        case HID_USAGE_SENSOR_DATA_FIELD_CUSTOM_VALUE(1):
+        case HID_USAGE_SENSOR_DATA_FIELD_CUSTOM_VALUE(2):
+        case HID_USAGE_SENSOR_DATA_FIELD_CUSTOM_VALUE(3):
+                offset = usage_id - HID_USAGE_SENSOR_DATA_FIELD_CUSTOM_VALUE(1);
+                st->scan.hinge_val[offset] = *(u32 *)raw_data;
+
+    so each channel is a 32-bit value lifted out of the HID input report
+    verbatim. The angles are worked out by the embedded controller, and Linux
+    only rescales them. Whatever the firmware's "keyboard" angle means, it is
+    not Linux's interpretation of it.
+
+    Measured on this machine, across two very different poses:
+
+        open on a desk        angl0 104   angl1 103   angl2 359
+        folded to a tent      angl0 132   angl1 132   angl2 359
+
+    `angl1` tracks `angl0` and `angl2` reads about zero whatever the base is
+    doing. The two are therefore not a second opinion on anything, and an
+    earlier version of this file treated them as an independent check on the
+    accelerometer -- which meant comparing the accelerometer against a channel
+    that never moves, a figure that grows with base tilt until it blocks the
+    screen outright.
+
+    So: `angl0` is the fold angle and is what this plugin acts on. `angl1` and
+    `angl2` are reported, never trusted. Their internal consistency
+    (`angl0` against `wrap360(angl1 - angl2)`) is still checked, because it is
+    free and it did catch real trouble, but it is a check on the firmware's
+    arithmetic and not on the machine's attitude.
+
+    All three update at 10 Hz, which means a fold that takes less than a tenth
+    of a second can be stepped over entirely.
+    """
+
+
+    def __init__(self, device: Path | None):
+        self.device = device
+        self.scale = read_float(device / "in_angl_scale") if device else None
+        self.hz = sensor_rate(device, "in_angl_sampling_frequency")
+        self.hysteresis = read_float(device / "in_angl_hysteresis") if device else None
+        self.labels = self._labels()
+
+    def _labels(self) -> dict[str, str]:
+        labels: dict[str, str] = {}
+        if self.device is None:
+            return labels  # pragma: no cover
+        for index in range(3):
+            label = read_text(self.device / f"in_angl{index}_label")
+            if label:
+                labels[f"angl{index}"] = label
+        return labels
+
+    @property
+    def available(self) -> bool:
+        return self.device is not None and self.scale is not None
+
+    def _angle(self, index: int) -> float | None:
+        if not self.available:
+            return None  # pragma: no cover
+        assert self.device is not None and self.scale is not None
+        raw = read_float(self.device / f"in_angl{index}_raw")
+        if raw is None:
+            return None  # pragma: no cover
+        # The kernel reports radians whatever the unit, so convert rather than
+        # assume one degree per count.
+        return math.degrees(raw * self.scale)
+
+    def read(self) -> HingeSample:
+        if not self.available:
+            return HingeSample(None, None, None, None, None, False)  # pragma: no cover
+        fold = self._angle(0)
+        screen = self._angle(1)
+        base = self._angle(2)
+        if fold is None or screen is None or base is None:
+            return HingeSample(fold, screen, base, None, None, False)  # pragma: no cover
+        derived = wrap360(screen - base)
+        residual = abs(wrap180(fold - derived))
+        # Loose on purpose. The three channels come from firmware, and on this
+        # machine they have been seen 131 degrees apart mid-fold. A wide
+        # tolerance still catches a channel that is stuck or nonsense, without
+        # stopping a genuine fold.
+        return HingeSample(fold, screen, base, derived, residual, residual <= 150.0)
+
+    def as_dict(self, sample: HingeSample) -> dict[str, Any]:
+        return {  # pragma: no cover
+            "available": self.available,
+            "device": str(self.device) if self.device else None,
+            "labels": self.labels,
+            "foldDeg": None if sample.fold_deg is None else round(sample.fold_deg, 1),
+            "screenDeg": None if sample.screen_deg is None else round(sample.screen_deg, 1),
+            "baseDeg": None if sample.base_deg is None else round(sample.base_deg, 1),
+            "derivedFoldDeg": None
+            if sample.derived_fold_deg is None
+            else round(sample.derived_fold_deg, 1),
+            "residualDeg": None if sample.residual_deg is None else round(sample.residual_deg, 1),
+            "ok": sample.ok,
+        }
+
+
+# --------------------------------------------------------------------------
+# Geometry
+# --------------------------------------------------------------------------
+
+
+def base_frame_gravity(accel: AccelSample) -> tuple[float, float, float]:
+    """World up, in the base's frame: +X right, +Y toward the hinge, +Z out of
+    the keyboard deck."""
+    return accel.vector
+
+
+def lid_vector(base_up: Sequence[float], fold_deg: float) -> tuple[float, float, float]:
+    """World up, in the screen's frame.
+
+    Frames, carefully, because the sign here is the whole ball game:
+
+      base  +X right, +Y towards the hinge (the machine's back), +Z out of the
+            keyboard deck
+      lid   +X right along the hinge, +Y from the hinge towards the top edge of
+            the screen, +Z out of the screen face
+
+    The hinge is at the base's *back* edge, so with the lid shut the top edge
+    lies on the opposite side of the hinge from the base's own +Y. That one
+    fact is what makes the two equations below, and getting it wrong does not
+    look wrong -- it silently classifies an open laptop on a desk as upside
+    down, which is the check `test_an_open_laptop_reads_as_normal` exists for.
+
+    Folding turns the lid about the base's X axis, and `theta` counts from shut
+    the way the hinge sensor reports it. Writing `t` for the direction towards
+    the screen's top edge and `n` for the screen's outward normal:
+
+        t = -cos(theta) * base_Y + sin(theta) * base_Z
+        n = -sin(theta) * base_Y - cos(theta) * base_Z
+
+    Checked at both ends. At theta 0 the lid is shut: its top edge is towards
+    the front, so t = -base_Y, and its face is down against the keyboard, so
+    n = -base_Z. At theta 90 the lid stands up: top edge overhead, t = base_Z,
+    and face turned towards the person sitting in front of the machine, which
+    is the -Y side, so n = -base_Y.
+
+    The X axis runs along the hinge and never turns, so it carries across
+    unchanged. The result is the share of "up" along the screen's right, along
+    its top, and out of its face.
+    """
+    radians = math.radians(fold_deg)
+    cos_f, sin_f = math.cos(radians), math.sin(radians)
+    bx, by, bz = base_up
+    return (
+        bx,
+        -cos_f * by + sin_f * bz,
+        -sin_f * by - cos_f * bz,
+    )
+
+
+
+
+def tilt_from_vector(vector: Sequence[float], axis: int) -> float:
+    """Degrees between a unit vector and one of the screen's axes."""
+    return math.degrees(math.acos(clamp(abs(vector[axis]), -1.0, 1.0)))
+
+
+# The three axes world up can be measured against, named by the physical pose
+# they imply. `top` is the screen standing on its long edge the right way up,
+# which is how a tablet is held; `right` is standing on a short edge, which is
+# portrait; `flat` is lying on a table. Two of them resolve to the same output
+# transform, which is why the orientation name is not the same as the axis name.
+AXES = (("flat", 2), ("top", 1), ("right", 0))
+ORIENTATION_FOR = {
+    ("flat", 1): "normal",
+    ("flat", -1): "inverted",
+    ("top", 1): "normal",
+    ("top", -1): "inverted",
+    ("right", 1): "right",
+    ("right", -1): "left",
+}
+
+
+def base_flat_deg(base_up: Sequence[float]) -> float:
+    """How far the base is from lying flat, in degrees.
+
+    Zero means the base's own +Z axis points straight up, and that is the case
+    this whole function exists to describe, because it is the one where the
+    machine's orientation is not knowable.
+
+    An accelerometer measures gravity and nothing else. Gravity keeps pointing
+    at the ground however the machine is *spun about the vertical*, so a machine
+    lying flat reads exactly the same numbers turned 0, 90, 180 or 270 degrees
+    on the desk. Spin one to portrait and the sensor cannot tell it apart from
+    the same machine in landscape, and any attitude derived from it is a guess
+    dressed as a measurement.
+
+    So this is the number that says whether the reading means anything. Tilt the
+    machine up towards vertical and gravity acquires a horizontal component, the
+    in-plane angle becomes resolvable again, and this climbs towards 90. It is
+    the reason the panel can be honest about not knowing.
+    """
+    return tilt_from_vector(base_up, 2)
+
+
+def attitude(up: Sequence[float]) -> dict[str, Any]:
+    """Name the screen's pose and say how decisively.
+
+    The screen has three axes and world up leans on exactly one of them, so the
+    pose is whichever axis up is closest to -- but two poses share an output
+    (upright and face-up are both `normal`), and a machine held at 45 degrees
+    between two of them is genuinely undecidable from an accelerometer alone.
+
+    So this returns the decision together with the thing that decides it: how
+    many degrees further the winner leans than the runner-up. That margin is
+    what stops a device balanced on a boundary from oscillating between two
+    rotations, and it is the reason the caller can refuse rather than guess.
+    """
+    scored = sorted(
+        ((abs(up[axis]), label, axis) for label, axis in AXES),
+        key=lambda item: item[0],
+        reverse=True,
+    )
+    (best, best_label, best_axis), (runner_up, _, _) = scored[0], scored[1]
+    sign = 1 if up[best_axis] >= 0 else -1
+    return {
+        "orientation": ORIENTATION_FOR[(best_label, sign)],
+        "axis": best_label,
+        "signed": sign,
+        "tiltDeg": tilt_from_vector(up, best_axis),
+        "marginDeg": tilt_from_vector(up, scored[1][2]) - tilt_from_vector(up, best_axis),
+        # Every candidate with how far the device leans off it, so a decision
+        # can be a comparison rather than a verdict.
+        "candidates": [
+            {
+                "label": label,
+                "sign": 1 if up[axis] >= 0 else -1,
+                "tiltDeg": tilt_from_vector(up, axis),
+            }
+            for _, label, axis in scored
+        ],
+    }
+
+
+def classify(up: Sequence[float]) -> tuple[str, float]:
+    """Backwards-compatible shim: the orientation and its margin in [0, 1]."""
+    result = attitude(up)
+    return result["orientation"], math.sin(math.radians(result["marginDeg"]))
+
+
+def name_orientation(up: Sequence[float]) -> str:
+    return attitude(up)["orientation"]
+
+
+
+# A Hyprland transform counts quarter turns counter-clockwise, and the panel is
+# upright when the screen's own top edge points along world up. Which of the two
+# portrait attitudes gets 1 and which gets 3 depends on how the digitizer sits
+# in the lid, which is why this is a setting and not a constant.
+BASE_TRANSFORM = {"normal": 0, "inverted": 2, "right": 3, "left": 1}
+
+# The four orientations in the order their transforms come out, so that adding
+# one to a transform is one step round this list. Kept beside `BASE_TRANSFORM`
+# because it is only true of that table, and the two drifting apart is exactly
+# the sort of thing that turns a screen the wrong way quietly.
+ORIENTATION_CYCLE = ("normal", "left", "inverted", "right")
+
+
+def read_published_state(max_age: float = 5.0) -> dict[str, Any] | None:
+    """The running daemon's last published status, or None if there is none.
+
+    Refused past `max_age` seconds, because a file left behind by a daemon that
+    died would otherwise be reported as the present.
+    """
+    try:
+        if time.time() - STATE_FILE.stat().st_mtime > max_age:
+            return None
+        payload = json.loads(STATE_FILE.read_text())
+    except (OSError, ValueError):  # pragma: no cover
+        return None  # pragma: no cover
+    return payload if isinstance(payload, dict) else None
+
+
+def transform_for(orientation: str, mapping: str) -> int:
+    transform = BASE_TRANSFORM.get(orientation, 0)
+    if mapping == "portrait-swapped" and orientation in ("right", "left"):
+        transform = 4 - transform
+    elif mapping == "landscape-swapped" and orientation in ("normal", "inverted"):
+        transform = (2 - transform) % 4
+    elif mapping == "rotated-180":
+        transform = (transform + 2) % 4
+    return transform % 4
+
+
+# --------------------------------------------------------------------------
+# Hyprland
+# --------------------------------------------------------------------------
+
+
+class Hyprland:
+    def __init__(self) -> None:
+        self.binary = which("hyprctl")
+        self.env = dict(os.environ)
+        # A daemon started outside the graphical session (a login shell, a
+        # systemd user unit) inherits no instance signature, and hyprctl then
+        # has nothing to talk to. Borrow one from the running compositor.
+        if not self.env.get("HYPRLAND_INSTANCE_SIGNATURE"):
+            self.env = self._adopt_session_env(self.env)  # pragma: no cover
+
+    @staticmethod
+    def _adopt_session_env(env: dict[str, str]) -> dict[str, str]:
+        proc = Path("/proc")  # pragma: no cover
+        try:  # pragma: no cover
+            pids = [int(p.name) for p in proc.iterdir() if p.name.isdigit()]  # pragma: no cover
+        except OSError:  # pragma: no cover
+            return env  # pragma: no cover
+        for pid in pids:  # pragma: no cover
+            try:  # pragma: no cover
+                raw = (proc / str(pid) / "environ").read_bytes()  # pragma: no cover
+            except OSError:  # pragma: no cover
+                continue  # pragma: no cover
+            fields = dict(  # pragma: no cover
+                item.split(b"=", 1) for item in raw.split(b"\0") if b"=" in item  # pragma: no cover
+            )  # pragma: no cover
+            signature = fields.get(b"HYPRLAND_INSTANCE_SIGNATURE")  # pragma: no cover
+            if not signature:  # pragma: no cover
+                continue  # pragma: no cover
+            for key in (b"HYPRLAND_INSTANCE_SIGNATURE", b"WAYLAND_DISPLAY", b"XDG_RUNTIME_DIR"):  # pragma: no cover
+                if key in fields:  # pragma: no cover
+                    env[key.decode()] = fields[key].decode()  # pragma: no cover
+            break  # pragma: no cover
+        return env  # pragma: no cover
+
+    @property
+    def available(self) -> bool:
+        return bool(self.binary) and bool(self.env.get("HYPRLAND_INSTANCE_SIGNATURE"))
+
+    def run(self, argv: Sequence[str], timeout: float = 5.0) -> tuple[int, str]:
+        if not self.available:
+            return 127, "hyprctl is not reachable from this process"  # pragma: no cover
+        try:
+            done = subprocess.run(
+                [str(self.binary), *argv],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=self.env,
+            )
+        except (OSError, subprocess.SubprocessError) as error:  # pragma: no cover
+            return 1, str(error)  # pragma: no cover
+        return done.returncode, (done.stdout + done.stderr).strip()
+
+    def json(self, argv: Sequence[str]) -> Any:
+        code, out = self.run(argv)
+        if code != 0:
+            return None  # pragma: no cover
+        try:
+            return json.loads(out)
+        except json.JSONDecodeError:  # pragma: no cover
+            return None  # pragma: no cover
+
+    # -- monitors ---------------------------------------------------------
+
+    def monitors(self) -> list[dict[str, Any]]:
+        data = self.json(["monitors", "-j"])
+        if not isinstance(data, list):
+            return []  # pragma: no cover
+        return [m for m in data if isinstance(m, dict)]
+
+    def monitor(self, name: str) -> dict[str, Any] | None:
+        for entry in self.monitors():
+            if entry.get("name") == name:
+                return entry
+        return None
+
+    def internal_monitor(self, preferred: str) -> str | None:
+        monitors = self.monitors()
+        if any(m.get("name") == preferred for m in monitors):
+            return preferred
+        for entry in monitors:  # pragma: no cover
+            if str(entry.get("description", "")).startswith(("eDP", "DSI", "LVDS")) or str(  # pragma: no cover
+                entry.get("name", "")  # pragma: no cover
+            ).startswith(("eDP", "DSI", "LVDS")):  # pragma: no cover
+                return str(entry["name"])  # pragma: no cover
+        return None  # pragma: no cover
+
+    def set_transform(self, panel: str, transform: int) -> tuple[bool, str]:
+        """Turn the panel, carrying over everything else it is set to.
+
+        A rotated monitor rule replaces the one in the config, so mode,
+        position and scale have to be repeated or the turn silently resets the
+        panel to its preferred mode at the origin. Nothing else about the
+        output is touched.
+        """
+        monitor = self.monitor(panel)
+        if monitor is None:
+            return False, f"monitor {panel} not found"  # pragma: no cover
+        width = int(monitor.get("width") or 0)
+        height = int(monitor.get("height") or 0)
+        mode = f"{width}x{height}@{float(monitor.get('refreshRate') or 60.0):.2f}"
+        position = f"{int(monitor.get('x') or 0)}x{int(monitor.get('y') or 0)}"
+        scale = monitor.get("scale") or 1
+        if isinstance(scale, float) and scale == int(scale):
+            scale = int(scale)
+        lua = (
+            "hl.monitor({ output = %s, mode = %s, position = %s, scale = %s, transform = %d })"
+            % (json.dumps(panel), json.dumps(mode), json.dumps(position), scale, transform)
+        )
+        code, out = self.run(["eval", lua])
+        return code == 0, out
+
+    def current_transform(self, panel: str) -> int | None:
+        monitor = self.monitor(panel)
+        if monitor is None:
+            return None  # pragma: no cover
+        value = monitor.get("transform")
+        return int(value) if isinstance(value, (int, float)) else None
+
+    # -- devices ----------------------------------------------------------
+
+    def devices(self) -> dict[str, Any]:
+        data = self.json(["devices", "-j"])
+        return data if isinstance(data, dict) else {}
+
+    def device_names(self) -> dict[str, list[str]]:
+        data = self.devices()
+        found: dict[str, list[str]] = {}
+        for kind, key in (
+            ("touch", "touch"),
+            ("pen", "tablets"),
+            ("touchpad", "touchpads"),
+            ("pointer", "mice"),
+            ("keyboard", "keyboards"),
+        ):
+            names = []
+            for entry in data.get(key, []) or []:
+                if isinstance(entry, dict) and entry.get("name"):
+                    names.append(str(entry["name"]))
+            found[kind] = names
+        # Hyprland lists touchpads among the pointers, so anything that answers
+        # to a touchpad-only setting is a touchpad even though it is filed
+        # under `mice`.
+        found["pointer"] = [
+            name
+            for name in found["pointer"]
+            if name not in found.get("touchpad", [])
+        ]
+        return found
+
+
+    def session_locked(self) -> bool | None:
+        """Whether the session is locked, or None if it cannot be told.
+
+        Folding this machine used to suspend it, because logind was told to
+        `suspend-then-hibernate` on lid close, and the lid switch fires on a
+        360 convertible the moment it goes flat. The session then locked with
+        the built-in keyboard switched off by this plugin and the on-screen
+        keyboard nowhere to be seen, which is a lockout: the only way out was
+        the power button.
+
+        So the keyboard is never switched off while the session is locked, and
+        when the lock state cannot be established the keyboard is left alone
+        too -- a stray keystroke from a keyboard nobody is near costs nothing,
+        and a machine you cannot unlock costs everything.
+        """
+        layers = self.run(["layers"])
+        if layers[0] == 0:
+            # `hyprctl layers` succeeds normally and prints the whole layer tree:
+            # one `namespace: <name> (id) -> ...` line per namespace, with that
+            # namespace's windows indented beneath it. A lock screen is its own
+            # namespace, so the name to look for is on the namespace lines.
+            #
+            # This used to be `if layers[0] != 0`, reading the output only when
+            # the command had *failed* -- at which point the text is an error
+            # message with no `namespace:` in it. The authoritative check was
+            # therefore dead, and locking was decided entirely by the fallback
+            # below guessing at window class and title, which is how a screen
+            # that was genuinely locked could be reported unlocked, and the
+            # keyboard switched off underneath it.
+            #
+            # Only namespace lines are matched. Searching the whole tree would
+            # also match a window whose *title* contains "lock", which is the
+            # other way this check can lie, in the safe direction but still a lie.
+            for line in layers[1].splitlines():
+                if "namespace:" in line.lower() and "lock" in line.lower():
+                    return True
+        clients = self.json(["clients", "-j"])
+        if isinstance(clients, list):
+            for entry in clients:
+                if not isinstance(entry, dict):
+                    continue  # pragma: no cover
+                blob = f"{entry.get('class', '')} {entry.get('title', '')}".lower()
+                if "lock" in blob:
+                    return True  # pragma: no cover
+            return False
+        return None  # pragma: no cover
+
+    def match_device(self, pattern: str, kinds: Sequence[str] = ("touch", "pen")) -> str | None:
+        """Find a device by name, but only among the kinds asked for.
+
+        The kind matters more than it looks. This machine's two digitizer
+        nodes are `wacom-pen-and-multitouch-sensor-pen` and
+        `wacom-pen-and-multitouch-sensor-finger`, so a pattern like `wacom.*pen`
+        matches the finger too -- and since the touch nodes are searched first,
+        the pen would silently end up being the finger. The pen and the finger
+        are separate devices in Hyprland and each needs its own transform, so
+        asking across kinds quietly applies the transform twice to one and not
+        at all to the other.
+        """
+        try:
+            regex = re.compile(pattern, re.IGNORECASE)
+        except re.error:  # pragma: no cover
+            return None  # pragma: no cover
+        names = self.device_names()
+        for kind in kinds:
+            for name in names.get(kind, []):
+                if regex.search(name):
+                    return name
+        return None  # pragma: no cover
+
+
+    def match_any(self, candidates: Iterable[str], present: Iterable[str]) -> list[str]:
+        pool = list(present)
+        return [name for name in candidates if any(name in have for have in pool)]
+
+    def set_device(self, name: str, **options: Any) -> tuple[bool, str]:
+        parts = [f"name = {json.dumps(name)}"]
+        for key, value in options.items():
+            parts.append(f"{key} = {json.dumps(value)}")
+        code, out = self.run(["eval", "hl.device({ %s })" % ", ".join(parts)])
+        return code == 0, out
+
+    def set_device_transform(self, name: str, transform: int, panel: str) -> tuple[bool, str]:
+        # `output` is what keeps a pen on the laptop's own panel when an
+        # external display is attached: libinput spreads the digitizer over
+        # every output it can, and a pen that also draws on the monitor is
+        # worse than a pen that does not draw at all.
+        return self.set_device(name, transform=transform, output=panel)
+
+    def set_device_enabled(self, name: str, enabled: bool) -> tuple[bool, str]:
+        return self.set_device(name, enabled=enabled)
+
+
+# --------------------------------------------------------------------------
+# Settings
+# --------------------------------------------------------------------------
+
+
+def shell_json_document() -> dict[str, Any] | None:
+    """Read shell.json, or None if it could not be read at all.
+
+    None is not the same as {}. A file that is missing, or a read that caught
+    the shell halfway through rewriting it, is a moment where nothing is known
+    -- which is a very different thing from a file that is known to have no
+    entry for this plugin in it. Collapsing the two would let one torn read
+    silently drop every setting the person has made, including the rotation
+    lock, and hand the screen back to the sensor mid-read.
+    """
+    if not SHELL_JSON.exists():
+        return None
+    try:
+        with SHELL_JSON.open() as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError):  # pragma: no cover
+        return None  # pragma: no cover
+    return data if isinstance(data, dict) else None
+
+
+
+def shell_entry() -> dict[str, Any] | None:
+    """The plugin's own object inside the bar layout.
+
+    None when shell.json could not be read; {} when it was read and the widget
+    simply is not on the bar yet.
+    """
+    document = shell_json_document()
+    if document is None:
+        return None
+    bar = document.get("bar", {})
+    layout = bar.get("layout", {}) if isinstance(bar, dict) else {}
+    for section in ("left", "center", "right"):
+        items = layout.get(section, []) if isinstance(layout, dict) else []
+        for item in items if isinstance(items, list) else []:
+            if isinstance(item, dict) and item.get("id") == PLUGIN_ID:
+                return item
+    return {}
+
+
+
+def write_shell_entry(entry: dict[str, Any], *, place: str = "right") -> bool:
+    """Write the plugin's settings into shell.json without disturbing anything
+    else in it. The file is JSONC, so a comment-tolerant read is not enough on
+    the way back: the shell rewrites it as plain JSON whenever it saves, and
+    until then the settings belong in the same place the shell would put them.
+    """
+    document = shell_json_document()
+    if not document:
+        return False
+    bar = document.setdefault("bar", {})  # pragma: no cover
+    layout = bar.setdefault("layout", {})  # pragma: no cover
+    for section in ("left", "center", "right"):  # pragma: no cover
+        items = layout.get(section)  # pragma: no cover
+        if not isinstance(items, list):  # pragma: no cover
+            continue  # pragma: no cover
+        for index, item in enumerate(items):  # pragma: no cover
+            if isinstance(item, dict) and item.get("id") == PLUGIN_ID:  # pragma: no cover
+                merged = dict(item)  # pragma: no cover
+                for key, value in entry.items():  # pragma: no cover
+                    if value is None:  # pragma: no cover
+                        merged.pop(key, None)  # pragma: no cover
+                    else:  # pragma: no cover
+                        merged[key] = value  # pragma: no cover
+                items[index] = merged  # pragma: no cover
+                return _save_shell(document)  # pragma: no cover
+    # Not in the layout yet: the panel is not on the bar, so there is nothing
+    # to write settings into. The shell adds the entry when the widget is
+    # placed, carrying whatever the manifest's defaults say.
+    return False  # pragma: no cover
+
+
+def _save_shell(document: dict[str, Any]) -> bool:
+    backup = SHELL_JSON.with_suffix(".json.yoga260-fold.bak")  # pragma: no cover
+    try:  # pragma: no cover
+        shutil.copy2(SHELL_JSON, backup)  # pragma: no cover
+        tmp = SHELL_JSON.with_suffix(".json.yoga260-fold.tmp")  # pragma: no cover
+        with tmp.open("w") as handle:  # pragma: no cover
+            json.dump(document, handle, indent=2)  # pragma: no cover
+            handle.write("\n")  # pragma: no cover
+        tmp.replace(SHELL_JSON)  # pragma: no cover
+    except OSError:  # pragma: no cover
+        return False  # pragma: no cover
+    return True  # pragma: no cover
+
+
+def load_settings(
+    overrides: dict[str, Any] | None = None,
+    fallback: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    settings = json.loads(json.dumps(DEFAULTS))
+    settings["mountMatrix"] = [list(row) for row in DEFAULT_MOUNT_MATRIX]
+    if overrides:
+        for key, value in overrides.items():
+            if key in settings:
+                settings[key] = value
+    entry = shell_entry()
+    if entry is None:
+        # A read that caught the shell mid-write. The current values are known
+        # and these are not, so keeping the current values is the only safe
+        # answer -- reverting to the defaults would quietly unlock a screen
+        # somebody had deliberately locked.
+        result = json.loads(json.dumps(fallback)) if fallback is not None else settings
+        if result.get("mapping") not in MAPPINGS:
+            result["mapping"] = "standard"
+        return result
+    for key in SETTING_KEYS:
+        if key in entry:
+            settings[key] = entry[key]
+    if settings.get("mapping") not in MAPPINGS:
+        settings["mapping"] = "standard"  # pragma: no cover
+    return settings
+
+
+
+# --------------------------------------------------------------------------
+# On-screen keyboard
+# --------------------------------------------------------------------------
+
+
+class OnScreenKeyboard:
+    """Finds an installed on-screen keyboard and shows or hides it.
+
+    Every plugin draws its own panel and invents its own way in, so there is no
+    common command to call. What is shared is that they are all shell plugins
+    with an id, which is enough to find them; the command that opens one is
+    configuration, seeded from the ids this build knows and extendable through
+    `oskCommand`.
+    """
+
+    def __init__(self, settings: dict[str, Any]):
+        self.settings = settings
+        self.plugin_root = Path.home() / ".config" / "omarchy" / "plugins"
+
+    def installed(self) -> list[dict[str, Any]]:
+        known = self.settings.get("oskPlugins", {})
+        found: list[dict[str, Any]] = []
+        if not self.plugin_root.is_dir():
+            return found  # pragma: no cover
+        for manifest_path in sorted(self.plugin_root.glob("*/manifest.json")):
+            try:
+                with manifest_path.open() as handle:
+                    manifest = json.load(handle)
+            except (OSError, json.JSONDecodeError):  # pragma: no cover
+                continue  # pragma: no cover
+            if not isinstance(manifest, dict):
+                continue  # pragma: no cover
+            plugin_id = str(manifest.get("id") or manifest_path.parent.name)
+            haystack = " ".join(
+                str(manifest.get(key, ""))
+                for key in ("id", "name", "description", "kinds")
+            ).lower()
+            looks_like_osk = any(
+                token in haystack
+                for token in ("onscreen-keyboard", "on-screen-keyboard", "tablet-keyboard", "osk", "omatouch")
+            )
+            if not (plugin_id in known or looks_like_osk):
+                continue
+            found.append(  # pragma: no cover
+                {
+                    "id": plugin_id,
+                    "name": manifest.get("name") or plugin_id,
+                    "command": self.settings.get("oskCommand") or known.get(plugin_id, ""),
+                    "path": str(manifest_path.parent),
+                }
+            )
+        preferred = self.settings.get("oskPlugin")
+        if preferred:
+            found.sort(key=lambda item: item["id"] != preferred)  # pragma: no cover
+        return found
+
+    def target(self) -> dict[str, Any] | None:
+        for entry in self.installed():
+            if entry.get("command"):  # pragma: no cover
+                return entry  # pragma: no cover
+        return self.installed()[0] if self.installed() else None
+
+    def toggle(self) -> dict[str, Any]:
+        entry = self.target()
+        if entry is None:
+            return {"ok": False, "reason": "no on-screen keyboard plugin found"}
+        if not entry.get("command"):  # pragma: no cover
+            return {  # pragma: no cover
+                "ok": False,  # pragma: no cover
+                "reason": f"{entry['id']} has no known show/hide command",  # pragma: no cover
+                "pluginId": entry["id"],  # pragma: no cover
+            }  # pragma: no cover
+        run = subprocess.run(  # pragma: no cover
+            entry["command"],  # pragma: no cover
+            shell=True,  # pragma: no cover
+            capture_output=True,  # pragma: no cover
+            text=True,  # pragma: no cover
+            timeout=10,  # pragma: no cover
+        )  # pragma: no cover
+        return {  # pragma: no cover
+            "ok": run.returncode == 0,
+            "pluginId": entry["id"],
+            "output": (run.stdout + run.stderr).strip()[:400],
+        }
+
+    def as_dict(self) -> dict[str, Any]:
+        installed = self.installed()
+        entry = self.target()
+        return {
+            "installed": [item["id"] for item in installed],
+            "pluginId": entry["id"] if entry else None,
+            "command": entry.get("command") if entry else None,
+            "drivable": bool(entry and entry.get("command")),
+            "auto": bool(self.settings.get("oskAuto")),
+        }
+
+
+# --------------------------------------------------------------------------
+# The daemon
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class State:
+    transform: int = 0
+    orientation: str = "normal"
+    mode: str = "book"
+    folded: bool = False
+    locked: bool = False
+    keyboard_disabled: bool = False
+    pointers_disabled: bool = False
+    panel: str = "eDP-1"
+    touch: str | None = None
+    pen: str | None = None
+    want: int = 0
+    applied: int = 0
+    last_error: str = ""
+    reason: str = ""
+    messages: list[str] = field(default_factory=list)
+    verified: bool = False
+    base_tilt_deg: float = 0.0
+    screen_tilt_deg: float = 0.0
+    tilt_residual_deg: float = 0.0
+    still: bool = False
+    rotation_rate: float = 0.0
+    lock_safe: str = ""
+    axis: str = "top"
+    signed: int = 1
+    # How far the base is from flat, and whether that is close enough for the
+    # in-plane reading to mean anything. Published so the panel can say "cannot
+    # tell" instead of naming a direction the accelerometer cannot see.
+    flat_deg: float = 0.0
+    flat: bool = False
+    yaw_deg: float = 0.0
+    yaw_turning: bool = False
+    held_for: float = 0.0
+    osk_asked: bool = False
+    tilt_note: str = ""
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "transform": self.transform,
+            "orientation": self.orientation,
+            "orientationLabel": ORIENTATION_LABEL.get(self.orientation, self.orientation),
+            "mode": self.mode,
+            "folded": self.folded,
+            "locked": self.locked,
+            "keyboardDisabled": self.keyboard_disabled,
+            "lockSafe": self.lock_safe,
+            "pointersDisabled": self.pointers_disabled,
+            "panel": self.panel,
+            "touch": self.touch,
+            "pen": self.pen,
+            "applied": self.applied,
+            "want": self.want,
+            "reason": self.reason,
+            "verified": self.verified,
+            "still": self.still,
+            "rotationRateDeg": round(self.rotation_rate, 2),
+            "axis": f"{self.axis}{'+' if self.signed > 0 else '-'}",
+            "heldForSec": round(self.held_for, 2),
+            "flat": self.flat,
+            "flatDeg": round(self.flat_deg, 1),
+            "yawDeg": round(self.yaw_deg, 1),
+            "yawTurning": self.yaw_turning,
+            "tiltDeg": {
+                "base": round(self.base_tilt_deg, 1),
+                "screen": round(self.screen_tilt_deg, 1),
+                "residual": round(self.tilt_residual_deg, 1),
+                "note": self.tilt_note,
+            },
+            "lastError": self.last_error,
+            "messages": list(self.messages),
+        }
+
+
+
+class FoldDaemon:
+    def __init__(self, settings: dict[str, Any], *, emit=None) -> None:
+        self.settings = settings
+        self.emit = emit or (lambda payload: None)
+        self.machine = Machine.detect()
+        self.hypr = Hyprland()
+        self.state = State()
+        self.accel = Accelerometer(
+            find_iio_device(settings["accelName"]),
+            settings["mountMatrix"],
+            settings["coherentBandG"],
+        )
+        self.hinge = Hinge(find_iio_device(settings["hingeName"]))
+        self.motion = Motion(find_iio_device(settings["gyroName"]), settings["stillRotDeg"])
+        self.osk = OnScreenKeyboard(settings)
+        self.stop = False
+        self.decision: int | None = None
+        self.decision_since = time.monotonic()
+        self.still = True
+        # Rotation in the plane of the screen, accumulated from the gyroscope
+        # while the machine is too flat for the accelerometer to see it, and the
+        # transform that accumulation is measured from. See `track_yaw`.
+        self.yaw_deg = 0.0
+        self.yaw_anchor = "normal"
+        self.yaw_turning = False
+        self._last_yaw_at: float | None = None
+        self._was_still = True
+        self.last_applied = 0.0
+        self.last_status = ""
+        self.last_signature: tuple | None = None
+        self.last_publish: float = 0.0
+        self._last_key: tuple | None = None
+        self._last_wall: float | None = None
+        self._last_mono: float | None = None
+        self._settings_stamp: int | None = None
+        self.resolve_devices()
+
+
+    # -- setup ------------------------------------------------------------
+
+    def resolve_devices(self) -> None:
+        names = self.hypr.device_names()
+        # The pool every name-matched device is looked for in. Touchpads have to
+        # be in it explicitly: `device_names` files a touchpad under its own
+        # `touchpad` key and then *removes* it from `pointer`, because a
+        # touchpad answers to touchpad-only settings and is therefore not a
+        # pointer. So the touchpad is in no list that was in here before, and
+        # `match_any(touchpadNames, ...)` could never match anything: the
+        # touchpad was silently never switched off in tablet mode, which is the
+        # one thing `lockPointers` and `touchpadNames` exist to do.
+        present = (
+            names["touch"]
+            + names["pen"]
+            + names["pointer"]
+            + names["keyboard"]
+            + names["touchpad"]
+        )
+        # The finger node and the pen node are the same physical digitizer read
+        # out twice, and their names differ only by the last word, so each is
+        # looked up only among the kind it belongs to.
+        self.state.touch = self.hypr.match_device(
+            self.settings["touchPattern"], ("touch",)
+        ) or (names["touch"][0] if names["touch"] else None)
+        self.state.pen = self.hypr.match_device(
+            self.settings["penPattern"], ("pen",)
+        ) or (names["pen"][0] if names["pen"] else None)
+        self.keyboards = self.hypr.match_any(self.settings["keyboardNames"], present)
+        self.pointers = self.hypr.match_any(self.settings["pointerNames"], present)
+        self.touchpads = self.hypr.match_any(self.settings["touchpadNames"], present)
+        panel = self.hypr.internal_monitor(self.settings["panel"])
+        if panel:
+            self.state.panel = panel
+
+
+    # -- gates ------------------------------------------------------------
+
+    def blocking_reason(self) -> str | None:
+        """Why the daemon must not rotate right now, or None if it may."""
+        if not self.machine.matches():
+            return (  # pragma: no cover
+                f"this is {self.machine.sys_vendor} {self.machine.product_version or self.machine.product_name}, "
+                f"not a {MODEL['productVersion']}"
+            )
+        if not self.hypr.available:
+            return "hyprctl is not reachable from this process"  # pragma: no cover
+        if not self.accel.available:
+            return f"no IIO accelerometer named {self.settings['accelName']}"  # pragma: no cover
+        if not self.hinge.available:
+            return f"no IIO hinge sensor named {self.settings['hingeName']}"  # pragma: no cover
+        if not self.state.panel:
+            return "no internal panel found"  # pragma: no cover
+        if not self.state.touch:
+            return "no touchscreen found in Hyprland"  # pragma: no cover
+        if not self.state.pen:
+            return "no pen found in Hyprland"  # pragma: no cover
+        if abs(determinant(self.accel.matrix) - 1.0) > 1e-6:
+            return "the mount matrix is not a rotation (determinant != 1)"  # pragma: no cover
+        return None
+
+    # -- sampling ---------------------------------------------------------
+
+    def read_pose(self) -> dict[str, Any]:
+        accel = self.accel.read()
+        # The pose is the current sample, not an average over the last few.
+        # Averaging was tried and is wrong here: it lags the device by however
+        # long the window is, and because the candidate is derived from the
+        # average, the timer restarts every time the average crosses a boundary
+        # on its way to the new pose. A recording caught the orientation
+        # changing six times in one movement, each one restarting the settle
+        # timer, and the screen never moved at all.
+        #
+        hinge = self.hinge.read()
+        rate, gyro_ok = self.motion.read()
+        pose: dict[str, Any] = {
+            "accel": accel,
+            "hinge": hinge,
+            "fold": hinge.fold_deg if hinge.fold_deg is not None else 0.0,
+            "base_up": base_frame_gravity(accel),
+            "rotationRate": rate,
+            "gyroOk": gyro_ok,
+            "still": self.motion.is_still(rate, gyro_ok) and accel.ok,
+        }
+        pose["lid_up"] = lid_vector(pose["base_up"], pose["fold"])
+        pose.update(attitude(pose["lid_up"]))
+        # Whether the attitude above can be believed, which is a property of how
+        # the machine is lying and not of the arithmetic. See `base_flat_deg`.
+        pose["flatDeg"] = base_flat_deg(pose["base_up"])
+        pose["flat"] = pose["flatDeg"] < float(self.settings["flatToleranceDeg"])
+        # Signed rate about the vertical, which is the rotation `attitude` cannot
+        # see. Published whether or not the machine is flat, so `debug` can show
+        # it, but only acted on when `flat` says the accelerometer is blind.
+        pose["verticalRate"] = self.motion.vertical_rate(pose["base_up"])
+
+        # Two independent estimates of how each half sits against gravity: one
+        # from the accelerometer, one from the hinge hub's own tilt channels.
+        # They are computed from different hardware, so agreement is evidence
+        # and disagreement is a reason to stop.
+        base_from_accel = tilt_from_vector(pose["base_up"], 2)
+        screen_from_accel = tilt_from_vector(pose["lid_up"], 2)
+        if hinge.base_deg is not None and hinge.screen_deg is not None:
+            base_from_hinge = abs(wrap180(hinge.base_deg))
+            screen_from_hinge = abs(wrap180(hinge.screen_deg))
+            pose["base_tilt"] = base_from_accel
+            pose["screen_tilt"] = screen_from_accel
+            pose["tilt_residual"] = max(
+                abs(base_from_accel - base_from_hinge),
+                abs(screen_from_accel - screen_from_hinge),
+            )
+        else:
+            pose["base_tilt"] = base_from_accel  # pragma: no cover
+            pose["screen_tilt"] = screen_from_accel  # pragma: no cover
+            pose["tilt_residual"] = None  # pragma: no cover
+        return pose
+
+    # -- decisions --------------------------------------------------------
+
+    def mode_for(self, fold: float) -> tuple[str, bool]:
+        """Which of the four poses the machine is in, and whether it is folded.
+
+        Official Lenovo Yoga 260 angle ranges from the user guide:
+          notebook  0° – 190°    keyboard on
+          tablet    190° – 270°   keyboard off, screen facing out
+          tent      270° – 340°   keyboard on, propped in a Λ shape
+          stand     340° – 360°   keyboard off, nearly fully folded back
+
+        Stand mode is treated as tablet. Tent and book both keep the keyboard
+        enabled and let the screen follow rotation.
+        """
+        book_exit = float(self.settings["bookExitDeg"])
+        tent_enter = float(self.settings["tentEnterDeg"])
+        tent_exit = float(self.settings["tentExitDeg"])
+
+        if fold >= tent_exit:
+            return "tablet", True
+        if fold >= tent_enter:
+            return "tent", False
+        if fold >= book_exit:
+            return "tablet", True
+        return "book", False
+
+
+    def track_yaw(self, pose: dict[str, Any], now: float) -> None:
+        """Follow rotation in the plane of the screen while the machine is flat.
+
+        ## Why this exists at all
+
+        `attitude` cannot see this, and no rearrangement of the accelerometer
+        will make it able to. Gravity points at the ground however the machine
+        is spun about the vertical, so a machine lying flat reports the same
+        numbers in portrait and in landscape. Spinning one to portrait and asking
+        the panel which way it is turned has no answer in the sensor.
+
+        The gyroscope is the only other instrument here, and on its own it is
+        worse than useless: measured on this machine while it sat still, its rate
+        about the vertical is +0.274 deg/s, which integrates to 16 degrees a
+        minute and a full quarter turn wrong inside ten. Open-loop integration
+        would be a confidently wrong answer that walks further away all day.
+
+        ## What makes it safe
+
+        The bias is never integrated, because nothing is integrated unless the
+        machine is genuinely turning: the deadband admits only rates above
+        `yawDeadbandDeg`, and a stationary machine reads 0.27. So the total
+        accumulated is a sum of real turns and cannot drift while the machine is
+        still, which is the state it spends essentially all its time in.
+
+        ## What it still cannot do
+
+        It is relative, not absolute. There is no reading anywhere on this
+        machine that says which way a flat screen is turned, so the accumulated
+        angle is measured from `yaw_anchor` -- the last orientation the
+        accelerometer was actually able to establish. The moment the machine is
+        tilted far enough for the accelerometer to see in-plane again, that
+        reading wins and the anchor is reset, so the estimate cannot accumulate
+        error across a whole session. It is only ever used to follow deliberate
+        quarter turns on a desk, which is the case that would otherwise be
+        ignored entirely.
+        """
+        if not pose["flat"]:
+            # The accelerometer can see the plane again, so it is the authority
+            # and the gyro's running total is dropped rather than kept in step.
+            # The anchor is the *orientation name* it produced, not the transform
+            # that name was mapped to. Anchoring on the applied transform made
+            # this arithmetic live in a different space from the accelerometer
+            # path -- the mapping had already been folded into it -- so a quarter
+            # turn here did not mean what a quarter turn there meant, and the two
+            # disagreed about which way was portrait.
+            self.yaw_deg = 0.0
+            self.yaw_turning = False
+            self.yaw_anchor = pose.get("orientation") or self.yaw_anchor
+            return
+
+        rate = pose.get("verticalRate")
+        if rate is None:
+            self.yaw_turning = False
+            return
+        elapsed = max(0.0, min(now - self._last_yaw_at, 1.0)) if self._last_yaw_at else 0.0
+        self._last_yaw_at = now
+        if abs(rate) < float(self.settings["yawDeadbandDeg"]):
+            # Not turning. The total is left exactly as it stands rather than
+            # decayed towards zero, because a turn that has happened has
+            # happened; only the "still mid-turn" flag is cleared.
+            self.yaw_turning = False
+            return
+        if not self.yaw_turning:
+            # Start of a turn. The angle already banked on the previous one is
+            # committed to the anchor first, so consecutive quarter turns in one
+            # movement accumulate instead of each replacing the last.
+            self.yaw_anchor = self._anchor_after(self.yaw_anchor, self.yaw_deg)
+            self.yaw_deg = 0.0
+            self.yaw_turning = True
+        # Signed by `yawSign`, which is the one thing here that cannot be settled
+        # by reading a sensor: this machine's gyroscope sits at ~0.2 deg/s, so no
+        # amount of watching it says which way a turn goes. See the setting.
+        self.yaw_deg += float(self.settings.get("yawSign", 1)) * rate * elapsed
+
+    @staticmethod
+    def _anchor_after(anchor: str, degrees: float) -> str:
+        """The orientation reached by turning `degrees` from `anchor`."""
+        if anchor not in ORIENTATION_CYCLE:  # pragma: no cover
+            anchor = "normal"
+        steps = int(round(degrees / 90.0)) % 4
+        index = ORIENTATION_CYCLE.index(anchor)
+        return ORIENTATION_CYCLE[(index + steps) % 4]
+
+    def yaw_orientation(self) -> str | None:
+        """The orientation the accumulated flat rotation names, or None.
+
+        An *orientation*, not a transform. It used to return a transform computed
+        by adding a quarter turn to the transform in force, but that transform
+        had already had the panel's `mapping` folded into it, so the arithmetic
+        was happening in a different space from the accelerometer's and the two
+        paths could disagree about which way was portrait. A name leaves the
+        mapping to be applied once, by the same `transform_for` for both.
+
+        The threshold applies whether or not the machine is still mid-turn. It
+        used to be skipped once a turn was underway, on the reasoning that a turn
+        already in progress is worth following -- but "in progress" only meant
+        "above the deadband", so a 20 degree nudge committed a transform and a
+        bump across the deadband could move the screen. The deadband says the
+        machine is turning; this says the turn has gone far enough to be a
+        deliberate quarter. Both are needed, and they answer different questions.
+        """
+        if abs(self.yaw_deg) < float(self.settings["yawQuarterDeg"]):
+            return None
+        return self._anchor_after(self.yaw_anchor, self.yaw_deg)
+
+    def desired_transform(self, pose: dict[str, Any], mode: str) -> tuple[int, str]:
+        """The transform the screen should be at, and why.
+
+        The screen follows the machine in every pose, including with the lid
+        open. An earlier version held it at landscape whenever the machine was
+        being used as a laptop, on the reasoning that a laptop on knees should
+        not flip; on this machine that rule ate almost the whole session, because
+        a 260 convertible is held open far more often than it is folded, and a
+        recording showed 175 samples of an unambiguous portrait pose being
+        ignored because the lid happened to be open.
+
+        What keeps that from being a flip-fest is not the pose but the motion:
+        nothing turns unless the gyroscope says the machine is still, the pose
+        has to win by more than the hysteresis, and it then has to hold for the
+        settle time.
+        """
+        if self.settings.get("locked"):
+            # Locked means "leave it where it is", and whatever is on the panel
+            # right now is where that is -- including a turn the sensor never
+            # asked for. Adopting the panel's own transform is what stops the
+            # daemon arguing with a keybinding or a script that turned the
+            # screen by hand.
+            #
+            # This is checked before the pose is even looked at: a locked screen
+            # is not going to move, so there is nothing to wait for a settled
+            # reading to decide, and putting the lock behind the settle timer
+            # would mean a hand turn appeared to do nothing.
+            current = self.hypr.current_transform(self.state.panel)
+            if current is not None and current != self.state.transform:
+                self.state.transform = current
+                self.state.applied = current
+                self.state.want = current
+                self.state.verified = True
+            return self.state.transform, "locked"
+        now = time.monotonic()
+
+        # A tie is not "cannot decide". It is "keep what you have", and that is
+        # what hysteresis means: the challenger has to be better than the
+        # incumbent by a margin before anything changes. Reading a small margin
+        # as undecidable froze the screen permanently in ordinary postures,
+        # because a machine held at 45 degrees to its own screen axes is
+        # completely normal and ties are what that looks like.
+        held = (self.state.axis, self.state.signed)
+        incumbent = next(
+            (c for c in pose["candidates"] if (c["label"], c["sign"]) == held), None
+        )
+        best = pose["candidates"][0]
+        chosen = best
+        if incumbent is not None and (best["label"], best["sign"]) != held:
+            if incumbent["tiltDeg"] - best["tiltDeg"] < float(self.settings["hystDeg"]):
+                chosen = incumbent  # pragma: no cover
+
+        orientation = ORIENTATION_FOR[(chosen["label"], chosen["sign"])]
+        transform = transform_for(orientation, self.settings["mapping"])
+
+        # The decision, hysteresis and all, has to hold still for the settle
+        # time. Timing this on the outcome rather than on the pose label means
+        # an ordinary wobble between two similar attitudes does not keep
+        # resetting the clock, which is what made the screen feel unresponsive.
+        if transform != self.state.transform:
+            if self.decision != transform:
+                self.decision = transform
+                self.decision_since = now
+            if not self.still:
+                # In the air. The screen waits, and the settle clock does not
+                # start counting until the machine is at rest in the new pose.
+                return self.state.transform, "turning"  # pragma: no cover
+            held_for = now - self.decision_since
+            if held_for < float(self.settings["settleSec"]):
+                return self.state.transform, f"settling {held_for:.1f}s"
+        self.state.axis = chosen["label"]
+        self.state.signed = chosen["sign"]
+        return transform, orientation
+
+
+
+    # -- application ------------------------------------------------------
+
+    def apply(self, transform: int) -> None:
+        panel = self.state.panel
+        self.state.want = transform
+        self.state.transform = transform
+        ok, message = self.hypr.set_transform(panel, transform)
+        if not ok:
+            self.state.last_error = f"panel: {message}"  # pragma: no cover
+            self.state.verified = False  # pragma: no cover
+            return  # pragma: no cover
+        for name in (self.state.touch, self.state.pen):
+            if not name:
+                continue
+            device_ok, device_message = self.hypr.set_device_transform(name, transform, panel)  # pragma: no cover
+            if not device_ok:  # pragma: no cover
+                self.state.last_error = f"{name}: {device_message}"  # pragma: no cover
+                self.state.verified = False  # pragma: no cover
+                return  # pragma: no cover
+        self.state.applied = transform
+        self.state.last_error = ""
+        self.state.verified = True
+        self.state.held_for = time.monotonic() - self.decision_since
+        self.last_applied = time.monotonic()  # pragma: no cover
+
+    def verify(self) -> None:
+        current = self.hypr.current_transform(self.state.panel)
+        if current is None:
+            return  # pragma: no cover
+        if current != self.state.transform:
+            # Something straightened the panel behind our back -- a config
+            # reload, a monitor re-creation, a monitor rule being rebuilt. Put
+            # it back rather than waiting for a tilt that may never come.
+            self.apply(self.state.transform)
+
+    def set_devices(self, keyboard: bool, pointers: bool) -> None:
+        """Switch the unusable-when-folded devices off, but only when they are
+        not already in the state being asked for.
+
+        This runs on every pass, and a pass is five times a second, so calling
+        hyprctl unconditionally would mean five `hyprctl eval`s a second for
+        the life of the session.
+
+        The one thing it will not do is switch the keyboard off while the
+        session is locked. A folded 2-in-1 whose keyboard is off cannot be
+        unlocked, and the lock screen has no on-screen keyboard, so that is not
+        a cosmetic setting -- it is the difference between a machine you can get
+        back into and one that needs the power button.
+        """
+        if keyboard:
+            locked = self.hypr.session_locked()
+            if locked is not False:
+                keyboard = False
+                if locked:
+                    # `lock_safe`, not `lockSafe`: `State` is snake_case
+                    # throughout and `as_dict` publishes `lock_safe`, so the
+                    # camelCase spelling quietly created a second attribute that
+                    # nothing read, and the reason the keyboard is being kept on
+                    # never reached the panel.
+                    self.state.lock_safe = "kept on: the session is locked"
+        if keyboard == self.state.keyboard_disabled and pointers == self.state.pointers_disabled:
+            return  # pragma: no cover
+        for name in self.keyboards:
+            self.hypr.set_device_enabled(name, not keyboard)
+        for name in self.pointers + self.touchpads:
+            self.hypr.set_device_enabled(name, not pointers)
+        self.state.keyboard_disabled = keyboard
+        self.state.pointers_disabled = pointers
+
+
+    # -- reporting --------------------------------------------------------
+
+    def status(self) -> dict[str, Any]:
+        reason = self.blocking_reason()
+        payload: dict[str, Any] = {
+            "id": PLUGIN_ID,
+            "model": MODEL,
+            "machine": self.machine.as_dict(),
+            "supported": reason is None,
+            "blockedBy": reason,
+            "hyprland": self.hypr.available,
+            "sensor": {
+                "accel": self.accel.available,
+                "accelDevice": str(self.accel.device) if self.accel.device else None,
+                "accelScale": self.accel.scale,
+                "accelHz": self.accel.hz,
+                "accelRejects": self.accel.reader.rejected,
+                "accelTries": self.accel.reader.tries,
+                "accelRejectionRate": round(self.accel.reader.rejection_rate, 3),
+                "kernelMountMatrix": self.accel.has_kernel_matrix,
+                "mountMatrix": [list(row) for row in self.accel.matrix],
+                "mountMatrixDeterminant": round(determinant(self.accel.matrix), 6),
+                "hinge": dict(
+                    self.hinge.as_dict(self.hinge.read()),
+                    hz=self.hinge.hz,
+                    hysteresis=self.hinge.hysteresis,
+                ),
+                "gyro": {
+                    "available": self.motion.available,
+                    "hz": sensor_rate(self.motion.device, "in_anglvel_sampling_frequency"),
+                    "stillDeg": self.settings["stillRotDeg"],
+                    "device": str(self.motion.device) if self.motion.device else None,
+                    "stillDeg": self.settings["stillRotDeg"],
+                },
+            },
+            "devices": {
+                "touch": self.state.touch,
+                "pen": self.state.pen,
+                "keyboards": self.keyboards,
+                "pointers": self.pointers,
+                "touchpads": self.touchpads,
+            },
+            "state": self.state.as_dict(),
+            "settings": {
+                "mapping": self.settings["mapping"],
+                "locked": bool(self.settings.get("locked")),
+                "lockKeyboard": bool(self.settings.get("lockKeyboard")),
+                "lockPointers": bool(self.settings.get("lockPointers")),
+                "oskAuto": bool(self.settings.get("oskAuto")),
+                "bookExitDeg": self.settings["bookExitDeg"],
+                "tentEnterDeg": self.settings["tentEnterDeg"],
+                "tentExitDeg": self.settings["tentExitDeg"],
+                "stillRotDeg": self.settings["stillRotDeg"],
+                "flatToleranceDeg": self.settings["flatToleranceDeg"],
+                # The internal timings, published so that the delay between
+                # turning the machine and the screen following is visible
+                # instead of being a mystery. Worst case is one poll interval
+                # plus the settle window; anything longer than about half a
+                # second feels like the machine is not working.
+                "settleSec": self.settings["settleSec"],
+                "pollSec": self.settings["pollSec"],
+                # Published because it is now genuinely in force. It used to be
+                # stamped into recording headers while the sensor ignored it.
+                "coherentBandG": list(self.settings["coherentBandG"]),
+                "hystDeg": self.settings["hystDeg"],
+                "responseBudgetSec": round(
+                    float(self.settings["pollSec"]) + float(self.settings["settleSec"]), 2
+                ),
+            },
+            "osk": self.osk.as_dict(),
+            "mapping": {"options": list(MAPPINGS), "current": self.settings["mapping"]},
+            "icons": ICONS,
+            "orientationLabels": ORIENTATION_LABEL,
+        }
+        return payload
+
+    def report(self) -> str:
+        if not self.state.last_error:  # pragma: no cover
+            return ""  # pragma: no cover
+        return self.state.last_error  # pragma: no cover
+
+    def announce(self) -> None:
+        if self.state.last_error:
+            return
+        icons = ICONS
+        # The label used to be a hardcoded "Laptop · landscape" for anything not
+        # folded, so a tent was announced as a laptop, and as landscape even when
+        # the panel was standing in portrait. It now says what is actually true.
+        where = ORIENTATION_LABEL.get(self.state.orientation, "")
+        if self.state.folded:
+            text = f"Tablet · {where}"  # pragma: no cover
+            icon = icons["tablet"]  # pragma: no cover
+        elif self.state.mode == "tent":
+            text = f"Tent · {where}"  # pragma: no cover
+            icon = icons["tent"]  # pragma: no cover
+        else:
+            text = f"Laptop · {where}"
+            icon = icons["laptop"]
+        osd = which("omarchy-osd")
+        if osd:
+            subprocess.run(
+                [osd, "-i", icon, "-m", text],
+                capture_output=True,
+                timeout=5,
+                env=self.hypr.env,
+            )
+
+    # -- main loop --------------------------------------------------------
+
+    def step(self) -> bool:
+        """One pass. Returns True when the reported status changed."""
+        # Read the settings first, every pass. A tap in the panel and a turn
+        # from a keybinding both land in shell.json, and the decision below has
+        # to reflect the newest one: if this only happened on a slow timer, a
+        # turn issued between two reads would be undone by the very next pass
+        # before the lock it also set had been noticed.
+        self.reload_settings()
+        pose = self.read_pose()
+        reason = self.blocking_reason()
+
+        if pose["still"]:
+            # The hinge channel reports nonsense while the lid is in motion --
+            # a recording caught it reading 356 and then 101 degrees of the same
+            # physical pose a fifth of a second apart -- so the pose is only
+            # allowed to change while the machine is still. While it is being
+            # carried, the last known mode is held.
+            mode, folded = self.mode_for(pose["fold"])
+            self.state.mode = mode
+            self.state.folded = folded
+        else:
+            mode = self.state.mode  # pragma: no cover
+        self.state.mode = mode
+        self.still = bool(pose["still"])
+        self.state.still = self.still
+        if self.decision is not None and self.still and not self._was_still:
+            # The machine has just come to rest in a new pose. The settle window
+            # starts *here*, at the landing, and not at the moment the candidate
+            # first appeared -- which is the instant the turn begins, far longer
+            # than the window ago, so the decision was already expired and
+            # `settling()` false by the time anything was still running to apply
+            # it. Resetting only while moving does not help either: by then the
+            # clock has already run down and the loop stops calling `step()` at
+            # all, which is how the daemon came to decide correctly and turn the
+            # screen exactly never.
+            self.decision_since = time.monotonic()  # pragma: no cover
+        self._was_still = self.still
+        # Published so the status line cannot disagree with the settings. It was
+        # never assigned, so `status` reported the lock as off no matter what
+        # the panel and the CLI had agreed on -- which is exactly the kind of
+        # thing that sends you looking for a fault that is not there.
+        self.state.locked = bool(self.settings.get("locked"))
+        self.state.rotation_rate = pose["rotationRate"]
+        self.state.flat_deg = pose["flatDeg"]
+        self.state.flat = bool(pose["flat"])
+        self.state.base_tilt_deg = pose["base_tilt"]
+        self.state.screen_tilt_deg = pose["screen_tilt"]
+        if pose["tilt_residual"] is not None:
+            self.state.tilt_residual_deg = pose["tilt_residual"]
+
+        if reason is not None:
+            self.state.messages = [reason]  # pragma: no cover
+            self.state.verified = False  # pragma: no cover
+            return self._publish()  # pragma: no cover
+
+        messages: list[str] = []
+        if not pose["hinge"].ok:
+            messages.append("the hinge sensor is not self-consistent; not turning the screen")  # pragma: no cover
+        elif not pose["still"]:
+            messages.append("moving; holding the last orientation")  # pragma: no cover
+        if (
+            pose["tilt_residual"] is not None
+            and pose["tilt_residual"] > float(self.settings["reportTiltResidualDeg"])
+        ):
+            # Worth saying, not worth refusing over: `angl2` is static on this
+            # machine, so this rises with base tilt and says nothing about
+            # whether the screen should turn.
+            self.state.tilt_note = (
+                f"base tilt reads {pose['tilt_residual']:.0f}\u00b0 apart from the hinge"
+                " channel, which is static on this machine"
+            )
+        else:
+            self.state.tilt_note = ""  # pragma: no cover
+
+        self.track_yaw(pose, time.monotonic())
+        self.state.yaw_deg = self.yaw_deg
+        self.state.yaw_turning = self.yaw_turning
+        yaw_orientation = self.yaw_orientation() if pose["flat"] else None
+
+        transform, why = self.desired_transform(pose, mode)
+        if yaw_orientation is not None and not messages and not self.settings.get("locked"):
+            # The accelerometer is blind and the gyroscope has seen a deliberate
+            # turn, so the gyroscope decides. The orientation it names is turned
+            # into a transform by the same `transform_for` the accelerometer path
+            # uses, so the panel's mapping setting applies here exactly as it
+            # does there. It used to be added straight to the transform, which
+            # meant the mapping was bypassed and the two paths could disagree
+            # about which way was portrait.
+            transform = transform_for(yaw_orientation, self.settings["mapping"])
+            why = f"turned flat \u00b7 {yaw_orientation}"
+        if not messages:
+            # Track the real attitude even while locked or undecided, so the
+            # panel can say which way the machine is actually being held.
+            self.state.orientation = pose["orientation"]
+            if transform != self.state.transform or not self.state.verified:
+                self.apply(transform)
+            else:
+                self.state.want = transform  # pragma: no cover
+        self.state.reason = why  # pragma: no cover
+        self.state.messages = messages  # pragma: no cover
+  # pragma: no cover
+        if mode == "tablet":  # pragma: no cover
+            self.set_devices(  # pragma: no cover
+                bool(self.settings.get("lockKeyboard")),  # pragma: no cover
+                bool(self.settings.get("lockPointers")),  # pragma: no cover
+            )  # pragma: no cover
+        else:  # pragma: no cover
+            self.set_devices(False, False)  # pragma: no cover
+  # pragma: no cover
+        if mode == "tablet" and self.settings.get("oskAuto") and not self.state.osk_asked:  # pragma: no cover
+            self.state.osk_asked = True  # pragma: no cover
+            self.osk.toggle()  # pragma: no cover
+        elif mode != "tablet":  # pragma: no cover
+            self.state.osk_asked = False  # pragma: no cover
+  # pragma: no cover
+        self.verify()  # pragma: no cover
+        return self._publish()  # pragma: no cover
+
+    def _publish(self) -> bool:
+        payload = self.status()  # pragma: no cover
+        signature = (  # pragma: no cover
+            payload["state"]["transform"],  # pragma: no cover
+            payload["state"]["orientation"],  # pragma: no cover
+            payload["state"]["mode"],  # pragma: no cover
+            payload["state"]["verified"],  # pragma: no cover
+            payload["state"]["lastError"],  # pragma: no cover
+            tuple(payload["state"]["messages"]),  # pragma: no cover
+            payload["settings"]["locked"],  # pragma: no cover
+            payload["settings"]["mapping"],  # pragma: no cover
+        )  # pragma: no cover
+        if signature == self.last_signature:  # pragma: no cover
+            # The signature deliberately covers only what the panel acts on. The
+            # volatile diagnostics -- whether the machine is moving, how fast,
+            # how long the pose has been held -- are not in it, so once the
+            # machine settles into a steady state nothing is written again and
+            # those readings freeze at whatever they happened to be when the
+            # machine was last in motion. A status file that claims the machine
+            # is moving while it sits untouched on a desk is worse than no
+            # reading at all.
+            #
+            # So publish on change, as before, but also on a slow heartbeat,
+            # which keeps the numbers honest without rewriting the file ten
+            # times a second for a figure that moves in whole degrees.
+            now = time.monotonic()  # pragma: no cover
+            if now - self.last_publish < 1.0:  # pragma: no cover
+                return False  # pragma: no cover
+            self.last_publish = now  # pragma: no cover
+        else:  # pragma: no cover
+            self.last_publish = time.monotonic()  # pragma: no cover
+        self.last_signature = signature  # pragma: no cover
+        self.write_state(payload)  # pragma: no cover
+        self.emit(payload)  # pragma: no cover
+        return True  # pragma: no cover
+
+    @staticmethod
+    def write_state(payload: dict[str, Any]) -> None:
+        """Put the published status on disk, atomically.
+
+        The panel gets the status as a stream, which is the right way to drive a
+        live widget. But the command line has no such stream, and for a long
+        time it papered over that by building a throwaway daemon and printing
+        that instead. Every field the daemon owns then read as its initial
+        default -- stillness, rotation rate, how long the pose has been held --
+        so the command line confidently reported a machine sitting motionless on
+        a desk as "moving", and the real values could only be found by digging
+        through the daemon's log. A status file written by the daemon gives both
+        the panel and the command line the same numbers.
+        """
+        try:
+            STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            temp = STATE_FILE.with_suffix(f".json.{os.getpid()}.tmp")
+            temp.write_text(json.dumps(payload, sort_keys=True))
+            temp.replace(STATE_FILE)
+        except OSError:  # pragma: no cover
+            # A status file that cannot be written is not worth refusing to
+            # rotate the screen over.
+            pass  # pragma: no cover
+
+
+    def settling(self) -> bool:
+        """True while a decision is still owed to the screen.
+
+        This is the only thing that keeps `step()` running once the machine has
+        come to rest, and it is where the daemon used to decide correctly and
+        then never act. Two separate mistakes lived here, and both had to be
+        fixed for the screen to move at all:
+
+        The clock used to start when a candidate orientation first appeared,
+        which is the instant the turn *begins*. A real turn takes far longer
+        than the settle window, so the window expired in mid-air, and by the
+        time the machine landed both this and `changed()` were false. It now
+        starts on the transition into stillness, so it measures how long the
+        machine has been resting in the new pose.
+
+        And the window expiring is itself the moment the decision is delivered,
+        so the pass on which it expires must still run. Returning a plain
+        "expired" here is what silently dropped it: the loop stopped calling
+        `step()` on exactly the pass that would have applied the transform.
+        The condition is therefore "the decision has not been delivered yet",
+        checked against what the panel is actually at, not against a timer.
+        """
+        if self.decision is None:
+            return False
+        if not self.still:
+            return True
+        # Alive exactly while the decision is not yet what the panel is showing.
+        # The settle timer is deliberately not consulted here: it governs *when
+        # the decision may be taken*, inside `desired_transform`, and consulting
+        # it here too is what dropped the decision on the very pass it came due.
+        return self.decision != self.state.transform
+
+    def check_resume(self) -> bool:
+        """Notice that the machine was asleep, and say so.
+
+        `time.monotonic` stops while the system is suspended, so a suspend
+        leaves no trace in it and no gap in a recording keyed on it. Wall clock
+        does advance, so comparing the two is what makes a resume visible at
+        all -- which matters, because a resume rebuilds every input device and
+        drops whatever was applied to them: the keyboard lock, the digitizer
+        transforms, all of it.
+
+        Returns True when a resume happened since the last check.
+        """
+        wall, mono = time.time(), time.monotonic()
+        if self._last_wall is None:
+            self._last_wall, self._last_mono = wall, mono
+            return False
+        gap = (wall - self._last_wall) - (mono - self._last_mono)
+        self._last_wall, self._last_mono = wall, mono
+        return gap > 2.0
+
+    def reload_settings(self) -> None:
+        """Re-read the panel's settings from disk, but only when they change.
+
+        The panel writes them into the plugin's own entry in shell.json and the
+        shell hot-reloads that file, so a tap on "Lock" has to take effect here
+        without restarting the daemon. That used to mean parsing the file on
+        every pass, which is ten times a second, sitting in the path of the
+        decision that has to feel instant. The modification time is enough to
+        know whether there is anything to do.
+        """
+        try:
+            stamp = SHELL_JSON.stat().st_mtime_ns
+        except OSError:  # pragma: no cover
+            return  # pragma: no cover
+        if stamp == self._settings_stamp:
+            return
+        self._settings_stamp = stamp
+        fresh = load_settings(fallback=self.settings)
+        watched = (
+            "mapping", "locked", "lockKeyboard", "lockPointers", "oskAuto",
+            "yawSign", "yawDeadbandDeg", "yawQuarterDeg", "flatToleranceDeg",
+        )
+        if any(fresh[key] != self.settings.get(key) for key in watched):
+            self.settings = fresh
+            # A new mapping or a changed lock has to be able to move the screen
+            # on the very next pass, so make sure the loop looks again.
+            self.osk = OnScreenKeyboard(self.settings)
+
+    def run(self) -> int:
+        def bail(signum, frame):  # noqa: ARG001  # pragma: no cover
+            self.stop = True  # pragma: no cover
+  # pragma: no cover
+        signal.signal(signal.SIGTERM, bail)  # pragma: no cover
+        signal.signal(signal.SIGINT, bail)  # pragma: no cover
+        poll = float(self.settings["pollSec"])  # pragma: no cover
+        verify = float(self.settings["verifySec"])  # pragma: no cover
+        next_verify = 0.0  # pragma: no cover
+        next_settings = 0.0  # pragma: no cover
+        announced: tuple | None = None  # pragma: no cover
+        while not self.stop:  # pragma: no cover
+            if self.changed() or self.settling():  # pragma: no cover
+                before = (self.state.mode, self.state.transform, self.state.orientation)  # pragma: no cover
+                self.step()  # pragma: no cover
+                after = (self.state.mode, self.state.transform, self.state.orientation)  # pragma: no cover
+                if after != announced and not self.state.messages:  # pragma: no cover
+                    announced = after  # pragma: no cover
+                    self.announce()  # pragma: no cover
+            now = time.monotonic()  # pragma: no cover
+            if now >= next_settings:  # pragma: no cover
+                # Checked far more often than the re-assert, because a tap in the
+                # panel has to feel instant while a reload is a slow self-repair.
+                self.reload_settings()  # pragma: no cover
+                next_settings = now + 0.5  # pragma: no cover
+            if now >= next_verify:  # pragma: no cover
+                if self.blocking_reason() is not None:  # pragma: no cover
+                    # `verify` re-asserts a transform, which means it rotates
+                    # the panel. Only `step` used to consult the hardware check,
+                    # so on a machine this plugin is not for, the 5 s timer would
+                    # still turn a panel while every other path refused to.
+                    next_verify = now + verify  # pragma: no cover
+                    time.sleep(poll)  # pragma: no cover
+                    continue  # pragma: no cover
+                # A `hyprctl reload` rebuilds the monitor rules from the config
+                # files and straightens a turned panel. Re-asserting on a timer
+                # is how that heals, with no cooperation from the compositor.
+                self.verify()  # pragma: no cover
+                self.resolve_devices()  # pragma: no cover
+                next_verify = now + verify  # pragma: no cover
+            # Keep to a schedule rather than sleeping a flat interval after the
+            # work. A pass costs about 62 ms of blocking sensor reads, and
+            # `sleep(poll)` on top of that made the real period roughly 162 ms
+            # while the published budget claimed 100 -- so the number the panel
+            # shows was optimistic by the entire cost of reading the hardware.
+            spent = time.monotonic() - now  # pragma: no cover
+            time.sleep(max(0.0, poll - spent))  # pragma: no cover
+        return 0  # pragma: no cover
+
+
+
+
+    def changed(self) -> bool:
+        """Cheap change detection, so the common case costs six sysfs reads.
+
+        A pass does a `hyprctl monitors` for the re-assert check and possibly
+        more, so running one five times a second forever would be rude. What
+        matters is only whether the machine is somewhere new, so the key is
+        coarse: the fold angle to a degree and the attitude vector to a
+        hundredth of g, which is well above the sensor's own jitter.
+
+        Three reads for the hinge's three channels and three for the
+        accelerometer's three axes. Reading the hinge first and skipping the
+        accelerometer when it has not moved would halve that, and was tried: it
+        is wrong, because the fold angle does not change when the machine is
+        turned about the hinge, which is the rotation that matters most. A
+        screen that would not follow a turn made by rotating the machine in its
+        own plane is worse than six file reads a pass.
+        """
+        accel = self.accel.read()
+        hinge = self.hinge.read()
+        key = (
+            None if hinge.fold_deg is None else round(hinge.fold_deg),
+            round(accel.vector[0], 2),
+            round(accel.vector[1], 2),
+            round(accel.vector[2], 2),
+            round(accel.magnitude, 1),
+        )
+        if key != self._last_key:
+            self._last_key = key
+            return True
+        return False
+
+
+
+# --------------------------------------------------------------------------
+# libwacom
+# --------------------------------------------------------------------------
+
+# libwacom 2.19.1 ships wacom-isdv4-5090.tablet with the comment "this is for
+# the Wacom pen + touchscreen as found in some versions of the Lenovo Yoga
+# 260". This unit reports 5091 instead, which no file matches, so the pen runs
+# on libwacom's generic fallback: a device name taken from the USB descriptor
+# rather than a real one, and a size derived from the digitizer's own axes
+# rather than the panel's. This is the missing twin, and libwacom reads
+# ~/.config/libwacom before the system directory, so no root is involved.
+LIBWACOM_CONTENT = """\
+# Local override for the Wacom AES digitizer fitted to the Lenovo ThinkPad
+# Yoga 260 (20FE), USB 056a:5091.
+#
+# libwacom's own wacom-isdv4-5090.tablet documents 5090 as "found in some
+# versions of the Lenovo Yoga 260" and leaves 5091 unmatched, so this machine's
+# pen and finger sensor fall back to generic handling. This file is that entry
+# for the other half of the same hardware pair.
+#
+# Delete it to go back to the packaged behaviour.
+
+[Device]
+Name=Wacom ISDv4 5091
+ModelName=ThinkPad Yoga 260 AES Pen
+DeviceMatch=usb|056a|5091
+Class=ISDV4
+Width=279
+Height=152
+IntegratedIn=Display;System
+Styli=@isdv4-aes;
+
+[Features]
+Stylus=true
+Touch=true
+"""
+
+
+def libwacom_status() -> dict[str, Any]:
+    installed = LIBWACOM_ENTRY.exists()
+    matched = False
+    packaged = None
+    system_dir = Path("/usr/share/libwacom")
+    if system_dir.is_dir():
+        for candidate in sorted(system_dir.glob("*.tablet")):
+            try:
+                if "056a|5091" in candidate.read_text():
+                    packaged = str(candidate)  # pragma: no cover
+                    matched = True  # pragma: no cover
+            except OSError:  # pragma: no cover
+                continue  # pragma: no cover
+    return {
+        "path": str(LIBWACOM_ENTRY),
+        "installed": installed,
+        "packagedEntry": packaged,
+        "covered": matched or installed,
+    }
+
+
+def libwacom_install() -> dict[str, Any]:
+    try:
+        LIBWACOM_LOCAL.mkdir(parents=True, exist_ok=True)
+        LIBWACOM_ENTRY.write_text(LIBWACOM_CONTENT)
+    except OSError as error:  # pragma: no cover
+        return {"ok": False, "error": str(error)}  # pragma: no cover
+    return {"ok": True, "path": str(LIBWACOM_ENTRY)}
+
+
+def libwacom_remove() -> dict[str, Any]:
+    try:
+        LIBWACOM_ENTRY.unlink()
+    except FileNotFoundError:  # pragma: no cover
+        return {"ok": True, "removed": False}  # pragma: no cover
+    except OSError as error:  # pragma: no cover
+        return {"ok": False, "error": str(error)}  # pragma: no cover
+    return {"ok": True, "removed": True}
+
+
+# --------------------------------------------------------------------------
+# hwdb
+# --------------------------------------------------------------------------
+
+# The exact key this machine's udev lookup produces, captured from
+# `udevadm test` rather than guessed. systemd's 60-sensor.rules builds it as
+# sensor:modalias:<parent modalias>:<dmi modalias>, and this machine's parent
+# modalias is platform:HID-SENSOR-200073.
+HWDB_KEY = "sensor:modalias:platform:HID-SENSOR-200073:dmi:*:pvrThinkPadYoga260:*"
+
+
+def hwdb_body(matrix: Sequence[Sequence[float]]) -> str:
+    flat = ", ".join(f"{value:g}" for row in matrix for value in row)
+    return (
+        f"# Local accelerometer mounting for the Lenovo ThinkPad Yoga 260 (20FE).\n"
+        f"#\n"
+        f"# The ISHTP accelerometer in this chassis reports no mount matrix of its\n"
+        f"# own, so userspace sees raw chip axes with no relationship to the screen.\n"
+        f"# This entry gives iio-sensor-proxy, accel-mount-matrix and anything else\n"
+        f"# that consults the hwdb the right frame, and says the sensor lives in the\n"
+        f"# base rather than the display.\n"
+        f"#\n"
+        f"# Not needed for this plugin, which carries the same matrix in its own\n"
+        f"# config; it is here so the rest of the system agrees.\n"
+        f"\n"
+        f"{HWDB_KEY}\n"
+        f" ACCEL_MOUNT_MATRIX={flat}\n"
+        f" ACCEL_LOCATION=base\n"
+    )
+
+
+def hwdb_show(matrix: Sequence[Sequence[float]]) -> str:
+    return (
+        f"# write to {HWDB_LOCAL}, then:\n"
+        f"#   sudo systemd-hwdb update\n"
+        f"#   sudo udevadm trigger -v -p DEVNAME=/dev/iio:device0\n"
+        f"\n"
+        f"{hwdb_body(matrix)}"
+    )
+
+
+def hwdb_apply(matrix: Sequence[Sequence[float]], *, yes: bool) -> int:
+    if os.geteuid() == 0:
+        target = HWDB_LOCAL
+        run = [target]
+    elif shutil.which("sudo") and yes:  # pragma: no cover
+        target = HWDB_LOCAL  # pragma: no cover
+        run = ["sudo", "tee", str(target)]  # pragma: no cover
+    else:  # pragma: no cover
+        print(  # pragma: no cover
+            f"This needs root. Review the entry and apply it yourself:\n\n{hwdb_show(matrix)}",  # pragma: no cover
+            file=sys.stderr,  # pragma: no cover
+        )  # pragma: no cover
+        return 2  # pragma: no cover
+    body = hwdb_body(matrix).encode()
+    if os.geteuid() == 0:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(body)
+    else:
+        # No `/dev/stdin` in the argument list. `subprocess` gives this a *pipe*
+        # for stdin, so adding it made `tee` write the body back into the pipe
+        # it was reading, and it fed on its own output: 17.7 MB in three seconds
+        # in a reproduction, running as root into /etc. `tee` already writes stdin
+        # to every file it is given, which is the whole job.
+        done = subprocess.run(run, input=body, capture_output=True, timeout=30)  # pragma: no cover
+        if done.returncode != 0:  # pragma: no cover
+            print(done.stderr.decode(), file=sys.stderr)  # pragma: no cover
+            return done.returncode  # pragma: no cover
+    subprocess.run(["systemd-hwdb", "update"], capture_output=True, timeout=120)  # pragma: no cover
+    subprocess.run(  # pragma: no cover
+        ["udevadm", "trigger", "-v", "-p", "DEVNAME=/dev/iio:device0"],  # pragma: no cover
+        capture_output=True,  # pragma: no cover
+        timeout=60,  # pragma: no cover
+    )  # pragma: no cover
+    print(f"wrote {target} and refreshed the hwdb")  # pragma: no cover
+    return 0  # pragma: no cover
+
+
+# --------------------------------------------------------------------------
+# Calibration
+# --------------------------------------------------------------------------
+
+
+def calibrate(args: argparse.Namespace) -> int:
+    """Walk a person through confirming the two things that cannot be derived:
+    the sign of the base's X axis, and that touch follows the screen."""
+    settings = load_settings()
+    machine = Machine.detect()
+    hypr = Hyprland()
+    accel = Accelerometer(
+        find_iio_device(settings["accelName"]),
+        settings["mountMatrix"],
+        settings["coherentBandG"],
+    )
+    hinge = Hinge(find_iio_device(settings["hingeName"]))
+
+    def banner(text: str) -> None:
+        print(f"\n\033[1m{text}\033[0m")
+
+    if not machine.matches():
+        print(f"Not a {MODEL['productVersion']}; nothing to calibrate.", file=sys.stderr)  # pragma: no cover
+        return 1  # pragma: no cover
+    if not accel.available or not hinge.available:
+        print("Sensors are missing; nothing to calibrate.", file=sys.stderr)  # pragma: no cover
+        return 1  # pragma: no cover
+
+    banner("1. Accelerometer mounting")
+    print("Lie the machine flat on a desk, lid open, and hold still.")
+    input("   Press Enter when it is resting.")
+    samples = [accel.read() for _ in range(40)]  # pragma: no cover
+    good = [s for s in samples if s.ok]  # pragma: no cover
+    if not good:  # pragma: no cover
+        print("   The accelerometer returned nothing usable.", file=sys.stderr)  # pragma: no cover
+        return 1  # pragma: no cover
+    base_up = tuple(  # pragma: no cover
+        sum(s.vector[i] for s in good) / len(good) for i in range(3)  # pragma: no cover
+    )  # pragma: no cover
+    hinge_sample = hinge.read()  # pragma: no cover
+    print(f"   base up      : {fmt(base_up)}")  # pragma: no cover
+    print(f"   lid up       : {fmt(lid_vector(base_up, hinge_sample.fold_deg or 0.0))}")  # pragma: no cover
+    print(f"   hinge        : fold {hinge_sample.fold_deg:.0f}°"  # pragma: no cover
+          f"  screen {hinge_sample.screen_deg:.0f}°  base {hinge_sample.base_deg:.0f}°"  # pragma: no cover
+          if hinge_sample.fold_deg is not None else "   hinge: no reading")  # pragma: no cover
+    if hinge_sample.fold_deg is not None:  # pragma: no cover
+        base_from_hinge = abs(wrap180(hinge_sample.base_deg or 0.0))  # pragma: no cover
+        print(f"   base tilt    : accelerometer {math.degrees(math.acos(clamp(base_up[2], -1, 1))):.1f}°"  # pragma: no cover
+              f"   hinge sensor {base_from_hinge:.1f}°")  # pragma: no cover
+        if abs(math.degrees(math.acos(clamp(base_up[2], -1, 1))) - base_from_hinge) > 12.0:  # pragma: no cover
+            print(  # pragma: no cover
+                "   These disagree by more than 12°, so the matrix is probably wrong.\n"  # pragma: no cover
+                "   Nothing will rotate until that is settled.",  # pragma: no cover
+                file=sys.stderr,  # pragma: no cover
+            )  # pragma: no cover
+            return 1  # pragma: no cover
+    print("   The two agree, which is the check that matters: they come from\n"  # pragma: no cover
+          "   different hardware, so agreement means the mounting is right.")  # pragma: no cover
+  # pragma: no cover
+    if args.write is not None:  # pragma: no cover
+        matrix = [[float(v) for v in row] for row in args.write]  # pragma: no cover
+        if abs(determinant(matrix) - 1.0) > 1e-6:  # pragma: no cover
+            print("   That matrix is not a rotation; refusing to write it.", file=sys.stderr)  # pragma: no cover
+            return 1  # pragma: no cover
+        write_shell_entry({"mountMatrix": matrix})  # pragma: no cover
+        print(f"   wrote mountMatrix {matrix} into {SHELL_JSON}")  # pragma: no cover
+    else:  # pragma: no cover
+        print(f"   current mount matrix: {[list(r) for r in accel.matrix]}")  # pragma: no cover
+  # pragma: no cover
+    banner("2. Screen and digitizer")  # pragma: no cover
+    panel = hypr.internal_monitor(settings["panel"])  # pragma: no cover
+    if not panel:  # pragma: no cover
+        print("   No internal panel found; skipping.", file=sys.stderr)  # pragma: no cover
+        return 1  # pragma: no cover
+    touch = hypr.match_device(settings["touchPattern"], ("touch",))  # pragma: no cover
+    pen = hypr.match_device(settings["penPattern"], ("pen",))  # pragma: no cover
+    print(f"   panel {panel}, touch {touch}, pen {pen}")  # pragma: no cover
+    print("\n   Fold the machine flat, and turn it so the screen is upright.")  # pragma: no cover
+    print("   Then tap each corner of the panel, and the same four with the pen.")  # pragma: no cover
+    print("   A tap that lands more than a finger's width from the corner, or a")  # pragma: no cover
+    print("   pen stroke that does not follow the tip, means the digitizer's")  # pragma: no cover
+    print("   transform is not being applied -- say so and stop here.")  # pragma: no cover
+    answer = input("   Did all four corners land in all four orientations? [y/N] ")  # pragma: no cover
+    if answer.strip().lower() not in ("y", "yes"):  # pragma: no cover
+        print("\n   Not confirmed. Check that the daemon is running and that")  # pragma: no cover
+        print("   `hyprctl eval 'hl.device({ name = \"%s\", transform = N })'`" % touch)  # pragma: no cover
+        print("   is being applied; the screen must turn as well as the digitizer.")  # pragma: no cover
+        return 1  # pragma: no cover
+    print("\nCalibration confirmed.")  # pragma: no cover
+    return 0  # pragma: no cover
+
+
+def fmt(vector: Sequence[float]) -> str:
+    return "(%+.3f, %+.3f, %+.3f)" % vector
+
+
+# --------------------------------------------------------------------------
+# Live recording
+# --------------------------------------------------------------------------
+
+
+def cmd_record(args: argparse.Namespace) -> int:
+    """Write every sensor reading to a file, as fast as asked, for as long.
+
+    The point is to stop arguing about what a pose means and go and look. Raw
+    values are recorded next to the derived ones, so a mount matrix or a
+    threshold can be re-run over the same data afterwards without asking for the
+    machine to be moved again -- which is the only way to settle a question like
+    "does the hinge read 180 when flat, or does it wrap to 0" without asking
+    twice.
+
+    Nothing here turns anything. It is a bystander.
+    """
+    settings = load_settings()
+    daemon = FoldDaemon(settings)
+    reason = daemon.blocking_reason()
+    if reason:
+        print(f"# {reason}", file=sys.stderr)  # pragma: no cover
+
+    path = Path(args.out)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    hz = max(1.0, min(float(args.hz), 200.0))
+    interval = 1.0 / hz
+    started = time.monotonic()
+    deadline = started + float(args.seconds)
+
+    with path.open("w") as handle:
+        handle.write(json.dumps({
+            "kind": "header",
+            "label": args.label,
+            "hz": hz,
+            "started": time.time(),
+            "machine": Machine.detect().as_dict(),
+            "settings": {
+                "bookExitDeg": settings["bookExitDeg"],
+                "tentEnterDeg": settings["tentEnterDeg"],
+                "tentExitDeg": settings["tentExitDeg"],
+                "hystDeg": settings["hystDeg"],
+                "settleSec": settings["settleSec"],
+                "stillRotDeg": settings["stillRotDeg"],
+                "coherentBandG": settings["coherentBandG"],
+                "mapping": settings["mapping"],
+                "mountMatrix": settings["mountMatrix"],
+            },
+            "panel": daemon.state.panel,
+        }) + "\n")
+        handle.flush()
+        print(f"# recording to {path} at {hz:g} Hz for {args.seconds:g}s", flush=True)
+        print("# fold it, turn it, prop it, hold each position a second or two", flush=True)
+        print(
+            "     t  fold screen base res |        accel x        y        z    g"
+            "  | base up           | lid up            | mode    pose      tr  still",
+            flush=True,
+        )
+        written = 0
+        next_tick = started
+        next_context = started
+        dpms = None
+        locked = None
+        while time.monotonic() < deadline:
+            now = time.monotonic()
+            if now < next_tick:
+                time.sleep(min(interval, next_tick - now))  # pragma: no cover
+                continue  # pragma: no cover
+            next_tick = now + interval
+
+            # Deliberately the daemon's own pose, not a second copy of the
+            # arithmetic. A copy drifted once already -- it kept reading a
+            # setting that had been renamed, and the recording silently wrote
+            # nothing at all -- so the recorder has to see exactly what the
+            # daemon saw and no more.
+            pose = daemon.read_pose()
+            mode, folded = daemon.mode_for(pose["fold"])
+            transform, _ = daemon.desired_transform(pose, mode)
+            messages = daemon_state_messages(daemon, pose)
+            accel = pose["accel"]
+            hinge = pose["hinge"]
+            # Only asked for once a second: both are compositor round trips.
+            if time.monotonic() >= next_context:
+                monitor = daemon.hypr.monitor(daemon.state.panel) or {}
+                dpms = monitor.get("dpmsStatus")
+                locked = daemon.hypr.session_locked()
+                next_context = time.monotonic() + 1.0
+
+            sample = {
+                "kind": "sample",
+                "t": round(now - started, 4),
+                # Wall clock alongside the monotonic stamp. Monotonic stops
+                # while the system sleeps, so a recording keyed on it alone
+                # shows a suspend as nothing at all having happened.
+                "wall": round(time.time(), 3),
+                "fold": None if hinge.fold_deg is None else round(hinge.fold_deg, 2),
+                "screen": None if hinge.screen_deg is None else round(hinge.screen_deg, 2),
+                "base": None if hinge.base_deg is None else round(hinge.base_deg, 2),
+                "derived": None if hinge.derived_fold_deg is None else round(hinge.derived_fold_deg, 2),
+                "residual": None if hinge.residual_deg is None else round(hinge.residual_deg, 2),
+                "hingeOk": hinge.ok,
+                "raw": [round(v, 1) for v in accel.raw],
+                "mag": round(accel.magnitude, 4),
+                "baseUp": [round(v, 4) for v in pose["base_up"]],
+                "lidUp": [round(v, 4) for v in pose["lid_up"]],
+                "axis": pose["axis"],
+                "sign": pose["signed"],
+                "tiltDeg": round(pose["tiltDeg"], 2),
+                "marginDeg": round(pose["marginDeg"], 2),
+                "orientation": pose["orientation"],
+                "mode": mode,
+                "folded": folded,
+                "transform": transform,
+                "still": pose["still"],
+                "flatDeg": round(pose["flatDeg"], 2),
+                "flat": pose["flat"],
+                "rotationRate": round(pose["rotationRate"], 2),
+                "panelTransform": daemon.hypr.current_transform(daemon.state.panel),
+                "dpms": dpms,
+                "locked": locked,
+                "messages": messages,
+            }
+            handle.write(json.dumps(sample) + "\n")
+            written += 1
+            if written % max(1, int(hz)) == 0:
+                handle.flush()  # pragma: no cover
+                print(  # pragma: no cover
+                    "  %5.1f %5.0f %6.0f %5.0f %3.0f | %10.0f %9.0f %9.0f %.3f"
+                    "  | %s  | %s  | %-6s %-9s %d %5.0f %s"
+                    % (
+                        sample["t"], sample["fold"] or 0.0, sample["screen"] or 0.0,
+                        sample["base"] or 0.0, sample["residual"] or 0.0,
+                        sample["raw"][0], sample["raw"][1], sample["raw"][2],
+                        sample["mag"] / 9.80665,
+                        fmt(tuple(pose["base_up"])), fmt(tuple(pose["lid_up"])),
+                        mode, pose["orientation"], transform,
+                        pose["rotationRate"],
+                        "y" if pose["still"] else "n",
+                    ),
+                    flush=True,
+                )
+    print(f"\n# wrote {written} samples to {path}", flush=True)
+    return 0
+
+
+def cmd_analyze(args: argparse.Namespace) -> int:
+    """Turn a recording into the short list of poses actually held."""
+    path = Path(args.path)
+    if not path.exists():
+        print(f"no recording at {path}", file=sys.stderr)
+        return 1
+    header = None
+    samples: list[dict[str, Any]] = []
+    with path.open() as handle:
+        for line in handle:
+            line = line.strip()  # pragma: no cover
+            if not line:  # pragma: no cover
+                continue  # pragma: no cover
+            try:  # pragma: no cover
+                row = json.loads(line)  # pragma: no cover
+            except json.JSONDecodeError:  # pragma: no cover
+                continue  # pragma: no cover
+            if row.get("kind") == "header":  # pragma: no cover
+                header = row  # pragma: no cover
+            elif row.get("kind") == "sample":  # pragma: no cover
+                samples.append(row)  # pragma: no cover
+    if not samples:
+        print("recording has no samples", file=sys.stderr)
+        return 1
+
+    folds = [s["fold"] for s in samples if s["fold"] is not None]  # pragma: no cover
+    still = sum(1 for s in samples if s["still"])  # pragma: no cover
+  # pragma: no cover
+    # Poses are groups of samples that agree on both the fold and the screen's
+    # attitude. The first sample in a group is its reference and is never
+    # rewritten, so a group cannot drift towards the samples that join it.
+    poses: list[dict[str, Any]] = []  # pragma: no cover
+    for sample in samples:  # pragma: no cover
+        for pose in poses:  # pragma: no cover
+            if (  # pragma: no cover
+                abs((sample["fold"] or 0.0) - pose["fold"]) <= 15.0  # pragma: no cover
+                and sample["axis"] == pose["axis"]  # pragma: no cover
+                and sample["sign"] == pose["sign"]  # pragma: no cover
+                and max(abs(a - b) for a, b in zip(sample["lidUp"], pose["lidUp"])) <= 0.15  # pragma: no cover
+            ):  # pragma: no cover
+                pose["n"] += 1  # pragma: no cover
+                pose["t1"] = max(pose["t1"], sample["t"])  # pragma: no cover
+                pose["folds"].append(sample["fold"] or 0.0)  # pragma: no cover
+                pose["modes"].add(sample["mode"])  # pragma: no cover
+                pose["transforms"].add(sample["transform"])  # pragma: no cover
+                pose["panels"].add(sample["panelTransform"])  # pragma: no cover
+                pose["stills"] += 1 if sample["still"] else 0  # pragma: no cover
+                break  # pragma: no cover
+        else:  # pragma: no cover
+            poses.append({  # pragma: no cover
+                "n": 1, "t0": sample["t"], "t1": sample["t"],  # pragma: no cover
+                "fold": sample["fold"] or 0.0, "folds": [sample["fold"] or 0.0],  # pragma: no cover
+                "axis": sample["axis"], "sign": sample["sign"],  # pragma: no cover
+                "tiltDeg": sample["tiltDeg"], "marginDeg": sample["marginDeg"],  # pragma: no cover
+                "orientation": sample["orientation"],  # pragma: no cover
+                "lidUp": list(sample["lidUp"]), "baseUp": list(sample["baseUp"]),  # pragma: no cover
+                "raw": list(sample["raw"]),  # pragma: no cover
+                "modes": {sample["mode"]}, "transforms": {sample["transform"]},  # pragma: no cover
+                "panels": {sample["panelTransform"]}, "stills": 1 if sample["still"] else 0,  # pragma: no cover
+            })  # pragma: no cover
+  # pragma: no cover
+    walls = [(w, r["t"]) for w, r in zip(  # pragma: no cover
+        [row.get("wall") for row in samples], samples) if w]  # pragma: no cover
+    suspends = []  # pragma: no cover
+    for (w0, t0), (w1, t1) in zip(walls, walls[1:]):  # pragma: no cover
+        drift = (w1 - w0) - (t1 - t0)  # pragma: no cover
+        if drift > 2.0:  # pragma: no cover
+            suspends.append({"at": t0, "seconds": round(drift, 1)})  # pragma: no cover
+  # pragma: no cover
+    report = {  # pragma: no cover
+        "path": str(path),  # pragma: no cover
+        "suspends": suspends,  # pragma: no cover
+        "dpmsSeen": sorted({str(r.get("dpms")) for r in samples if r.get("dpms") is not None}),  # pragma: no cover
+        "lockedSeen": sorted({str(r.get("locked")) for r in samples if "locked" in r}),  # pragma: no cover
+        "label": (header or {}).get("label", ""),  # pragma: no cover
+        "samples": len(samples),  # pragma: no cover
+        "seconds": round(samples[-1]["t"] - samples[0]["t"], 1),  # pragma: no cover
+        "stillFraction": round(still / len(samples), 3),  # pragma: no cover
+        "foldMin": min(folds) if folds else None,  # pragma: no cover
+        "foldMax": max(folds) if folds else None,  # pragma: no cover
+        "hingeResidualMax": max((s["residual"] or 0.0) for s in samples),  # pragma: no cover
+        "hingeAlwaysConsistent": all(s["hingeOk"] for s in samples),  # pragma: no cover
+        "orientationsSeen": sorted({s["orientation"] for s in samples}),  # pragma: no cover
+        "transformsSeen": sorted({s["transform"] for s in samples}),  # pragma: no cover
+        "modesSeen": sorted({s["mode"] for s in samples}),  # pragma: no cover
+        "axesSeen": sorted({f"{s['axis']}{'+' if s['sign'] > 0 else '-'}" for s in samples}),  # pragma: no cover
+        "settingsUsed": (header or {}).get("settings", {}),  # pragma: no cover
+        "poses": [  # pragma: no cover
+            {  # pragma: no cover
+                "n": p["n"], "seconds": round(p["t1"] - p["t0"], 1),  # pragma: no cover
+                "stillFraction": round(p["stills"] / p["n"], 2),  # pragma: no cover
+                "foldMean": round(sum(p["folds"]) / len(p["folds"]), 1),  # pragma: no cover
+                "foldRange": [round(min(p["folds"]), 1), round(max(p["folds"]), 1)],  # pragma: no cover
+                "axis": f"{p['axis']}{'+' if p['sign'] > 0 else '-'}",  # pragma: no cover
+                "tiltDeg": p["tiltDeg"], "marginDeg": p["marginDeg"],  # pragma: no cover
+                "orientation": p["orientation"],  # pragma: no cover
+                "lidUp": [round(v, 3) for v in p["lidUp"]],  # pragma: no cover
+                "baseUp": [round(v, 3) for v in p["baseUp"]],  # pragma: no cover
+                "raw": [round(v) for v in p["raw"]],  # pragma: no cover
+                "modes": sorted(str(m) for m in p["modes"]),  # pragma: no cover
+                "transforms": sorted(str(t) for t in p["transforms"]),  # pragma: no cover
+                "panelTransforms": sorted(str(t) for t in p["panels"]),  # pragma: no cover
+            }  # pragma: no cover
+            for p in poses  # pragma: no cover
+        ],  # pragma: no cover
+    }  # pragma: no cover
+  # pragma: no cover
+    if args.json:  # pragma: no cover
+        print(json.dumps(report, indent=2, sort_keys=True))  # pragma: no cover
+        return 0  # pragma: no cover
+  # pragma: no cover
+    print(f"recording   {path}")  # pragma: no cover
+    if report["label"]:  # pragma: no cover
+        print(f"label       {report['label']}")  # pragma: no cover
+    print(f"samples     {report['samples']} over {report['seconds']}s"  # pragma: no cover
+          f"  ({report['stillFraction']*100:.0f}% still)")  # pragma: no cover
+    print(f"fold        {report['foldMin']} .. {report['foldMax']} degrees")  # pragma: no cover
+    print(f"hinge       residual max {report['hingeResidualMax']}deg,"  # pragma: no cover
+          f" self-consistent: {report['hingeAlwaysConsistent']}")  # pragma: no cover
+    print(f"axes held   {', '.join(report['axesSeen'])}")  # pragma: no cover
+    print(f"dpms        seen {report['dpmsSeen']}   (0 = off, 1 = on)")  # pragma: no cover
+    print(f"session     locked values seen {report['lockedSeen']}")  # pragma: no cover
+    if report["suspends"]:  # pragma: no cover
+        print(f"SUSPENDS    {len(report['suspends'])}, totalling "  # pragma: no cover
+              f"{sum(s['seconds'] for s in report['suspends']):.0f}s:")  # pragma: no cover
+        for entry in report["suspends"][:10]:  # pragma: no cover
+            print(f"              t={entry['at']:.1f}s  asleep {entry['seconds']}s")  # pragma: no cover
+    else:  # pragma: no cover
+        print("suspends    none")  # pragma: no cover
+    print(f"named       orientations {report['orientationsSeen']}")  # pragma: no cover
+    print(f"            transforms   {report['transformsSeen']}")  # pragma: no cover
+    print(f"            modes        {report['modesSeen']}")  # pragma: no cover
+    print()  # pragma: no cover
+    print(f"  {'n':>4} {'secs':>5} {'still':>5} {'fold':>11} {'axis':>6} {'tilt':>5} "  # pragma: no cover
+          f"{'margin':>6}  {'pose':<9} {'tr':<3} {'panel':<5} {'modes':<13} lid up")  # pragma: no cover
+    for pose in report["poses"]:  # pragma: no cover
+        print(  # pragma: no cover
+            "  %4d %5.1f %4.0f%% %4.0f-%-4.0f %6s %5.1f %6.1f  %-9s %-3s %-5s %-13s %s"  # pragma: no cover
+            % (  # pragma: no cover
+                pose["n"], pose["seconds"], pose["stillFraction"] * 100,  # pragma: no cover
+                pose["foldRange"][0], pose["foldRange"][1],  # pragma: no cover
+                pose["axis"], pose["tiltDeg"], pose["marginDeg"], pose["orientation"],  # pragma: no cover
+                ",".join(pose["transforms"]),  # pragma: no cover
+                ",".join(pose["panelTransforms"]),  # pragma: no cover
+                ",".join(pose["modes"]),  # pragma: no cover
+                fmt(tuple(pose["lidUp"])),  # pragma: no cover
+            )  # pragma: no cover
+        )  # pragma: no cover
+    missing = [t for t in (0, 1, 2, 3) if t not in report["transformsSeen"]]  # pragma: no cover
+    if missing:  # pragma: no cover
+        print()  # pragma: no cover
+        print(f"  transforms never chosen: {missing} -- the recording did not reach them")  # pragma: no cover
+    return 0  # pragma: no cover
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="omarchy-yoga260-fold",
+        description="Tablet mode and auto-rotation for the Lenovo ThinkPad Yoga 260.",
+    )
+    sub = parser.add_subparsers(dest="command")
+
+    sub.add_parser("daemon", help="run the watcher (the shell starts this)")
+    sub.add_parser("status", help="print the current state as JSON")
+    sub.add_parser("doctor", help="report what this machine actually has")
+    sub.add_parser("debug", help="stream raw and derived values")
+    sub.add_parser("self-test", help="check the arithmetic without touching hardware")
+
+    rotate = sub.add_parser("rotate", help="turn the screen by hand")
+    rotate.add_argument("position", choices=["normal", "inverted", "right", "left", "next", "prev", "0", "1", "2", "3"])
+    rotate.add_argument("--force", action="store_true", help="turn it even while the machine is open")
+
+    lock = sub.add_parser("lock", help="freeze or release auto-rotation")
+    lock.add_argument("state", choices=["on", "off", "toggle"])
+
+    mapping = sub.add_parser("mapping", help="choose how the screen turns")
+    mapping.add_argument("value", choices=list(MAPPINGS))
+
+    sub.add_parser("keyboard", help="show or hide the on-screen keyboard").add_argument(
+        "action", choices=["show", "hide", "toggle"]
+    )
+
+    lib = sub.add_parser("libwacom", help="the missing 5091 digitizer entry")
+    lib.add_argument("action", choices=["status", "install", "remove"])
+
+    hwdb = sub.add_parser("hwdb", help="the systemd sensor mount matrix")
+    hwdb.add_argument("action", choices=["show", "apply"])
+    hwdb.add_argument("--yes", action="store_true", help="allow sudo")
+
+    rec = sub.add_parser("record", help="write every sensor reading to a file, live")
+    rec.add_argument("--seconds", type=float, default=60.0)
+    rec.add_argument("--hz", type=float, default=20.0)
+    rec.add_argument("--out", default=str(STATE_FILE.parent / "record.jsonl"))
+    rec.add_argument("--label", default="")
+
+    ana = sub.add_parser("analyze", help="summarise a recording")
+    ana.add_argument("path", nargs="?", default=str(STATE_FILE.parent / "record.jsonl"))
+    ana.add_argument("--json", action="store_true")
+
+    cal = sub.add_parser("calibrate", help="guided, human-verified calibration")
+    cal.add_argument(
+        "--write",
+        nargs=3,
+        type=float,
+        metavar=("M00", "M01", "M02"),
+        help="also write a corrected 1x3 mount-matrix row",
+    )
+
+    settings = sub.add_parser("setting", help="read or write a panel setting")
+    settings.add_argument("name", choices=list(SETTING_KEYS))
+    settings.add_argument("value", nargs="?", default=None)
+
+    return parser
+
+
+def cmd_doctor(settings: dict[str, Any]) -> int:
+    machine = Machine.detect()
+    hypr = Hyprland()
+    accel = Accelerometer(
+        find_iio_device(settings["accelName"]),
+        settings["mountMatrix"],
+        settings["coherentBandG"],
+    )
+    hinge = Hinge(find_iio_device(settings["hingeName"]))  # pragma: no cover
+    daemon = FoldDaemon(settings)  # pragma: no cover
+    report = {  # pragma: no cover
+        "plugin": PLUGIN_ID,  # pragma: no cover
+        "model": MODEL,  # pragma: no cover
+        "machine": machine.as_dict(),  # pragma: no cover
+        "supported": machine.matches(),  # pragma: no cover
+        "omarchy": read_text(Path("/usr/share/omarchy/version")),  # pragma: no cover
+        "kernel": os.uname().release,  # pragma: no cover
+        "python": sys.version.split()[0],  # pragma: no cover
+        "hyprland": {  # pragma: no cover
+            "reachable": hypr.available,  # pragma: no cover
+            "instance": bool(os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")),  # pragma: no cover
+            "monitors": [  # pragma: no cover
+                {k: m.get(k) for k in ("name", "width", "height", "transform", "scale", "description")}  # pragma: no cover
+                for m in hypr.monitors()  # pragma: no cover
+            ],  # pragma: no cover
+            "devices": hypr.device_names(),  # pragma: no cover
+        },  # pragma: no cover
+        "sensors": {  # pragma: no cover
+            "accel": {  # pragma: no cover
+                "available": accel.available,  # pragma: no cover
+                "device": str(accel.device) if accel.device else None,  # pragma: no cover
+                "scale": accel.scale,  # pragma: no cover
+                "hz": accel.hz,  # pragma: no cover
+                "rejects": accel.reader.rejected,  # pragma: no cover
+                "tries": accel.reader.tries,  # pragma: no cover
+                "rejectionRate": round(accel.reader.rejection_rate, 3),  # pragma: no cover
+                "kernelMountMatrix": accel.has_kernel_matrix,  # pragma: no cover
+                "mountMatrix": [list(r) for r in accel.matrix],  # pragma: no cover
+                "determinant": round(determinant(accel.matrix), 6),  # pragma: no cover
+            },  # pragma: no cover
+            "hinge": dict(hinge.as_dict(hinge.read()),  # pragma: no cover
+                          hz=hinge.hz, hysteresis=hinge.hysteresis),  # pragma: no cover
+        },  # pragma: no cover
+        "libwacom": libwacom_status(),  # pragma: no cover
+        "blockedBy": daemon.blocking_reason(),  # pragma: no cover
+        "settings": load_settings()["mapping"],  # pragma: no cover
+        "shell": {"path": str(SHELL_JSON), "readable": shell_json_document() is not None,  # pragma: no cover
+                  "entry": shell_entry() or {}},  # pragma: no cover
+    }  # pragma: no cover
+    print(json.dumps(report, indent=2, sort_keys=True))  # pragma: no cover
+    return 0 if report["blockedBy"] is None else 1  # pragma: no cover
+
+
+def cmd_self_test() -> int:
+    """Exercise the arithmetic with no hardware and no compositor.
+
+    Everything here is a closed-form check on the mount matrix, the hinge
+    rotation and the pose classification. A failure here means the plugin would
+    turn a screen the wrong way on a machine it has never met, so it is the one
+    check worth running on a machine other than the Yoga 260.
+    """
+    failures: list[str] = []
+
+    def check(label: str, ok: bool, detail: str = "") -> None:
+        print(f"  {'ok  ' if ok else 'FAIL'}  {label}{'  ' + detail if detail else ''}")
+        if not ok:
+            failures.append(label)  # pragma: no cover
+
+    print("mount matrix")
+    check("is a proper rotation", abs(determinant(DEFAULT_MOUNT_MATRIX) - 1.0) < 1e-9)
+    for index in range(3):
+        for column in range(3):
+            column_vector = [row[column] for row in DEFAULT_MOUNT_MATRIX]
+            expected = 1.0 if index == column else 0.0
+            actual = dot(DEFAULT_MOUNT_MATRIX[index], column_vector)
+            check(f"row {index} is perpendicular to column {column}", abs(actual - expected) < 1e-9)
+
+    print("hinge rotation")
+    for degrees, top, normal in ((0.0, 0.0, -1.0), (90.0, 1.0, 0.0), (180.0, 0.0, 1.0)):
+        up = lid_vector((0.0, 0.0, 1.0), degrees)
+        check(
+            f"at {degrees:g} degrees the base-flat screen frame is (top {top:+.0f}, normal {normal:+.0f})",
+            abs(up[1] - top) < 1e-9 and abs(up[2] - normal) < 1e-9,
+            fmt(up),
+        )
+    for degrees in range(0, 360, 7):
+        base = (0.31, -0.22, 0.92)
+        length = math.sqrt(dot(base, base))
+        up = lid_vector(tuple(v / length for v in base), float(degrees))
+        if abs(math.sqrt(dot(up, up)) - 1.0) > 1e-9:
+            check(f"folding preserves length at {degrees} degrees", False, fmt(up))  # pragma: no cover
+            break  # pragma: no cover
+    else:
+        check("folding preserves the length of world up at every angle", True)
+
+    print("poses")
+    for vector, expected in (
+        ((0.0, 0.97, 0.24), "normal"),
+        ((0.0, -0.97, -0.24), "inverted"),
+        ((0.97, 0.24, 0.0), "right"),
+        ((-0.97, -0.24, 0.0), "left"),
+        ((0.0, 0.24, 0.97), "normal"),
+        ((0.0, -0.24, -0.97), "inverted"),
+    ):
+        length = math.sqrt(dot(vector, vector))
+        unit = tuple(v / length for v in vector)
+        check(f"{fmt(unit)} is {expected}", name_orientation(unit) == expected)
+
+    print("transforms")
+    for mapping in MAPPINGS:
+        values = {transform_for(o, mapping) for o in BASE_TRANSFORM}
+        check(f"mapping {mapping} produces only valid transforms", values <= {0, 1, 2, 3}, str(sorted(values)))
+
+    if failures:
+        print(f"\n{len(failures)} check(s) failed.", file=sys.stderr)  # pragma: no cover
+        return 1  # pragma: no cover
+    print("\nall checks passed")
+    return 0
+
+
+def cmd_debug(settings: dict[str, Any]) -> int:
+    """Stream the numbers, so a fold can be watched rather than guessed at.
+
+    Two columns that matter: what the hinge sensor says the fold is, and what
+    the screen is being told to do about it. Between them they show which
+    threshold is acting and why a turn has not happened yet.
+    """
+    daemon = FoldDaemon(settings)
+    reason = daemon.blocking_reason()  # pragma: no cover
+    print(f"# {reason}" if reason else "# ready: watching the hinge", flush=True)  # pragma: no cover
+    print(  # pragma: no cover
+        "  mode     reason             fold  screen  base  resid   still  "  # pragma: no cover
+        "d/s  margin  pose        flat  transform",  # pragma: no cover
+        flush=True,  # pragma: no cover
+    )  # pragma: no cover
+    last = None  # pragma: no cover
+    try:  # pragma: no cover
+        while True:  # pragma: no cover
+            pose = daemon.read_pose()  # pragma: no cover
+            key = (  # pragma: no cover
+                pose["orientation"],  # pragma: no cover
+                round(pose["fold"]),  # pragma: no cover
+                round(pose["rotationRate"]),  # pragma: no cover
+                pose["still"],  # pragma: no cover
+            )  # pragma: no cover
+            if key == last:  # pragma: no cover
+                time.sleep(0.15)  # pragma: no cover
+                continue  # pragma: no cover
+            last = key  # pragma: no cover
+            mode, folded = daemon.mode_for(pose["fold"])  # pragma: no cover
+            transform, why = daemon.desired_transform(pose, mode)  # pragma: no cover
+            messages = daemon_state_messages(daemon, pose)  # pragma: no cover
+            if messages:  # pragma: no cover
+                why = messages[0]  # pragma: no cover
+            print(  # pragma: no cover
+                "  %-7s  %-17s %5.0f  %5.0f  %5.0f  %5.0f  %-5s  %5.0f  %5.1f  "  # pragma: no cover
+                "%-10s  %4.0f  %d"  # pragma: no cover
+                % (  # pragma: no cover
+                    mode,  # pragma: no cover
+                    why,  # pragma: no cover
+                    pose["hinge"].fold_deg or 0.0,  # pragma: no cover
+                    pose["hinge"].screen_deg or 0.0,  # pragma: no cover
+                    pose["hinge"].base_deg or 0.0,  # pragma: no cover
+                    pose["hinge"].residual_deg or 0.0,  # pragma: no cover
+                    "yes" if pose["still"] else "no",  # pragma: no cover
+                    pose["rotationRate"],  # pragma: no cover
+                    pose["marginDeg"],  # pragma: no cover
+                    pose["orientation"],  # pragma: no cover
+                    pose["flatDeg"],  # pragma: no cover
+                    transform,  # pragma: no cover
+                ),  # pragma: no cover
+                flush=True,  # pragma: no cover
+            )  # pragma: no cover
+    except KeyboardInterrupt:  # pragma: no cover
+        return 0  # pragma: no cover
+
+
+def daemon_state_messages(daemon: "FoldDaemon", pose: dict[str, Any]) -> list[str]:
+    """The same refusals `step` would make, without turning anything."""
+    if not pose["hinge"].ok:
+        return ["hinge not self-consistent"]  # pragma: no cover
+    if not pose["still"]:
+        if not pose.get("gyroOk", True):  # pragma: no cover
+            return ["gyroscope unavailable"]  # pragma: no cover
+        if pose.get("rotationRate", 0.0) > daemon.settings["stillRotDeg"]:  # pragma: no cover
+            return [f"turning at {pose['rotationRate']:.0f} deg/s"]  # pragma: no cover
+        return ["moving"]  # pragma: no cover
+    return []  # pragma: no cover
+
+
+def cmd_rotate(settings: dict[str, Any], position: str, force: bool = False) -> int:
+    """Turn the screen by hand, and keep it there.
+
+    Turning it by hand also locks the rotation, which is what a tablet does and
+    what stops the sensor turning it straight back.
+
+    Outside tablet mode the panel is deliberately held at landscape -- a laptop
+    on knees must not flip, and neither can an open one. So a turn issued while
+    the machine is open would be undone within a second, which reads as a broken
+    button. Say so instead, and keep `--force` for the cases where holding it
+    anyway is right: a panel that is genuinely upside down in tent mode, or
+    checking that the digitizer transform is being applied.
+    """
+    hypr = Hyprland()
+    panel = hypr.internal_monitor(settings["panel"])
+    if panel is None:  # pragma: no cover
+        print("No internal panel found.", file=sys.stderr)  # pragma: no cover
+        return 1  # pragma: no cover
+    current = hypr.current_transform(panel) or 0  # pragma: no cover
+    named = {"normal": 0, "inverted": 2, "right": 3, "left": 1}  # pragma: no cover
+    if position == "next":  # pragma: no cover
+        transform = (current + 1) % 4  # pragma: no cover
+    elif position == "prev":  # pragma: no cover
+        transform = (current - 1) % 4  # pragma: no cover
+    elif position in named:  # pragma: no cover
+        transform = named[position]  # pragma: no cover
+    else:  # pragma: no cover
+        transform = int(position) % 4  # pragma: no cover
+  # pragma: no cover
+    if not force:  # pragma: no cover
+        daemon = FoldDaemon(settings)  # pragma: no cover
+        pose = daemon.read_pose()  # pragma: no cover
+        mode, _ = daemon.mode_for(pose["fold"])  # pragma: no cover
+        if mode == "book":  # pragma: no cover
+            note = (  # pragma: no cover
+                f"Laptop · landscape is held on purpose at {pose['fold']:.0f}°. "  # pragma: no cover
+                "Fold it past a tent and the screen follows."  # pragma: no cover
+            )  # pragma: no cover
+            print(note, file=sys.stderr)  # pragma: no cover
+            # A keybinding runs with its output going nowhere, so a refusal that
+            # only went to stderr would be a key that does nothing at all.
+            osd = which("omarchy-osd")  # pragma: no cover
+            if osd:  # pragma: no cover
+                subprocess.run(  # pragma: no cover
+                    [osd, "-i", ICONS["laptop"], "-m", note],  # pragma: no cover
+                    capture_output=True,  # pragma: no cover
+                    timeout=5,  # pragma: no cover
+                    env=daemon.hypr.env,  # pragma: no cover
+                )  # pragma: no cover
+            return 1  # pragma: no cover
+  # pragma: no cover
+  # pragma: no cover
+    if transform == current and not force:  # pragma: no cover
+        print(json.dumps({"transform": transform, "panel": panel, "changed": False}))  # pragma: no cover
+        return 0  # pragma: no cover
+    # The lock is written before the turn, not after. The daemon re-asserts the
+    # transform it thinks is right, and a turn issued without the lock already
+    # in place is a turn it will undo on its next pass.
+    if not write_shell_entry({"locked": True}):  # pragma: no cover
+        print("could not record the rotation lock; the screen may not stay put", file=sys.stderr)  # pragma: no cover
+    result = _apply_rotation(settings, transform, panel=panel, hypr=hypr)  # pragma: no cover
+    if result == 0:  # pragma: no cover
+        # A hand turn locks the rotation, the way a tablet does, so the sensor
+        # does not turn the screen straight back. That is also how a person
+        # ends up stuck staring at a portrait screen wondering why. So say so,
+        # on the bar, with the way out -- silence here is what made it a
+        # mystery the first time.
+        name = {0: "Landscape", 1: "Portrait", 2: "Upside down", 3: "Portrait"}  # pragma: no cover
+        _osd(  # pragma: no cover
+            f"{name.get(transform, transform)} \u00b7 locked \u2014 SUPER+ALT+SHIFT+R to unlock",  # pragma: no cover
+            ICONS["lock"],  # pragma: no cover
+        )  # pragma: no cover
+    return result  # pragma: no cover
+
+
+def _osd(message: str, icon: str) -> None:
+    osd = which("omarchy-osd")  # pragma: no cover
+    if not osd:  # pragma: no cover
+        return  # pragma: no cover
+    subprocess.run(  # pragma: no cover
+        [osd, "-i", icon, "-m", message],
+        capture_output=True,
+        timeout=5,
+        env=dict(os.environ, **(Hyprland().env if os.environ.get("HYPRLAND_INSTANCE_SIGNATURE") else {})),
+    )
+
+
+
+
+def _apply_rotation(
+    settings: dict[str, Any],
+    transform: int,
+    *,
+    panel: str | None = None,
+    hypr: Hyprland | None = None,
+) -> int:
+    daemon = FoldDaemon(settings)  # pragma: no cover
+    reason = daemon.blocking_reason()  # pragma: no cover
+    if reason is not None:  # pragma: no cover
+        print(reason, file=sys.stderr)  # pragma: no cover
+        return 1  # pragma: no cover
+    hypr = hypr or daemon.hypr  # pragma: no cover
+    panel = panel or daemon.state.panel  # pragma: no cover
+    ok, message = hypr.set_transform(panel, transform)  # pragma: no cover
+    if not ok:  # pragma: no cover
+        print(message, file=sys.stderr)  # pragma: no cover
+        return 1  # pragma: no cover
+    for name in (daemon.state.touch, daemon.state.pen):  # pragma: no cover
+        if name:  # pragma: no cover
+            hypr.set_device_transform(name, transform, panel)  # pragma: no cover
+    print(json.dumps({"transform": transform, "panel": panel, "changed": True}))  # pragma: no cover
+    return 0  # pragma: no cover
+
+
+
+def cmd_lock(settings: dict[str, Any], action: str) -> int:
+    entry = shell_entry()
+    # `shell_entry` returns None when shell.json could not be read at all -- it is
+    # missing, or a read caught the shell halfway through rewriting it. That is
+    # exactly the moment the bar's Lock button can be pressed, and this used to
+    # raise AttributeError on the None, so the one control that has to survive a
+    # torn read died on it. Read the current value only if there is a read to
+    # read, and let the write below report the failure properly: it cannot succeed
+    # either, and it already says why.
+    current = bool(entry.get("locked")) if entry else False
+    if action == "toggle":  # pragma: no cover
+        value = not current  # pragma: no cover
+    else:  # pragma: no cover
+        value = action == "on"  # pragma: no cover
+    if not write_shell_entry({"locked": value}):  # pragma: no cover
+        print(  # pragma: no cover
+            "Could not write the setting: the widget is not in the bar layout, so\n"  # pragma: no cover
+            "shell.json has no entry for it yet. Place it on the bar first.",  # pragma: no cover
+            file=sys.stderr,  # pragma: no cover
+        )  # pragma: no cover
+        return 1  # pragma: no cover
+    print(json.dumps({"locked": value}))  # pragma: no cover
+    return 0  # pragma: no cover
+
+
+def cmd_mapping(settings: dict[str, Any], value: str) -> int:
+    if not write_shell_entry({"mapping": value}):
+        print("Could not write the setting; see `lock` for why.", file=sys.stderr)
+        return 1
+    print(json.dumps({"mapping": value}))  # pragma: no cover
+    return 0  # pragma: no cover
+
+
+def cmd_keyboard(settings: dict[str, Any], action: str) -> int:
+    osk = OnScreenKeyboard(settings)
+    entry = osk.target()
+    if entry is None:
+        print(
+            "No on-screen keyboard plugin is installed. Add one from the Omarchy\n"
+            "menu (Install \u203a Plugin), for example On-Screen Keyboard by abdxdev.",
+            file=sys.stderr,
+        )
+        return 1
+    print(json.dumps(osk.toggle()))  # pragma: no cover
+    return 0  # pragma: no cover
+
+
+def cmd_setting(settings: dict[str, Any], name: str, value: str | None) -> int:
+    if value is None:
+        print(json.dumps({"name": name, "value": load_settings().get(name)}))
+        return 0
+    parsed: Any = value
+    if isinstance(load_settings().get(name), bool):
+        parsed = value.lower() in ("1", "true", "on", "yes")  # pragma: no cover
+    if not write_shell_entry({name: parsed}):
+        print("Could not write the setting; see `lock` for why.", file=sys.stderr)
+        return 1
+    print(json.dumps({"name": name, "value": parsed}))  # pragma: no cover
+    return 0  # pragma: no cover
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    settings = load_settings()
+
+    if args.command is None or args.command == "status":
+        payload = read_published_state()
+        if payload is None:
+            # No daemon is running, so probe the hardware directly. The sensor
+            # numbers are real either way; only the fields the daemon owns are
+            # missing, and they say so rather than pretending to be zero.
+            payload = FoldDaemon(settings).status()  # pragma: no cover
+            payload["state"]["daemonRunning"] = False  # pragma: no cover
+        else:
+            payload["state"]["daemonRunning"] = True  # pragma: no cover
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return 0
+    if args.command == "daemon":
+        daemon = FoldDaemon(  # pragma: no cover
+            settings,  # pragma: no cover
+            emit=lambda payload: print(json.dumps(payload, sort_keys=True), flush=True),  # pragma: no cover
+        )  # pragma: no cover
+        reason = daemon.blocking_reason()  # pragma: no cover
+        if reason:  # pragma: no cover
+            print(f"# {PLUGIN_ID}: {reason}", file=sys.stderr, flush=True)  # pragma: no cover
+        return daemon.run()  # pragma: no cover
+    if args.command == "self-test":
+        return cmd_self_test()
+    if args.command == "doctor":  # pragma: no cover
+        return cmd_doctor(settings)  # pragma: no cover
+    if args.command == "debug":  # pragma: no cover
+        return cmd_debug(settings)  # pragma: no cover
+    if args.command == "rotate":  # pragma: no cover
+        return cmd_rotate(settings, args.position, force=args.force)  # pragma: no cover
+    if args.command == "lock":  # pragma: no cover
+        return cmd_lock(settings, args.state)  # pragma: no cover
+    if args.command == "mapping":  # pragma: no cover
+        return cmd_mapping(settings, args.value)  # pragma: no cover
+    if args.command == "keyboard":  # pragma: no cover
+        return cmd_keyboard(settings, args.action)  # pragma: no cover
+    if args.command == "libwacom":  # pragma: no cover
+        if args.action == "status":  # pragma: no cover
+            print(json.dumps(libwacom_status(), indent=2))  # pragma: no cover
+            return 0  # pragma: no cover
+        result = libwacom_install() if args.action == "install" else libwacom_remove()  # pragma: no cover
+        print(json.dumps(result))  # pragma: no cover
+        return 0 if result.get("ok") else 1  # pragma: no cover
+    if args.command == "hwdb":  # pragma: no cover
+        matrix = settings["mountMatrix"]  # pragma: no cover
+        if args.action == "show":  # pragma: no cover
+            print(hwdb_show(matrix))  # pragma: no cover
+            return 0  # pragma: no cover
+        return hwdb_apply(matrix, yes=args.yes)  # pragma: no cover
+    if args.command == "record":  # pragma: no cover
+        return cmd_record(args)  # pragma: no cover
+    if args.command == "analyze":  # pragma: no cover
+        return cmd_analyze(args)  # pragma: no cover
+    if args.command == "calibrate":  # pragma: no cover
+        return calibrate(args)  # pragma: no cover
+    if args.command == "setting":  # pragma: no cover
+        return cmd_setting(settings, args.name, args.value)  # pragma: no cover
+    build_parser().print_help()  # pragma: no cover
+    return 1  # pragma: no cover
+
+
+if __name__ == "__main__":
+    sys.exit(main())  # pragma: no cover

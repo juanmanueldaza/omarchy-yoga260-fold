@@ -1,0 +1,244 @@
+# Yoga 260 Fold
+
+Tablet mode and auto-rotation for the **Lenovo ThinkPad Yoga 260 (20FE)** on
+Omarchy, built on the machine's hinge-angle sensor.
+
+## The problem this exists for
+
+The Yoga 260 folds all the way round, but it never says so. There is no
+`SW_TABLET_MODE` bit on any of its input devices and no ACPI event for the fold
+— the lid switch is the only switch it has. Every other convertible plugin for
+Hyprland or Omarchy keys off that switch, so on this machine they either refuse
+to work or fall back to rotating on every tilt, including on a lap.
+
+What the Yoga 260 does have is an Intel ISHTP **hinge-angle sensor**, which the
+kernel exposes as an IIO device with three channels:
+
+| channel | label | meaning |
+|---|---|---|
+| `in_angl0` | `hinge` | the fold angle between the two halves |
+| `in_angl1` | `screen` | the lid's tilt against gravity |
+| `in_angl2` | `keyboard` | the base's tilt against gravity |
+
+That is more information than a switch, not less: it separates a tent from a
+flat-folded tablet, so the fold can be watched rather than inferred.
+
+## The second half of the problem
+
+The accelerometer in this machine is in the **base**, not the lid. A reader that
+takes the base's attitude as the screen's attitude is only right while the
+machine is open, and exactly wrong once it is folded — which is the only time
+rotation matters. So the screen's attitude is rebuilt by turning the base's
+gravity vector through the measured fold angle:
+
+```
+t = -cos(θ)·base_Y + sin(θ)·base_Z     # towards the top edge of the screen
+n = -sin(θ)·base_Y - cos(θ)·base_Z     # out of the screen face
+```
+
+and the screen's right axis, which runs along the hinge, carries across
+unchanged.
+
+The accelerometer also reports **no `in_accel_mount_matrix`**, so its axes mean
+nothing on their own — what "left" and "up" are is a property of how the chip is
+glued into the base. This plugin carries that property as a matrix and refuses to
+rotate if it is not a proper rotation, because a matrix that is a reflection
+inverts the sense of every turn.
+
+## The one thing it cannot see
+
+An accelerometer measures gravity and nothing else. **Gravity is a fixed world
+vector, and rotating a machine about the vertical leaves it exactly where it was
+in the base's frame** — verified here at 0°, 20°, 40° and 70° of tilt alike: the
+reading is byte-identical at every quarter turn. So yaw is not *mostly*
+unknowable to an accelerometer, it is entirely unknowable, at any tilt. There is
+no reading anywhere on this machine that says which way a flat screen is turned.
+
+What the panel used to do was pretend otherwise. It answered a hardcoded
+`"Landscape while open"` for any open machine — a string chosen by the lid being
+open, not a measurement — so a machine spun to portrait was told it was in
+landscape, the one case the sensor is least able to see. It now reports
+**"Flat · cannot tell which way it is turned"** when the base is flat enough that
+no screen axis means anything, and otherwise reports what it actually measured.
+
+What it does instead is follow the turn, from the gyroscope: the rate about
+gravity is integrated and a deliberate quarter turn moves the panel.
+
+That integration is gated, and the gate is the whole design. Measured on this
+machine at rest, the gyroscope reads **+0.274 deg/s about the vertical** —
+open-loop integration of that is 16° a minute and a full quarter turn wrong
+inside ten. So nothing is integrated unless the machine is genuinely turning: a
+stationary machine reads 0.27, well inside the deadband, so the bias is never
+banked. What accumulates is a sum of real turns, which cannot walk away while
+the machine sits still.
+
+It remains a *relative* estimate, measured from the last orientation the
+accelerometer could establish; tilt the machine and the accelerometer takes over
+and the estimate is dropped.
+
+### Which way is portrait
+
+Both paths now answer in **orientation names** and hand them to the same
+`transform_for` that applies the panel's **mapping** setting. They did not used
+to: the flat path added a quarter turn straight onto the transform in force,
+which had already had `mapping` folded into it, so it was doing arithmetic in a
+different space from the accelerometer's. The two then disagreed — landscape
+came out as portrait — and the mapping was bypassed entirely.
+
+Which way a turn reads is the one value here that cannot be derived, because this
+gyroscope sits at ~0.2 deg/s at rest and so never shows a turn to watch. It
+depends on the sign of the base's X axis, which is what `calibrate` settles. It
+is therefore `yawSign`, deliberately separate from `mapping`: reusing `mapping`
+here would fix the flat case and break every other one.
+
+```bash
+$fold setting yawSign -1     # if the screen turns the wrong way while flat
+```
+
+## Install
+
+```bash
+omarchy plugin add https://github.com/<you>/omarchy-yoga260-fold --enable
+```
+
+Or, from a checkout, copy it into place and enable it:
+
+```bash
+cp -r . ~/.config/omarchy/plugins/estrocondoso.yoga260-fold
+omarchy shell rescanPlugins      # if it is already running
+omarchy bar move estrocondoso.yoga260-fold --section right
+```
+
+Then give the pen its proper libwacom entry, which this machine is missing:
+
+```bash
+~/.config/omarchy/plugins/estrocondoso.yoga260-fold/bin/omarchy-yoga260-fold libwacom install
+```
+
+Remove the whole thing with `omarchy plugin remove estrocondoso.yoga260-fold` and
+`omarchy-yoga260-fold libwacom remove`.
+
+## What it does
+
+- **Follows the machine, in every pose it can see.** Rotate it and the screen
+  turns; the finger sensor and the pen follow it, and both are bound to the
+  laptop's own panel so an external monitor does not stretch the pen across two
+  screens. A machine flat on a desk is the exception, and is described above:
+  its in-plane rotation is invisible to the accelerometer and is followed from
+  the gyroscope instead.
+- **Knows three poses, not two.** A 360 convertible is a laptop, a tent and a
+  tablet, and the fold is what tells them apart:
+
+  | fold | pose | keyboard |
+  |---|---|---|
+  | under 118° | book, lid open for use | on |
+  | 118–165° | tent, propped on its own lid | on |
+  | over 165° (exits under 145°) | tablet, folded back | off |
+
+  The screen follows the machine in all three. An earlier version held it at
+  landscape whenever the lid was open, on the reasoning that a laptop on knees
+  should not flip; on this machine that rule ate almost the whole session,
+  because a 260 convertible is held open far more often than it is folded.
+
+  Only the step into tablet is hysteretic, because that is the one crossing a
+  machine can come to rest on, and a keyboard that switches itself off and on
+  again is a keyboard you cannot type on.
+
+  Note that a tent normally *stays* landscape, and that is correct: propped as
+  an A, the screen faces the viewer across the tent, so it reads landscape on
+  its own. The arrangement that wants portrait is the whole tent turned ninety
+  degrees in the plane.
+- **Tablet mode locks the keyboard off.** The keyboard, the TrackPoint, the
+  extra-buttons cluster and the touchpad are all useless folded flat, so they
+  are switched off and put back when the machine opens — but never while the
+  session is locked, and never on a reading it is unsure of.
+- **Rotation lock** from the bar, so reading in bed does not spin the screen.
+  Turning the screen by hand engages it, the way a tablet does, and says so.
+- **Holds still.** Nothing turns while the gyroscope says the machine is being
+  moved, a new pose has to beat the current one by a margin, and the decision
+  has to hold before the screen moves. Readings that disagree with each other
+  stop the screen rather than guessing.
+- **Heals after a config reload.** `hyprctl reload` rebuilds the monitor rules
+  and straightens a turned panel; the transform is re-asserted on a timer.
+
+### How a turn is decided, and how fast
+
+The response budget is **0.45 s**: one 0.1 s poll to notice, plus a 0.35 s
+settle window the decision has to survive.
+
+Two earlier designs were much slower, and both are worth not repeating:
+
+- **Averaging the pose is wrong here.** The pose used to be an average over the
+  last 0.6 s, which lags the machine by that much and — because the decision is
+  derived from the average — restarts the settle clock every time the average
+  crosses a boundary on its way to a new pose. A recording caught the
+  orientation changing six times during one movement, so the screen never moved
+  at all. The pose is now the current sample; the window is kept only to say
+  how long things have been steady.
+- **A tie is not indecision.** A small margin between the best and second-best
+  axis used to be read as "cannot decide", and the screen was held where it
+  was, forever. But a machine held at forty-five degrees to its own screen axes
+  is a perfectly ordinary posture, and that is exactly what a tie looks like.
+  A tie now means *keep the incumbent* — hysteresis, in the sense it is
+  actually meant in.
+
+The decision path reads the panel's settings once per change rather than
+parsing `shell.json` on every pass, because it sits directly in the path of
+the thing that has to feel instant.
+
+## What it will not do
+
+- It refuses to touch anything that is not a Yoga 260. `product_version` has to
+  say so; the board prefix cannot tell a Yoga from anything else.
+- It does not use `iio-sensor-proxy`. Reading the two IIO nodes directly needs no
+  package, and a proxy that applies an identity mount matrix to a sensor with no
+  mount matrix of its own reports the chip's axes rather than the machine's.
+- It cannot give a folded machine its lock screen back an on-screen keyboard.
+  Opening the lid restores the keyboard at once.
+
+## The command
+
+```bash
+fold=~/.config/omarchy/plugins/estrocondoso.yoga260-fold/bin/omarchy-yoga260-fold
+
+$fold doctor        # what this machine actually has, read-only
+$fold status        # the state the bar shows, as JSON
+$fold debug         # live raw and derived values, while you fold it
+$fold self-test     # the arithmetic, with no hardware involved
+$fold calibrate     # guided, human-verified calibration
+$fold rotate next   # turn it by hand (tablet mode only; --force overrides)
+$fold lock toggle
+$fold mapping standard
+$fold libwacom status
+$fold hwdb show     # the systemd sensor entry, not applied
+```
+
+`doctor` and `self-test` are the two worth running first. `self-test` checks the
+matrix, the hinge rotation and the pose classification in closed form, so it is
+also the check to run on a machine that is *not* a Yoga 260.
+
+## Calibration
+
+Two things cannot be derived and have to be confirmed by a person: the sign of
+the base's X axis, and that the digitizer's transform is really being applied.
+`calibrate` walks through both, and checks the mount matrix against the hinge
+sensor's independent tilt channels on the way.
+
+If the screen turns the wrong way, the panel's **Settings** offers the four
+mappings: Standard, Upright, Flat and 180. See [`docs/calibration.md`](docs/calibration.md).
+
+## Layout
+
+```
+manifest.json                     the plugin contract
+Service.qml                       mounts the daemon once, owns the state
+Fold.qml                          the bar button and its panel
+bin/omarchy-yoga260-fold          the daemon and CLI, Python 3, no dependencies
+tests/                            224 tests; the arithmetic is the point
+docs/hardware.md                  this machine, in the detail it deserves
+docs/calibration.md               how to confirm it by hand
+```
+
+## License
+
+MIT.
