@@ -22,9 +22,12 @@ difference of its two tilt channels are computed separately; when they part
 company the reading is treated as bad and nothing turns. On this machine they
 have agreed to 0.0°.
 
-**The two sensors agree about how the machine is sitting.** The accelerometer
-and the hinge hub estimate each half's tilt independently, and the plugin
-refuses to rotate past a 25° disagreement. See the note at the end of
+**The two sensors' disagreement is reported, not enforced.** The accelerometer
+and the hinge hub estimate each half's tilt independently; the residual is
+shown in the panel, and past 25° it is also written into `status` as a note —
+never used to stop a rotation, because `angl2` is static on this machine, so
+the figure rises with base tilt and says nothing about whether the screen
+should turn. See the note at the end of
 [`hardware.md`](hardware.md) about the ~13° this sits at on a desk.
 
 **The machine is still.** Below 0.8 g of measured acceleration is movement, not
@@ -52,13 +55,15 @@ under about 12° or the command stops and says so.
 If it is off, work out the correction and write it in:
 
 ```bash
-$fold calibrate --write M00 M01 M02     # one row of the matrix at a time
+$fold calibrate --write M00 M01 M02 M10 M11 M12 M20 M21 M22   # the whole matrix
 ```
 
 A row is the base's axis written in terms of the sensor's, so `-1, 0, 0` means
-"the base's right is the sensor's left". The command refuses to write a matrix
-that is not a proper rotation, and it merges the rows into the existing matrix
-rather than replacing it.
+"the base's right is the sensor's left"; the nine numbers are the three rows,
+top to bottom. The command refuses a matrix whose determinant is not +1, and
+writes it into `shell.json` as `mountMatrix`, replacing whatever was stored
+there. The daemon reads it back with the same determinant check and falls back
+to the shipped matrix if it does not hold.
 
 ### 2. The digitizer
 
@@ -89,8 +94,8 @@ digitizer read out twice, Hyprland treats them as two devices, and the pen will
 not follow the panel on its own.
 
 `$fold rotate right --force` does all three and puts it back. The `--force` is
-needed while the machine is open: outside tablet mode the panel is deliberately
-held at landscape, and without it the command declines instead of turning the
+needed while the machine is open: in book mode the panel is deliberately held
+at landscape, and without it the command declines instead of turning the
 screen and having the daemon straighten it a second later.
 
 ## If the screen turns the wrong way

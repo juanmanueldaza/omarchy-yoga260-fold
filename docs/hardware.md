@@ -174,8 +174,9 @@ to rotate when they disagreed, was comparing the accelerometer against a channel
 that never moves: the difference grew with base tilt (12.5° flat, 40.8° with the
 base propped at 42°) and would eventually have stopped the screen for good. The
 figure is reported now and never acted on. The only real gates are the machine
-fingerprint, the mount-matrix determinant, the hinge's own arithmetic, stillness,
-and the book-mode lockout.
+fingerprint, the mount-matrix determinant, the hinge's own arithmetic and
+stillness; the book-mode lockout belongs to the `rotate` command alone, because
+the screen follows the machine in book mode too.
 
 ### A disagreement worth knowing about
 
@@ -187,13 +188,15 @@ It is almost certainly the hinge's base reference rather than a fault: gravity
 is gravity, and a 13.5° tilt of a laptop on a desk is not a thing. It does not
 corrupt anything, because the only thing the plugin *needs* from the hinge
 sensor is the fold angle, and that channel is self-consistent to 0.0°. It
-inflates the residual figure the panel shows. The plugin's threshold is 25°, and
-the reason it is a check at all is that two pieces of hardware describing
-different machines is worth refusing to act on.
+inflates the residual figure the panel shows. Past 25° that figure also becomes
+a note in `status` and nothing more: two pieces of hardware describing
+different machines is worth saying out loud, but `angl2` is static here, so the
+number rises with base tilt and says nothing about whether the screen should
+turn.
 
 If `calibrate` is run on a known-flat surface and the accelerometer still
 disagrees by more than about 12°, the mount matrix wants correcting and
-`calibrate --write` will take a replacement row.
+`calibrate --write` takes the whole matrix back — nine numbers, one call.
 
 ## Fold angles measured on this machine
 
@@ -202,8 +205,19 @@ disagrees by more than about 12°, the mount matrix wants correcting and
 | lid open on a desk | 104° |
 | lid open, leaning further back | 132° |
 
-The 118° and 165° thresholds are set from those two readings and the geometry of
-the hinge; what a fully flat fold reads is the one number still to be measured.
+The thresholds the plugin acts on are the official Lenovo Yoga 260 ranges, not
+anything derived from those two readings: book below 190°, tablet 190°–270°,
+tent 270°–340°, stand 340°–360° and treated as tablet. What a fully flat fold
+reads is the one number still to be measured.
+
+The 190 crossing carries a release threshold below it, `bookReleaseDeg`
+(default 170), because the EC does not switch at 190 and release at 190 — it
+engages partway through the band with hysteresis of its own. Dell's convertible
+documentation puts the default keyboard cut-out near 225 for the same reason.
+So a lid resting at 189/191 keeps whatever mode it already had instead of taking
+the keyboard off and on. The 270 and 340 boundaries gate no input, so they stay
+exact. See `docs/windows.md` for why this, and for the rest of what Windows did
+that this plugin does not and cannot.
 
 ## No tablet-mode switch
 

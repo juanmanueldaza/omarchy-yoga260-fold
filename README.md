@@ -131,18 +131,27 @@ Remove the whole thing with `omarchy plugin remove estrocondoso.yoga260-fold` an
 
   | fold | pose | keyboard |
   |---|---|---|
-  | under 118° | book, lid open for use | on |
-  | 118–165° | tent, propped on its own lid | on |
-  | over 165° (exits under 145°) | tablet, folded back | off |
+  | under 190° | book, lid open for use | on |
+  | 190–270° | tablet, folded back | off |
+  | 270–340° | tent, propped on its own lid | on |
+  | 340° and over | stand, treated as tablet | off |
 
   The screen follows the machine in all three. An earlier version held it at
   landscape whenever the lid was open, on the reasoning that a laptop on knees
   should not flip; on this machine that rule ate almost the whole session,
   because a 260 convertible is held open far more often than it is folded.
 
-  Only the step into tablet is hysteretic, because that is the one crossing a
-  machine can come to rest on, and a keyboard that switches itself off and on
-  again is a keyboard you cannot type on.
+  The 190 boundary is the one that gates input, and it is a **band, not a
+  line**: leave book at 190 (`bookExitDeg`), come back to it at 170
+  (`bookReleaseDeg`), and keep whatever you were in between. The EC does not
+  switch at 190 and release at 190 either — it engages partway through with
+  hysteresis of its own, which is why convertible documentation puts the cut-out
+  near 225 — so a bare comparison on one number chatters on a lid left near the
+  edge. The 270 and 340 boundaries change only the label, so they stay exact.
+
+  On top of that, the mode is only recomputed while the machine is still: one
+  being carried keeps the mode it last settled in, and a keyboard that switches
+  itself off and on again is a keyboard you cannot type on.
 
   Note that a tent normally *stays* landscape, and that is correct: propped as
   an A, the screen faces the viewer across the tent, so it reads landscape on
@@ -156,8 +165,8 @@ Remove the whole thing with `omarchy plugin remove estrocondoso.yoga260-fold` an
   Turning the screen by hand engages it, the way a tablet does, and says so.
 - **Holds still.** Nothing turns while the gyroscope says the machine is being
   moved, a new pose has to beat the current one by a margin, and the decision
-  has to hold before the screen moves. Readings that disagree with each other
-  stop the screen rather than guessing.
+  has to hold before the screen moves. A hinge reading that disagrees with
+  itself stops the screen rather than guessing.
 - **Heals after a config reload.** `hyprctl reload` rebuilds the monitor rules
   and straightens a turned panel; the transform is re-asserted on a timer.
 
@@ -206,7 +215,7 @@ $fold status        # the state the bar shows, as JSON
 $fold debug         # live raw and derived values, while you fold it
 $fold self-test     # the arithmetic, with no hardware involved
 $fold calibrate     # guided, human-verified calibration
-$fold rotate next   # turn it by hand (tablet mode only; --force overrides)
+$fold rotate next   # turn it by hand (not in book mode; --force overrides)
 $fold lock toggle
 $fold mapping standard
 $fold libwacom status
@@ -234,7 +243,7 @@ manifest.json                     the plugin contract
 Service.qml                       mounts the daemon once, owns the state
 Fold.qml                          the bar button and its panel
 bin/omarchy-yoga260-fold          the daemon and CLI, Python 3, no dependencies
-tests/                            224 tests; the arithmetic is the point
+tests/                            228 tests; the arithmetic is the point
 docs/hardware.md                  this machine, in the detail it deserves
 docs/calibration.md               how to confirm it by hand
 ```

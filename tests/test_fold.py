@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Tests for omarchy-yoga260-fold.
 
 The interesting part of this plugin is arithmetic: a mount matrix nobody wrote
@@ -12,9 +11,9 @@ that to be true, feed those numbers in, and require the original pose back.
 """
 
 import contextlib
-import io
 import importlib.machinery
 import importlib.util
+import io
 import json
 import math
 import os
@@ -23,17 +22,27 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from typing import ClassVar
 from unittest.mock import MagicMock, patch
 
 SCRIPT = Path(__file__).resolve().parent.parent / "bin" / "omarchy-yoga260-fold"
 spec = importlib.util.spec_from_loader(
     "fold", importlib.machinery.SourceFileLoader("fold", str(SCRIPT))
 )
+# spec_from_loader only returns None for a loader it cannot describe, which a
+# SourceFileLoader is not -- the guards are for the type checker, which only
+# knows the Optional, and they turn a silent AttributeError below into a
+# failure that names what went missing.
+if spec is None:
+    raise RuntimeError(f"cannot build a module spec for {SCRIPT}")
+loader = spec.loader
+if loader is None:
+    raise RuntimeError(f"no loader in the module spec for {SCRIPT}")
 fold = importlib.util.module_from_spec(spec)
 # dataclass resolves annotations through sys.modules, so the module has to be
 # registered before it is executed.
 sys.modules["fold"] = fold
-spec.loader.exec_module(fold)
+loader.exec_module(fold)
 
 
 GRAVITY = 9.80665
@@ -57,11 +66,11 @@ def base_up_from_lid(lid_up, fold_deg):
     )
 
 
-def raw_for_base_up(base_up, scale, full_scale=2 ** 23):
+def raw_for_base_up(base_up, scale, full_scale=2**23):
     """The integers an accelerometer with this mount would report."""
     sensor = unit(tuple(fold.dot(row, base_up) for row in zip(*M)))
     magnitude = GRAVITY / scale
-    return tuple(int(round(v * magnitude)) for v in sensor), magnitude
+    return tuple(round(v * magnitude) for v in sensor), magnitude
 
 
 def transpose(matrix):
@@ -95,7 +104,7 @@ class FakeHingeDevice:
         ):
             (self.path / f"in_angl{index}_label").write_text(f"{label}\n")
             (self.path / f"in_angl{index}_raw").write_text(
-                f"{int(round(math.radians(value) / scale))}\n"
+                f"{round(math.radians(value) / scale)}\n"
             )
 
     @property
@@ -104,6 +113,32 @@ class FakeHingeDevice:
 
 
 # --------------------------------------------------------------------------
+
+
+@contextlib.contextmanager
+def libwacom_in_tmpdir():
+    """Redirect both libwacom globals into a temporary directory.
+
+    `LIBWACOM_ENTRY` is the path the install and remove actually write, and it
+    is a separate module-level constant from `LIBWACOM_LOCAL`. Patching only
+    the directory would leave every one of these tests writing into the real
+    ~/.config/libwacom on the machine running them.
+
+    Module-level, not a method, because a second class of tests installs and
+    removes the entry too and had been writing the real path. The pair is
+    net-zero on a full green run, which is exactly why it went unnoticed: a
+    run filtered down to the install alone leaves the pen's real libwacom
+    entry behind, and a run of the whole suite deletes one the user installed
+    by hand.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        real_dir, real_entry = fold.LIBWACOM_LOCAL, fold.LIBWACOM_ENTRY
+        fold.LIBWACOM_LOCAL = Path(td) / "libwacom"
+        fold.LIBWACOM_ENTRY = fold.LIBWACOM_LOCAL / "wacom-isdv4-5091.tablet"
+        try:
+            yield fold.LIBWACOM_ENTRY
+        finally:
+            fold.LIBWACOM_LOCAL, fold.LIBWACOM_ENTRY = real_dir, real_entry
 
 
 class Angles(unittest.TestCase):
@@ -144,7 +179,9 @@ class Angles(unittest.TestCase):
         base_up = unit((0.0, 0.14, -0.99))
         lid_up = unit(fold.lid_vector(base_up, 180.0))
         self.assertEqual(fold.name_orientation(lid_up), "inverted")
-        self.assertEqual(fold.transform_for(fold.name_orientation(lid_up), "standard"), 2)
+        self.assertEqual(
+            fold.transform_for(fold.name_orientation(lid_up), "standard"), 2
+        )
 
     def test_folding_never_touches_the_axis_along_the_hinge(self):
         for degrees in (0, 37, 90, 145, 180, 271, 359):
@@ -163,7 +200,9 @@ class MountMatrix(unittest.TestCase):
         for i in range(3):
             for j in range(3):
                 expected = 1.0 if i == j else 0.0
-                self.assertAlmostEqual(fold.dot(M[i], [row[j] for row in M]), expected, places=9)
+                self.assertAlmostEqual(
+                    fold.dot(M[i], [row[j] for row in M]), expected, places=9
+                )
 
     # Both readings below are real captures from this machine with the machine
     # lying on a desk and the lid open, so neither is exactly axis-aligned: the
@@ -211,7 +250,9 @@ class MountMatrix(unittest.TestCase):
         for i in range(3):
             for j in range(3):
                 expected = 1.0 if i == j else 0.0
-                self.assertAlmostEqual(fold.dot(M[i], [row[j] for row in inv]), expected, places=9)
+                self.assertAlmostEqual(
+                    fold.dot(M[i], [row[j] for row in inv]), expected, places=9
+                )
 
 
 class ReverseConstruction(unittest.TestCase):
@@ -222,13 +263,17 @@ class ReverseConstruction(unittest.TestCase):
         base_up = unit((0.0, 0.14, 0.99))
         lid_up = fold.lid_vector(base_up, 95.0)
         self.assertEqual(fold.name_orientation(unit(lid_up)), "normal")
-        self.assertEqual(fold.transform_for(fold.name_orientation(lid_up), "standard"), 0)
+        self.assertEqual(
+            fold.transform_for(fold.name_orientation(lid_up), "standard"), 0
+        )
 
     def test_a_screen_facing_away_reads_upside_down(self):
         base_up = unit((0.0, 0.14, -0.99))
         lid_up = unit(fold.lid_vector(base_up, 180.0))
         self.assertEqual(fold.name_orientation(lid_up), "inverted")
-        self.assertEqual(fold.transform_for(fold.name_orientation(lid_up), "standard"), 2)
+        self.assertEqual(
+            fold.transform_for(fold.name_orientation(lid_up), "standard"), 2
+        )
 
     # Which of the two portrait attitudes is called "right" and which "left" is
     # a property of the mount matrix's X sign, and that sign is the one thing
@@ -372,7 +417,9 @@ class FlatBlindness(unittest.TestCase):
         )
         daemon.hinge = MagicMock()
         daemon.hinge.available = True
-        daemon.hinge.read.return_value = fold.HingeSample(105.0, 104.0, 359.0, 105.0, 1.0, True)
+        daemon.hinge.read_fold.return_value = fold.HingeSample(
+            105.0, 104.0, 359.0, 105.0, 1.0, True
+        )
         daemon.motion = MagicMock()
         daemon.motion.read.return_value = (0.3, True)
         daemon.motion.is_still.return_value = True
@@ -392,7 +439,9 @@ class FlatBlindness(unittest.TestCase):
         )
         daemon.hinge = MagicMock()
         daemon.hinge.available = True
-        daemon.hinge.read.return_value = fold.HingeSample(105.0, 104.0, 359.0, 105.0, 1.0, True)
+        daemon.hinge.read_fold.return_value = fold.HingeSample(
+            105.0, 104.0, 359.0, 105.0, 1.0, True
+        )
         daemon.motion = MagicMock()
         daemon.motion.read.return_value = (0.3, True)
         daemon.motion.is_still.return_value = True
@@ -467,7 +516,7 @@ class FlatTurnTracking(unittest.TestCase):
 
     def test_a_partial_turn_does_not_move_the_screen(self):
         d = self._daemon()
-        self._run(d, 40.0, 0.5)   # about 20 degrees
+        self._run(d, 40.0, 0.5)  # about 20 degrees
         self.assertIsNone(d.yaw_orientation())
 
     def test_consecutive_turns_accumulate_rather_than_replacing(self):
@@ -512,9 +561,7 @@ class FlatTurnTracking(unittest.TestCase):
         # opinions about which way is up.
         for mapping in fold.MAPPINGS:
             for orientation in ("normal", "inverted", "right", "left"):
-                self.assertIn(
-                    fold.transform_for(orientation, mapping), (0, 1, 2, 3)
-                )
+                self.assertIn(fold.transform_for(orientation, mapping), (0, 1, 2, 3))
         # And the user's correction applies to the gyro's answer as well.
         self.assertEqual(fold.transform_for("left", "standard"), 1)
         self.assertEqual(fold.transform_for("left", "portrait-swapped"), 3)
@@ -538,7 +585,9 @@ class FlatTurnTracking(unittest.TestCase):
         # `ORIENTATION_CYCLE` is only true of `BASE_TRANSFORM` if the two are
         # kept in step, and nothing else would notice them drifting apart.
         for name in fold.ORIENTATION_CYCLE:
-            self.assertEqual(fold.BASE_TRANSFORM[name], fold.ORIENTATION_CYCLE.index(name))
+            self.assertEqual(
+                fold.BASE_TRANSFORM[name], fold.ORIENTATION_CYCLE.index(name)
+            )
 
 
 class VerticalRateTests(unittest.TestCase):
@@ -554,7 +603,9 @@ class VerticalRateTests(unittest.TestCase):
                 (dev / f"in_anglvel_{axis}_raw").write_text(f"{value}\n")
             motion = fold.Motion(dev, 9.0, fold.DEFAULT_MOUNT_MATRIX)
             # base_Z is the sensor's -Y, so a +Y rate is a turn the other way.
-            self.assertAlmostEqual(motion.vertical_rate((0.0, 0.0, 1.0)), -900.0, places=6)
+            self.assertAlmostEqual(
+                motion.vertical_rate((0.0, 0.0, 1.0)), -900.0, places=6
+            )
             # And the magnitude is unchanged by any of this.
             self.assertAlmostEqual(motion.read()[0], 900.0, places=6)
 
@@ -670,7 +721,7 @@ class BookMode(unittest.TestCase):
         daemon.hypr = self.StubHypr(2)
         daemon.state = fold.State()
         daemon.state.transform = 0
-        transform, why = daemon.desired_transform({"candidates": []}, "book")
+        _transform, why = daemon.desired_transform({"candidates": []}, "book")
         self.assertEqual(why, "locked")
         self.assertEqual(daemon.state.transform, 2)
 
@@ -681,6 +732,8 @@ class BookMode(unittest.TestCase):
         daemon.state = fold.State()
         daemon.state.transform = 3
         transform, why = daemon.desired_transform({"candidates": []}, "book")
+        self.assertEqual(why, "locked")
+        self.assertEqual(transform, 3)
         self.assertEqual(daemon.state.transform, 3)
 
 
@@ -694,8 +747,14 @@ def bare_daemon(**settings):
     had ever checked a decision.
     """
     daemon = fold.FoldDaemon.__new__(fold.FoldDaemon)
-    daemon.settings = {"mapping": "standard", "locked": False, "hystDeg": 12.0,
-                       "settleSec": 0.35, "flatToleranceDeg": 20.0, **settings}
+    daemon.settings = {
+        "mapping": "standard",
+        "locked": False,
+        "hystDeg": 12.0,
+        "settleSec": 0.35,
+        "flatToleranceDeg": 20.0,
+        **settings,
+    }
     daemon.state = fold.State()
     daemon.decision = None
     daemon.decision_since = time.monotonic()
@@ -713,8 +772,8 @@ class Hysteresis(unittest.TestCase):
     against `flat` (transform 0), which are genuinely different outputs.
     """
 
-    INCUMBENT = {"label": "right", "sign": 1}
-    CHALLENGER = {"label": "flat", "sign": 1}
+    INCUMBENT: ClassVar[dict] = {"label": "right", "sign": 1}
+    CHALLENGER: ClassVar[dict] = {"label": "flat", "sign": 1}
 
     def _pose(self, incumbent_tilt, challenger_tilt):
         """Candidates in the order `attitude` emits them: best first.
@@ -759,7 +818,11 @@ class Hysteresis(unittest.TestCase):
             daemon = bare_daemon(hystDeg=12.0, settleSec=0.0)
             daemon.state.axis, daemon.state.signed = "right", 1
             daemon.state.transform = 3
-            results.append(daemon.desired_transform(self._pose(incumbent_tilt, challenger_tilt), "book")[0])
+            results.append(
+                daemon.desired_transform(
+                    self._pose(incumbent_tilt, challenger_tilt), "book"
+                )[0]
+            )
         self.assertEqual(results, [3, 0])
 
 
@@ -809,6 +872,122 @@ class TransformForTests(unittest.TestCase):
         self.assertEqual(fold.transform_for("unknown", "standard"), 0)
 
 
+class HingeTelemetryCadenceTests(unittest.TestCase):
+    """The fold angle is read every pass; the other two are not.
+
+    Reading one IIO attribute on this machine is not cheap. Timed per attribute,
+    median over 40 reads:
+
+        hinge  in_angl{0,1,2}_raw   ~10.4 ms each
+        accel  in_accel_{x,y,z}_raw ~5.5 ms each
+        gyro   in_anglvel_*_raw     ~1.8 ms each
+        static in_angl_scale         0.1 ms
+
+    So the hinge was ~58% of a whole pass, and two thirds of that went on
+    `angl1` and `angl2` -- the two channels this plugin's own docs describe as
+    telemetry that nothing gates on. `mode_for` reads `angl0` and nothing else.
+    The residual derived from the other two is shown in the panel and, past 25
+    degrees, noted in `status`; no rotation is ever refused because of it.
+
+    These pin that the cheap path is actually taken, because a version that set
+    the cache without stamping it looked identical and did nothing at all.
+    """
+
+    def _hinge(self, fold_deg=102.0):
+        self._td = tempfile.TemporaryDirectory()
+        self.addCleanup(self._td.cleanup)
+        dev = FakeHingeDevice(self._td.name, fold_deg, fold_deg - 1.0, 359.0)
+        hinge = fold.Hinge(dev.device)
+        # Count which attributes are actually read.
+        self.reads = []
+        real = fold.read_float
+
+        def counting(path):
+            self.reads.append(Path(path).name)
+            return real(path)
+
+        fold.read_float = counting
+        self.addCleanup(lambda: setattr(fold, "read_float", real))
+        return hinge
+
+    def test_the_cheap_path_reads_only_the_fold_channel(self):
+        hinge = self._hinge()
+        hinge.read()  # warm the cache
+        self.reads.clear()
+        hinge.read_fold(time.monotonic(), 1.0)
+        self.assertEqual(self.reads, ["in_angl0_raw"])
+
+    def test_the_cheap_path_is_actually_cheap(self):
+        # Guards the bug this whole thing was written for: `read()` set the
+        # cache but never stamped the time, so every call fell through to the
+        # full three-channel read and the optimisation did nothing. It is
+        # invisible in the API -- `read_fold` returns a perfectly good sample
+        # either way -- so it can only be caught by counting the reads.
+        hinge = self._hinge()
+        hinge.read()
+        self.reads.clear()
+        for _ in range(5):
+            hinge.read_fold(time.monotonic(), 60.0)
+        self.assertEqual(len(self.reads), 5)
+        self.assertEqual(set(self.reads), {"in_angl0_raw"})
+
+    def test_the_fold_value_is_never_stale(self):
+        # The cache must not become a way of acting on an old angle. Only the
+        # two unused channels are held back; the one every decision reads is
+        # fetched every time.
+        hinge = self._hinge(fold_deg=102.0)
+        hinge.read()
+        (hinge.device / "in_angl0_raw").write_text(
+            f"{round(math.radians(250.0) / hinge.scale)}\n"
+        )
+        for _ in range(3):
+            sample = hinge.read_fold(time.monotonic(), 60.0)
+            self.assertAlmostEqual(sample.fold_deg, 250.0, places=1)
+
+    def test_the_channels_come_back_on_the_telemetry_cadence(self):
+        hinge = self._hinge()
+        hinge.read()
+        self.reads.clear()
+        # A window of zero has elapsed, so this is a full read again.
+        hinge.read_fold(time.monotonic() + 10.0, 1.0)
+        self.assertEqual(
+            set(self.reads), {"in_angl0_raw", "in_angl1_raw", "in_angl2_raw"}
+        )
+
+    def test_a_cadence_of_zero_reads_everything_every_time(self):
+        hinge = self._hinge()
+        for _ in range(3):
+            hinge.read_fold(time.monotonic(), 0.0)
+        self.assertEqual(self.reads.count("in_angl1_raw"), 3)
+
+    def test_the_self_consistency_verdict_is_carried_not_recomputed(self):
+        # `ok` is a check on the firmware's own arithmetic, computed
+        # independently of the fold channel. Holding `angl0` fresh against two
+        # channels from a different instant would report a disagreement that
+        # means nothing, so the last real verdict is what carries forward.
+        hinge = self._hinge()
+        full = hinge.read()
+        self.assertTrue(full.ok)
+        sample = hinge.read_fold(time.monotonic(), 60.0)
+        self.assertEqual(sample.ok, full.ok)
+        self.assertEqual(sample.residual_deg, full.residual_deg)
+
+    def test_derived_is_withheld_when_it_cannot_be_computed_honestly(self):
+        hinge = self._hinge()
+        self.assertIsNotNone(hinge.read().derived_fold_deg)
+        sample = hinge.read_fold(time.monotonic(), 60.0)
+        self.assertIsNone(sample.derived_fold_deg)
+
+    def test_a_full_read_updates_the_cache_the_cheap_path_depends_on(self):
+        # The stamp, not just the value. Without it the cheap path can never be
+        # entered, which is exactly what went wrong.
+        hinge = self._hinge()
+        self.assertIsNone(hinge._cached)
+        hinge.read()
+        self.assertIsNotNone(hinge._cached)
+        self.assertGreater(hinge._cached_at, 0.0)
+
+
 class HyprlandTests(unittest.TestCase):
     def setUp(self):
         self._real_which = fold.shutil.which
@@ -827,11 +1006,36 @@ class HyprlandTests(unittest.TestCase):
             returncode = 0
             stdout = ""
             stderr = ""
+
         r = R()
         if "monitors" in cmd:
-            r.stdout = json.dumps([{"name": "eDP-1", "width": 1920, "height": 1080, "refreshRate": 60.0, "x": 0, "y": 0, "scale": 1.0, "transform": 0}])
+            r.stdout = json.dumps(
+                [
+                    {
+                        "name": "eDP-1",
+                        "width": 1920,
+                        "height": 1080,
+                        "refreshRate": 60.0,
+                        "x": 0,
+                        "y": 0,
+                        "scale": 1.0,
+                        "transform": 0,
+                    }
+                ]
+            )
         elif "devices" in cmd:
-            r.stdout = json.dumps({"keyboards": [{"name": "at-translated-set-2-keyboard"}], "touch": [{"name": "wacom-pen-and-multitouch-sensor-finger"}], "tablets": [{"name": "wacom-pen-and-multitouch-sensor-pen"}], "mice": [{"name": "etps/2-elantech-trackpoint"}, {"name": "etps/2-elantech-touchpad"}], "touchpads": [{"name": "etps/2-elantech-touchpad"}]})
+            r.stdout = json.dumps(
+                {
+                    "keyboards": [{"name": "at-translated-set-2-keyboard"}],
+                    "touch": [{"name": "wacom-pen-and-multitouch-sensor-finger"}],
+                    "tablets": [{"name": "wacom-pen-and-multitouch-sensor-pen"}],
+                    "mice": [
+                        {"name": "etps/2-elantech-trackpoint"},
+                        {"name": "etps/2-elantech-touchpad"},
+                    ],
+                    "touchpads": [{"name": "etps/2-elantech-touchpad"}],
+                }
+            )
         elif "clients" in cmd:
             r.stdout = json.dumps([])
         elif "layers" in cmd:
@@ -852,7 +1056,7 @@ class HyprlandTests(unittest.TestCase):
 
     def test_set_transform(self):
         ok, msg = self.hypr.set_transform("eDP-1", 2)
-        self.assertTrue(ok)
+        self.assertTrue(ok, msg)
 
     def test_current_transform(self):
         self.assertEqual(self.hypr.current_transform("eDP-1"), 0)
@@ -878,26 +1082,210 @@ class HyprlandTests(unittest.TestCase):
         self.assertTrue(self.hypr.session_locked())
 
     def test_match_device(self):
-        self.assertEqual(self.hypr.match_device("wacom.*finger", ("touch",)), "wacom-pen-and-multitouch-sensor-finger")
+        self.assertEqual(
+            self.hypr.match_device("wacom.*finger", ("touch",)),
+            "wacom-pen-and-multitouch-sensor-finger",
+        )
 
     def test_match_any(self):
-        result = self.hypr.match_any(["at-translated-set-2-keyboard"], ["at-translated-set-2-keyboard", "other"])
+        result = self.hypr.match_any(
+            ["at-translated-set-2-keyboard"], ["at-translated-set-2-keyboard", "other"]
+        )
         self.assertEqual(result, ["at-translated-set-2-keyboard"])
 
     def test_set_device(self):
         ok, msg = self.hypr.set_device("test", transform=1, output="eDP-1")
-        self.assertTrue(ok)
+        self.assertTrue(ok, msg)
 
     def test_set_device_transform(self):
         ok, msg = self.hypr.set_device_transform("test", 1, "eDP-1")
-        self.assertTrue(ok)
+        self.assertTrue(ok, msg)
 
     def test_set_device_enabled(self):
         ok, msg = self.hypr.set_device_enabled("test", False)
-        self.assertTrue(ok)
+        self.assertTrue(ok, msg)
 
     def test_available(self):
         self.assertTrue(self.hypr.available)
+
+
+class RotationTransactionTests(unittest.TestCase):
+    """Panel, pen and finger must move together, in one round trip.
+
+    On Windows the display driver committed all three at once, so there was no
+    interval in which the picture had turned and the input had not. Here each
+    call is its own `hyprctl eval`, so three sequential ones can land either
+    side of a compositor reload and leave the pen rotated against the panel.
+
+    Hyprland's Lua config is evaluated as a chunk rather than an expression, so
+    several statements separated by `;` go in one `eval`. That was verified
+    against the running compositor before being relied on: panel + finger + pen
+    in a single call returns `ok` and applies.
+    """
+
+    TOUCH = "wacom-pen-and-multitouch-sensor-finger"
+    PEN = "wacom-pen-and-multitouch-sensor-pen"
+
+    def _hypr(self):
+        hypr = fold.Hyprland.__new__(fold.Hyprland)
+        hypr.binary = "/usr/bin/hyprctl"
+        hypr.env = {"HYPRLAND_INSTANCE_SIGNATURE": "test"}
+        hypr._monitor_spec = {}
+        self.calls = []
+        hypr.run = lambda argv, timeout=5.0: (
+            self.calls.append(argv),
+            (0, "ok"),
+        )[1]
+        hypr.monitor = lambda name: {
+            "name": name,
+            "width": 1366,
+            "height": 768,
+            "refreshRate": 60.0,
+            "x": 0,
+            "y": 0,
+            "scale": 1.0,
+            "transform": 0,
+        }
+        return hypr
+
+    def test_the_whole_rotation_is_a_single_call(self):
+        hypr = self._hypr()
+        ok, msg = hypr.rotate_transaction("eDP-1", 3, [self.TOUCH, self.PEN])
+        self.assertTrue(ok, msg)
+        self.assertEqual(len(self.calls), 1)
+
+    def test_that_one_call_carries_the_panel_and_both_nodes(self):
+        hypr = self._hypr()
+        hypr.rotate_transaction("eDP-1", 3, [self.TOUCH, self.PEN])
+        lua = self.calls[0][1]
+        self.assertIn("hl.monitor(", lua)
+        self.assertIn("transform = 3", lua)
+        self.assertIn(self.TOUCH, lua)
+        self.assertIn(self.PEN, lua)
+        # Three statements in one chunk, not three evaluations.
+        self.assertEqual(lua.count("hl."), 3)
+
+    def test_a_missing_device_is_skipped_rather_than_failing_the_rotation(self):
+        # The daemon only knows about the nodes Hyprland reported. An absent
+        # one must not leave a stray `hl.device({ name = , ...})` in the chunk,
+        # which is a Lua syntax error and would take the panel down with it.
+        hypr = self._hypr()
+        ok, _ = hypr.rotate_transaction("eDP-1", 0, [None, self.PEN])
+        self.assertTrue(ok)
+        lua = self.calls[0][1]
+        self.assertNotIn("name = null", lua)
+        self.assertEqual(lua.count("hl.device("), 1)
+
+    def test_the_monitor_geometry_is_looked_up_once_not_per_rotation(self):
+        # Re-deriving mode/position/scale means a `monitors -j` before every
+        # rotation, which was half the cost of turning the screen.
+        hypr = self._hypr()
+        looked_up = []
+        real_monitor = hypr.monitor
+
+        def counting(name):
+            looked_up.append(name)
+            return real_monitor(name)
+
+        hypr.monitor = counting
+        for transform in (1, 2, 3, 0):
+            hypr.rotate_transaction("eDP-1", transform, [])
+        self.assertEqual(len(looked_up), 1)
+
+    def test_the_cached_geometry_is_dropped_when_the_monitor_is_re_read(self):
+        # A resolution or scale change has to be noticed, or a rotation would be
+        # built from the geometry the monitor used to have.
+        hypr = self._hypr()
+        hypr.rotate_transaction("eDP-1", 0, [])
+        self.assertIn("eDP-1", hypr._monitor_spec)
+        hypr.current_transform("eDP-1")
+        self.assertEqual(hypr._monitor_spec, {})
+
+    def test_an_unknown_panel_fails_instead_of_emitting_a_broken_call(self):
+        hypr = self._hypr()
+        hypr.monitor = lambda name: None
+        ok, _msg = hypr.rotate_transaction("nope", 0, [])
+        self.assertFalse(ok)
+        self.assertEqual(self.calls, [])
+
+
+class ModeBandTests(unittest.TestCase):
+    """The 190 crossing has a band, not a line.
+
+    The EC does not engage at exactly 190 and release at exactly 190. Dell's
+    Windows convertible documentation puts the keyboard cut-out near 225 --
+    inside Lenovo's 190-270 tablet band, not at its edge -- because the
+    firmware engages partway through with hysteresis of its own. A bare
+    comparison on one threshold chatters whenever a lid is rested near it,
+    which is exactly where a person tends to leave one.
+    """
+
+    def _daemon(self, release=170.0):
+        daemon = fold.FoldDaemon.__new__(fold.FoldDaemon)
+        daemon.settings = {
+            "bookExitDeg": 190.0,
+            "bookReleaseDeg": release,
+            "tentEnterDeg": 270.0,
+            "tentExitDeg": 340.0,
+        }
+        daemon.state = fold.State()
+        return daemon
+
+    def test_the_published_boundaries_are_unchanged_for_a_cold_start(self):
+        # Nothing is known about the previous mode, so these are the user
+        # guide's ranges exactly. The existing Mode tests pin the same thing.
+        daemon = self._daemon()
+        self.assertEqual(daemon.mode_for(189.0), ("book", False))
+        self.assertEqual(daemon.mode_for(190.0), ("tablet", True))
+
+    def test_a_lid_left_on_the_boundary_does_not_flutter(self):
+        daemon = self._daemon()
+        # Entered tablet, then the lid settles a hair below the threshold.
+        self.assertEqual(daemon.mode_for(191.0, "book"), ("tablet", True))
+        # Still inside the band: stays a tablet, so the keyboard stays off.
+        self.assertEqual(daemon.mode_for(185.0, "tablet"), ("tablet", True))
+        self.assertEqual(daemon.mode_for(180.0, "tablet"), ("tablet", True))
+
+    def test_it_comes_back_to_book_once_it_is_below_the_release(self):
+        daemon = self._daemon()
+        self.assertEqual(daemon.mode_for(169.0, "tablet"), ("book", False))
+        self.assertEqual(daemon.mode_for(100.0, "tablet"), ("book", False))
+
+    def test_a_round_trip_across_the_boundary_never_toggles(self):
+        # The failure this exists to prevent: a lid parked at the edge, jittering
+        # either side of it, taking the keyboard on and off every few seconds.
+        # One crossing in, and never back out while it stays in the band.
+        daemon = self._daemon()
+        mode = "book"
+        readings = [189, 190, 189, 191, 190, 189, 190, 189]
+        seen = []
+        for fold_deg in readings:
+            mode, _folded = daemon.mode_for(float(fold_deg), mode)
+            seen.append(mode)
+        self.assertEqual(seen[0], "book")
+        self.assertEqual(set(seen[1:]), {"tablet"})
+        # And it does come back once the lid genuinely retreats.
+        self.assertEqual(daemon.mode_for(150.0, mode), ("book", False))
+
+    def test_entering_from_book_still_happens_at_the_published_angle(self):
+        daemon = self._daemon()
+        self.assertEqual(daemon.mode_for(190.0, "book"), ("tablet", True))
+        self.assertEqual(daemon.mode_for(189.0, "book"), ("book", False))
+
+    def test_the_tent_boundaries_stay_exact(self):
+        # The band is only for the crossing that gates input. The other two
+        # change a label and nothing else, so they must keep meaning what the
+        # user guide says: tablet to 269, tent from 270 to 339, stand from 340.
+        daemon = self._daemon()
+        self.assertEqual(daemon.mode_for(269.0, "tablet"), ("tablet", True))
+        self.assertEqual(daemon.mode_for(270.0, "tablet"), ("tent", False))
+        self.assertEqual(daemon.mode_for(339.0, "tent"), ("tent", False))
+        self.assertEqual(daemon.mode_for(340.0, "tent"), ("tablet", True))
+
+    def test_the_band_is_configurable(self):
+        narrow = self._daemon(release=188.0)
+        self.assertEqual(narrow.mode_for(188.5, "tablet"), ("tablet", True))
+        self.assertEqual(narrow.mode_for(187.0, "tablet"), ("book", False))
 
 
 class SessionLockTests(unittest.TestCase):
@@ -962,7 +1350,9 @@ class SessionLockTests(unittest.TestCase):
         # returns None so `set_devices` leaves the keyboard alone.
         self.assertIs(self._hypr("", rc=1).session_locked(), False)
         self.assertIs(
-            self._hypr("", rc=1, clients='[{"class": "waylock", "title": ""}]').session_locked(),
+            self._hypr(
+                "", rc=1, clients='[{"class": "waylock", "title": ""}]'
+            ).session_locked(),
             True,
         )
 
@@ -991,11 +1381,38 @@ class SessionLockTests(unittest.TestCase):
         daemon.set_devices(True, True)
         self.assertFalse(daemon.state.keyboard_disabled)
 
+    def test_the_kept_on_reason_is_cleared_once_the_session_unlocks(self):
+        # The reason is recomputed on every call, not set once under the lock.
+        # It used to be set under the lock and never cleared, so the panel kept
+        # claiming the keyboard was "kept on" after the session had been
+        # unlocked and the keyboard had been switched off normally.
+        daemon = bare_daemon(lockKeyboard=True, lockPointers=True)
+        daemon.state.keyboard_disabled = False
+        daemon.state.pointers_disabled = False
+        daemon.hypr = MagicMock()
+        daemon.keyboards, daemon.pointers, daemon.touchpads = ["kb"], ["ptr"], ["pad"]
+
+        daemon.hypr.session_locked.return_value = True
+        daemon.set_devices(True, True)
+        self.assertEqual(daemon.state.lock_safe, "kept on: the session is locked")
+        self.assertFalse(daemon.state.keyboard_disabled)
+
+        # Unlocked: the keyboard is now the thing being asked for, and the
+        # stale explanation must not outlive the situation that produced it.
+        daemon.hypr.session_locked.return_value = False
+        daemon.set_devices(True, True)
+        self.assertEqual(daemon.state.lock_safe, "")
+        self.assertTrue(daemon.state.keyboard_disabled)
+
 
 class OnScreenKeyboardTests(unittest.TestCase):
     def setUp(self):
         self._real_path = fold.Path
-        self.settings = {"oskPlugins": {"test-plugin": ""}, "oskCommand": "", "oskPlugin": ""}
+        self.settings = {
+            "oskPlugins": {"test-plugin": ""},
+            "oskCommand": "",
+            "oskPlugin": "",
+        }
 
     def test_installed_empty(self):
         osk = fold.OnScreenKeyboard(self.settings)
@@ -1028,9 +1445,11 @@ class FoldDaemonStepTests(unittest.TestCase):
         self._real_shell = fold.SHELL_JSON
         self._shell_td = tempfile.TemporaryDirectory()
         fold.SHELL_JSON = Path(self._shell_td.name) / "shell.json"
-        fold.SHELL_JSON.write_text(json.dumps(
-            {"bar": {"layout": {"right": [{"id": "estrocondoso.yoga260-fold"}]}}}
-        ))
+        fold.SHELL_JSON.write_text(
+            json.dumps(
+                {"bar": {"layout": {"right": [{"id": "estrocondoso.yoga260-fold"}]}}}
+            )
+        )
         self.addCleanup(self._restore_shell)
         self.daemon = fold.FoldDaemon.__new__(fold.FoldDaemon)
         self.daemon.settings = {
@@ -1062,7 +1481,9 @@ class FoldDaemonStepTests(unittest.TestCase):
             "reportTiltResidualDeg": 25.0,
         }
         self.daemon.state = fold.State()
-        self.daemon.machine = fold.Machine("LENOVO", "20FE", "ThinkPad Yoga 260", "31", "20FES04T1M", "N1GETA9W")
+        self.daemon.machine = fold.Machine(
+            "LENOVO", "20FE", "ThinkPad Yoga 260", "31", "20FES04T1M", "N1GETA9W"
+        )
         self.daemon.hypr = MagicMock()
         self.daemon.hypr.env = {}
         self.daemon.hypr.available = True
@@ -1072,12 +1493,18 @@ class FoldDaemonStepTests(unittest.TestCase):
         self.daemon.accel.device = Path("/dev/iio:device0")
         self.daemon.accel.scale = 1.0
         self.daemon.accel.hz = 10.0
-        self.daemon.accel.matrix = [[-1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, -1.0, 0.0]]
+        self.daemon.accel.matrix = [
+            [-1.0, 0.0, 0.0],
+            [0.0, 0.0, -1.0],
+            [0.0, -1.0, 0.0],
+        ]
         self.daemon.accel.has_kernel_matrix = False
         self.daemon.accel.reader.rejected = 0
         self.daemon.accel.reader.tries = 0
         self.daemon.accel.reader.rejection_rate = 0.0
-        self.daemon.accel.read.return_value = fold.AccelSample((0, -9.22, -1.29), (0.0, 0.92, 0.39), 9.8, True)
+        self.daemon.accel.read.return_value = fold.AccelSample(
+            (0, -9.22, -1.29), (0.0, 0.92, 0.39), 9.8, True
+        )
         self.daemon.hinge = MagicMock()
         self.daemon.hinge.available = True
         self.daemon.hinge.device = Path("/dev/iio:device5")
@@ -1085,7 +1512,9 @@ class FoldDaemonStepTests(unittest.TestCase):
         self.daemon.hinge.hz = 10.0
         self.daemon.hinge.hysteresis = 1.0
         self.daemon.hinge.labels = {}
-        self.daemon.hinge.read.return_value = fold.HingeSample(102.0, 101.0, 359.0, 102.0, 1.0, True)
+        self.daemon.hinge.read_fold.return_value = fold.HingeSample(
+            102.0, 101.0, 359.0, 102.0, 1.0, True
+        )
         self.daemon.motion = MagicMock()
         self.daemon.motion.available = True
         self.daemon.motion.device = Path("/dev/iio:device1")
@@ -1113,7 +1542,7 @@ class FoldDaemonStepTests(unittest.TestCase):
         self.daemon.state.pen = "wacom-pen-and-multitouch-sensor-pen"
         self.daemon.state.panel = "eDP-1"
         self.daemon.emit = lambda payload: None
-        self.daemon.hypr.set_transform.return_value = (True, "")
+        self.daemon.hypr.rotate_transaction.return_value = (True, "")
         self.daemon.hypr.set_device_transform.return_value = (True, "")
         self.daemon.hypr.set_device_enabled.return_value = (True, "")
         # The shape `Hyprland.device_names()` actually returns: one key per kind
@@ -1128,8 +1557,14 @@ class FoldDaemonStepTests(unittest.TestCase):
             "touchpad": ["etps/2-elantech-touchpad"],
             "keyboard": ["at-translated-set-2-keyboard"],
         }
-        self.daemon.hypr.match_device.side_effect = lambda pattern, kinds: "wacom-pen-and-multitouch-sensor-finger" if "finger" in pattern else "wacom-pen-and-multitouch-sensor-pen"
-        self.daemon.hypr.match_any.side_effect = lambda candidates, present: [c for c in candidates if c in present]
+        self.daemon.hypr.match_device.side_effect = lambda pattern, kinds: (
+            "wacom-pen-and-multitouch-sensor-finger"
+            if "finger" in pattern
+            else "wacom-pen-and-multitouch-sensor-pen"
+        )
+        self.daemon.hypr.match_any.side_effect = lambda candidates, present: [
+            c for c in candidates if c in present
+        ]
         self.daemon.hypr.internal_monitor.return_value = "eDP-1"
         self.daemon.hypr.session_locked.return_value = False
 
@@ -1142,17 +1577,23 @@ class FoldDaemonStepTests(unittest.TestCase):
         self.assertIsInstance(result, bool)
 
     def test_step_tablet_mode(self):
-        self.daemon.hinge.read.return_value = fold.HingeSample(200.0, 200.0, 359.0, 200.0, 1.0, True)
+        self.daemon.hinge.read_fold.return_value = fold.HingeSample(
+            200.0, 200.0, 359.0, 200.0, 1.0, True
+        )
         result = self.daemon.step()
         self.assertIsInstance(result, bool)
 
     def test_step_tent_mode(self):
-        self.daemon.hinge.read.return_value = fold.HingeSample(300.0, 300.0, 359.0, 300.0, 1.0, True)
+        self.daemon.hinge.read_fold.return_value = fold.HingeSample(
+            300.0, 300.0, 359.0, 300.0, 1.0, True
+        )
         result = self.daemon.step()
         self.assertIsInstance(result, bool)
 
     def test_step_stand_mode(self):
-        self.daemon.hinge.read.return_value = fold.HingeSample(350.0, 350.0, 359.0, 350.0, 1.0, True)
+        self.daemon.hinge.read_fold.return_value = fold.HingeSample(
+            350.0, 350.0, 359.0, 350.0, 1.0, True
+        )
         result = self.daemon.step()
         self.assertIsInstance(result, bool)
 
@@ -1161,70 +1602,106 @@ class FoldDaemonStepTests(unittest.TestCase):
         result = self.daemon.step()
         self.assertIsInstance(result, bool)
         self.assertTrue(self.daemon.state.messages)
+        # The whole point of the gate: a machine the plugin was not written for
+        # must get no hyprctl writes at all, not a rotation the daemon happens
+        # to decide on the way past.
+        self.daemon.hypr.rotate_transaction.assert_not_called()
+        self.daemon.hypr.set_device_enabled.assert_not_called()
 
     def test_step_blocked_by_no_panel(self):
         self.daemon.state.panel = None
         result = self.daemon.step()
         self.assertIsInstance(result, bool)
         self.assertTrue(self.daemon.state.messages)
+        self.daemon.hypr.rotate_transaction.assert_not_called()
+        self.daemon.hypr.set_device_enabled.assert_not_called()
 
     def test_step_blocked_by_no_touch(self):
         self.daemon.state.touch = None
         result = self.daemon.step()
         self.assertIsInstance(result, bool)
         self.assertTrue(self.daemon.state.messages)
+        self.daemon.hypr.rotate_transaction.assert_not_called()
+        self.daemon.hypr.set_device_enabled.assert_not_called()
 
     def test_step_blocked_by_no_pen(self):
         self.daemon.state.pen = None
         result = self.daemon.step()
         self.assertIsInstance(result, bool)
         self.assertTrue(self.daemon.state.messages)
+        self.daemon.hypr.rotate_transaction.assert_not_called()
+        self.daemon.hypr.set_device_enabled.assert_not_called()
 
     def test_step_blocked_by_bad_matrix(self):
         self.daemon.accel.matrix = [[2.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
         result = self.daemon.step()
         self.assertIsInstance(result, bool)
         self.assertTrue(self.daemon.state.messages)
+        self.daemon.hypr.rotate_transaction.assert_not_called()
+        self.daemon.hypr.set_device_enabled.assert_not_called()
 
     def test_step_hinge_not_consistent(self):
-        self.daemon.hinge.read.return_value = fold.HingeSample(102.0, 50.0, 359.0, None, None, False)
+        self.daemon.hinge.read_fold.return_value = fold.HingeSample(
+            102.0, 50.0, 359.0, None, None, False
+        )
         result = self.daemon.step()
         self.assertIsInstance(result, bool)
         self.assertTrue(self.daemon.state.messages)
+        # Reported nonsense from the hinge means hold, not turn: a reading the
+        # driver itself flags as inconsistent must never reach the panel.
+        self.daemon.hypr.rotate_transaction.assert_not_called()
 
     def test_step_moving(self):
         self.daemon.motion.is_still.return_value = False
         result = self.daemon.step()
         self.assertIsInstance(result, bool)
         self.assertTrue(self.daemon.state.messages)
+        # The stillness gate is what stops the screen reacting while the
+        # machine is being carried.
+        self.daemon.hypr.rotate_transaction.assert_not_called()
 
     def test_step_tilt_residual_high(self):
-        self.daemon.hinge.read.return_value = fold.HingeSample(102.0, 101.0, 359.0, 102.0, 30.0, True)
+        self.daemon.hinge.read_fold.return_value = fold.HingeSample(
+            102.0, 101.0, 359.0, 102.0, 30.0, True
+        )
         result = self.daemon.step()
         self.assertIsInstance(result, bool)
         self.assertTrue(self.daemon.state.tilt_note)
+        # The other half of the contract: `angl2` is static on this machine, so
+        # a large residual is reported and must not be mistaken for a gate. If
+        # this ever stops being called, the note has quietly become a veto.
+        self.daemon.hypr.rotate_transaction.assert_called()
 
     def test_step_applies_transform(self):
         self.daemon.hypr.current_transform.return_value = 2
         self.daemon.state.transform = 0
         result = self.daemon.step()
         self.assertIsInstance(result, bool)
-        self.daemon.hypr.set_transform.assert_called()
+        self.daemon.hypr.rotate_transaction.assert_called()
 
     def test_step_tablet_mode_disables_keyboard(self):
-        self.daemon.hinge.read.return_value = fold.HingeSample(200.0, 200.0, 359.0, 200.0, 1.0, True)
+        self.daemon.hinge.read_fold.return_value = fold.HingeSample(
+            200.0, 200.0, 359.0, 200.0, 1.0, True
+        )
         self.daemon.state.keyboard_disabled = False
         result = self.daemon.step()
         self.assertIsInstance(result, bool)
         self.assertTrue(self.daemon.state.keyboard_disabled)
 
     def test_step_tablet_mode_enables_osk(self):
-        self.daemon.hinge.read.return_value = fold.HingeSample(200.0, 200.0, 359.0, 200.0, 1.0, True)
+        self.daemon.hinge.read_fold.return_value = fold.HingeSample(
+            200.0, 200.0, 359.0, 200.0, 1.0, True
+        )
         self.daemon.settings["oskAuto"] = True
         self.daemon.state.osk_asked = False
         self.daemon.osk = MagicMock()
         self.daemon.osk.toggle.return_value = {"ok": True}
-        self.daemon.osk.as_dict.return_value = {"installed": [], "drivable": False, "auto": True, "pluginId": ""}
+        self.daemon.osk.as_dict.return_value = {
+            "installed": [],
+            "drivable": False,
+            "auto": True,
+            "pluginId": "",
+        }
         self.daemon.reload_settings = MagicMock()
         result = self.daemon.step()
         self.assertIsInstance(result, bool)
@@ -1273,11 +1750,13 @@ class FoldDaemonStepTests(unittest.TestCase):
         self.daemon.hypr.current_transform.return_value = 2
         transform, why = self.daemon.desired_transform({"candidates": []}, "book")
         self.assertEqual(why, "locked")
+        self.assertEqual(transform, 2)
 
     def test_desired_transform_normal(self):
         pose = {"candidates": [{"label": "flat", "sign": 1, "tiltDeg": 90.0}]}
         transform, why = self.daemon.desired_transform(pose, "book")
         self.assertEqual(why, "normal")
+        self.assertEqual(transform, 0)
 
     def test_desired_transform_still(self):
         self.daemon.still = False
@@ -1285,6 +1764,9 @@ class FoldDaemonStepTests(unittest.TestCase):
         pose = {"candidates": [{"label": "flat", "sign": 1, "tiltDeg": 90.0}]}
         transform, why = self.daemon.desired_transform(pose, "book")
         self.assertEqual(why, "turning")
+        # While moving the screen keeps what it had, rather than adopting the
+        # pose the accelerometer is mid-way through reporting.
+        self.assertEqual(transform, 2)
 
     def test_desired_transform_settling(self):
         self.daemon.still = True
@@ -1294,11 +1776,18 @@ class FoldDaemonStepTests(unittest.TestCase):
         pose = {"candidates": [{"label": "right", "sign": 1, "tiltDeg": 80.0}]}
         transform, why = self.daemon.desired_transform(pose, "book")
         self.assertIn("settling", why)
+        self.assertEqual(transform, 0)
 
     def test_set_devices_no_change(self):
         self.daemon.state.keyboard_disabled = True
         self.daemon.state.pointers_disabled = True
         self.daemon.set_devices(True, True)
+        # `set_devices` runs five times a second, and the whole reason it
+        # returns early is that hyprctl must not be spawned for a state that
+        # is already true. Without this the test only proves the call returns.
+        self.daemon.hypr.set_device_enabled.assert_not_called()
+        self.assertTrue(self.daemon.state.keyboard_disabled)
+        self.assertTrue(self.daemon.state.pointers_disabled)
 
     def test_set_devices_change(self):
         self.daemon.state.keyboard_disabled = False
@@ -1326,6 +1815,22 @@ class FoldDaemonStepTests(unittest.TestCase):
         self.assertIn("hinge", pose)
         self.assertIn("fold", pose)
 
+    def _pose(self, fold_deg=102.0, vector=(0.0, 0.92, 0.39)):
+        """The sample `changed()` judges, built rather than read.
+
+        `changed()` used to read the sensors itself, so the tests set up the
+        device mocks and let it. It is now handed the pass's sample by `run()`,
+        which is the whole point of the change, so the tests build one -- and
+        building it is what lets them prove that the very same reading reaches
+        both the detection and the decision.
+        """
+        return {
+            "accel": fold.AccelSample((0, -9.22, -1.29), tuple(vector), 9.8, True),
+            "hinge": fold.HingeSample(
+                fold_deg, fold_deg - 1.0, 359.0, fold_deg, 1.0, True
+            ),
+        }
+
     def test_mode_for_book(self):
         self.assertEqual(self.daemon.mode_for(0.0), ("book", False))
         self.assertEqual(self.daemon.mode_for(189.0), ("book", False))
@@ -1344,11 +1849,11 @@ class FoldDaemonStepTests(unittest.TestCase):
 
     def test_changed_no_change(self):
         self.daemon._last_key = (102.0, 0.0, 0.92, 0.39, 9.8)
-        self.assertFalse(self.daemon.changed())
+        self.assertFalse(self.daemon.changed(self._pose()))
 
     def test_changed_with_change(self):
         self.daemon._last_key = (999.0, 0.0, 0.92, 0.39, 9.8)
-        self.assertTrue(self.daemon.changed())
+        self.assertTrue(self.daemon.changed(self._pose()))
 
     def test_settling_no_decision(self):
         self.daemon.decision = None
@@ -1384,37 +1889,117 @@ class FoldDaemonStepTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             real = fold.SHELL_JSON
             fold.SHELL_JSON = Path(td) / "shell.json"
-            fold.SHELL_JSON.write_text(json.dumps({}))
+            fold.SHELL_JSON.write_text(self._shell_with({"locked": True}))
+            self.daemon.settings["locked"] = False
             self.daemon._settings_stamp = fold.SHELL_JSON.stat().st_mtime_ns
             self.daemon.reload_settings()
+            # The file on disk disagrees with the daemon, but its mtime is the
+            # one the daemon last read. The stamp is what keeps this off the
+            # hot path ten times a second, so a reload that happened here would
+            # be the bug.
+            self.assertFalse(self.daemon.settings["locked"])
             fold.SHELL_JSON = real
 
     def test_reload_settings_with_change(self):
         with tempfile.TemporaryDirectory() as td:
             real = fold.SHELL_JSON
             fold.SHELL_JSON = Path(td) / "shell.json"
-            fold.SHELL_JSON.write_text(json.dumps({}))
+            fold.SHELL_JSON.write_text(self._shell_with({"locked": True}))
+            self.daemon.settings["locked"] = False
             self.daemon._settings_stamp = None
             self.daemon.reload_settings()
+            # The stamp disagreed, so the file has to be read and the new value
+            # has to land -- otherwise a tap on "Lock" in the panel does nothing
+            # until the daemon restarts.
+            self.assertTrue(self.daemon.settings["locked"])
+            self.assertEqual(
+                self.daemon._settings_stamp, fold.SHELL_JSON.stat().st_mtime_ns
+            )
             fold.SHELL_JSON = real
+
+    def test_reload_settings_picks_up_a_changed_osk_plugin(self):
+        # The comparison set used to be SETTING_KEYS minus `oskPlugin`, so
+        # changing the preferred keyboard from the panel did nothing until the
+        # daemon was restarted. End to end: a value written to disk lands in
+        # the live settings on the next pass, and the stamp moves with it.
+        with tempfile.TemporaryDirectory() as td:
+            real = fold.SHELL_JSON
+            fold.SHELL_JSON = Path(td) / "shell.json"
+            fold.SHELL_JSON.write_text(self._shell_with({"oskPlugin": "plugin-one"}))
+            self.daemon._settings_stamp = None
+            self.daemon.reload_settings()
+            self.assertEqual(self.daemon.settings["oskPlugin"], "plugin-one")
+
+            # A second write. The mtime is forced forward rather than left to
+            # the clock, because a filesystem with coarse timestamps could put
+            # both writes in the same tick and the stamp would then match --
+            # silently skipping the reload this test exists to check.
+            fold.SHELL_JSON.write_text(self._shell_with({"oskPlugin": "plugin-two"}))
+            stamp = fold.SHELL_JSON.stat().st_mtime_ns
+            os.utime(fold.SHELL_JSON, ns=(stamp + 1_000_000_000, stamp + 1_000_000_000))
+            self.daemon.reload_settings()
+            self.assertEqual(self.daemon.settings["oskPlugin"], "plugin-two")
+            fold.SHELL_JSON = real
+
+    @staticmethod
+    def _shell_with(entry_values):
+        """A shell.json holding one plugin entry with these values on it."""
+        entry = {"id": fold.PLUGIN_ID, **entry_values}
+        return json.dumps({"bar": {"layout": {"right": [entry]}}})
 
     def test_verify_no_change(self):
         self.daemon.state.transform = 0
         self.daemon.hypr.current_transform.return_value = 0
         self.daemon.verify()
+        # `verify` runs on a timer for the life of the session; re-issuing a
+        # transform that is already in force would be a hyprctl call per tick
+        # for no reason.
+        self.daemon.hypr.rotate_transaction.assert_not_called()
 
     def test_verify_reasserts(self):
         self.daemon.state.transform = 2
         self.daemon.hypr.current_transform.return_value = 0
         self.daemon.verify()
+        # Something straightened the panel behind the daemon's back, and the
+        # whole contract of `verify` is that it puts the transform back.
+        self.daemon.hypr.rotate_transaction.assert_called_once_with(
+            "eDP-1",
+            2,
+            [
+                "wacom-pen-and-multitouch-sensor-finger",
+                "wacom-pen-and-multitouch-sensor-pen",
+            ],
+        )
 
     def test_announce_no_error(self):
         self.daemon.state.last_error = ""
-        self.daemon.announce()
+        with (
+            patch.object(
+                fold, "which", return_value="/usr/bin/omarchy-osd"
+            ) as which_mock,
+            patch.object(fold.subprocess, "run") as run_mock,
+        ):
+            self.daemon.announce()
+        which_mock.assert_called_once_with("omarchy-osd")
+        run_mock.assert_called_once()
+        args = run_mock.call_args.args[0]
+        self.assertEqual(args[1], "-i")
+        self.assertEqual(args[2], fold.ICONS["laptop"])
+        self.assertEqual(args[4], "Laptop · landscape")
 
     def test_announce_with_error(self):
         self.daemon.state.last_error = "test"
-        self.daemon.announce()
+        with (
+            patch.object(
+                fold, "which", return_value="/usr/bin/omarchy-osd"
+            ) as which_mock,
+            patch.object(fold.subprocess, "run") as run_mock,
+        ):
+            self.daemon.announce()
+        # A panel that already has an error on it must not also announce a pose
+        # -- the early return is the whole guard.
+        which_mock.assert_not_called()
+        run_mock.assert_not_called()
 
     def test_write_state(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1437,7 +2022,9 @@ class FoldDaemonStepTests(unittest.TestCase):
         # a different shape, and it used to raise KeyError on the missing key
         # rather than fail on something about device resolution.
         self.daemon.resolve_devices()
-        self.assertEqual(self.daemon.state.touch, "wacom-pen-and-multitouch-sensor-finger")
+        self.assertEqual(
+            self.daemon.state.touch, "wacom-pen-and-multitouch-sensor-finger"
+        )
         self.assertEqual(self.daemon.state.pen, "wacom-pen-and-multitouch-sensor-pen")
         self.assertEqual(self.daemon.state.panel, "eDP-1")
         self.assertEqual(self.daemon.keyboards, ["at-translated-set-2-keyboard"])
@@ -1451,7 +2038,9 @@ class FoldDaemonStepTests(unittest.TestCase):
         # `self.touchpads` always empty, and a folded machine kept a live
         # touchpad under a dead keyboard -- the exact thing `lockPointers` is
         # there to prevent, and invisible because nothing errored.
-        self.assertIn("etps/2-elantech-touchpad", self.daemon.hypr.device_names()["touchpad"])
+        self.assertIn(
+            "etps/2-elantech-touchpad", self.daemon.hypr.device_names()["touchpad"]
+        )
         self.assertNotIn(
             "etps/2-elantech-touchpad", self.daemon.hypr.device_names()["pointer"]
         )
@@ -1462,7 +2051,9 @@ class FoldDaemonStepTests(unittest.TestCase):
     def test_folding_really_does_switch_the_touchpad_off(self):
         # The end the bug had: a populated list is only worth having if the
         # devices on it are the ones that get disabled.
-        self.daemon.hinge.read.return_value = fold.HingeSample(200.0, 200.0, 359.0, 200.0, 1.0, True)
+        self.daemon.hinge.read_fold.return_value = fold.HingeSample(
+            200.0, 200.0, 359.0, 200.0, 1.0, True
+        )
         self.daemon.state.keyboard_disabled = False
         self.daemon.state.pointers_disabled = False
         self.daemon.step()
@@ -1527,33 +2118,15 @@ class CLITests(unittest.TestCase):
         self.assertEqual(fold.main(["libwacom", "status"]), 0)
 
     def test_cmd_libwacom_install(self):
-        with self._libwacom_in_tmpdir() as entry:
+        with libwacom_in_tmpdir() as entry:
             self.assertEqual(fold.main(["libwacom", "install"]), 0)
             self.assertTrue(entry.exists())
 
     def test_cmd_libwacom_remove(self):
-        with self._libwacom_in_tmpdir() as entry:
+        with libwacom_in_tmpdir() as entry:
             fold.main(["libwacom", "install"])
             self.assertEqual(fold.main(["libwacom", "remove"]), 0)
             self.assertFalse(entry.exists())
-
-    @contextlib.contextmanager
-    def _libwacom_in_tmpdir(self):
-        """Redirect both libwacom globals into a temporary directory.
-
-        `LIBWACOM_ENTRY` is the path the install and remove actually write, and
-        it is a separate module-level constant from `LIBWACOM_LOCAL`. Patching
-        only the directory would leave every one of these tests writing into the
-        real ~/.config/libwacom on the machine running them.
-        """
-        with tempfile.TemporaryDirectory() as td:
-            real_dir, real_entry = fold.LIBWACOM_LOCAL, fold.LIBWACOM_ENTRY
-            fold.LIBWACOM_LOCAL = Path(td) / "libwacom"
-            fold.LIBWACOM_ENTRY = fold.LIBWACOM_LOCAL / "wacom-isdv4-5091.tablet"
-            try:
-                yield fold.LIBWACOM_ENTRY
-            finally:
-                fold.LIBWACOM_LOCAL, fold.LIBWACOM_ENTRY = real_dir, real_entry
 
     def test_cmd_hwdb_show(self):
         self.assertEqual(fold.main(["hwdb", "show"]), 0)
@@ -1586,9 +2159,22 @@ class WriteShellEntryTests(unittest.TestCase):
         self._real_shell = fold.SHELL_JSON
         self._real_home = fold.Path.home
         import tempfile
+
         self.td = tempfile.TemporaryDirectory()
         self.shell_path = Path(self.td.name) / "shell.json"
-        self.shell_path.write_text(json.dumps({"bar": {"layout": {"right": [{"id": "estrocondoso.yoga260-fold", "locked": False}]}}}))
+        self.shell_path.write_text(
+            json.dumps(
+                {
+                    "bar": {
+                        "layout": {
+                            "right": [
+                                {"id": "estrocondoso.yoga260-fold", "locked": False}
+                            ]
+                        }
+                    }
+                }
+            )
+        )
         fold.SHELL_JSON = self.shell_path
         fold.Path.home = lambda: Path(self.td.name)
 
@@ -1617,17 +2203,32 @@ class WriteShellEntryTests(unittest.TestCase):
 
 class LibwacomTests(unittest.TestCase):
     def test_libwacom_status(self):
-        s = fold.libwacom_status()
+        with libwacom_in_tmpdir():
+            s = fold.libwacom_status()
         self.assertIn("installed", s)
         self.assertIn("covered", s)
 
     def test_libwacom_install(self):
-        result = fold.libwacom_install()
-        self.assertTrue(result["ok"])
+        # These two used to call install and remove with no redirection, so they
+        # wrote and then deleted the real ~/.config/libwacom entry on whichever
+        # machine ran the suite. Asserting the returned path is the temporary
+        # one is what makes a dropped redirect fail loudly instead of quietly
+        # mutating a real user's pen config again.
+        with libwacom_in_tmpdir() as entry:
+            result = fold.libwacom_install()
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["path"], str(entry))
+            self.assertTrue(entry.exists())
+            self.assertEqual(entry.name, "wacom-isdv4-5091.tablet")
 
     def test_libwacom_remove(self):
-        result = fold.libwacom_remove()
-        self.assertTrue(result["ok"])
+        with libwacom_in_tmpdir() as entry:
+            fold.libwacom_install()
+            self.assertTrue(entry.exists())
+            result = fold.libwacom_remove()
+            self.assertTrue(result["ok"])
+            self.assertTrue(result["removed"])
+            self.assertFalse(entry.exists())
 
 
 class HwdbTests(unittest.TestCase):
@@ -1701,6 +2302,7 @@ class Settings(unittest.TestCase):
 
     def test_a_torn_read_does_not_unlock_a_locked_screen(self):
         import tempfile as tf
+
         real = fold.SHELL_JSON
         data = real.read_text()
         with tf.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
@@ -1709,7 +2311,9 @@ class Settings(unittest.TestCase):
         try:
             fold.SHELL_JSON = torn
             self.assertIsNone(fold.shell_entry())
-            kept = fold.load_settings(fallback={"locked": True, "mapping": "rotated-180"})
+            kept = fold.load_settings(
+                fallback={"locked": True, "mapping": "rotated-180"}
+            )
             self.assertTrue(kept["locked"])
             self.assertEqual(kept["mapping"], "rotated-180")
         finally:
@@ -1728,8 +2332,137 @@ class Settings(unittest.TestCase):
 
     def test_the_matrix_default_survives_a_load(self):
         self.assertEqual(
-            fold.load_settings()["mountMatrix"], [list(r) for r in fold.DEFAULT_MOUNT_MATRIX]
+            fold.load_settings()["mountMatrix"],
+            [list(r) for r in fold.DEFAULT_MOUNT_MATRIX],
         )
+
+    def _write_entry(self, entry_values):
+        """Put one plugin entry holding these values onto the bar."""
+        fold.SHELL_JSON.write_text(
+            json.dumps(
+                {"bar": {"layout": {"right": [{"id": fold.PLUGIN_ID, **entry_values}]}}}
+            )
+        )
+
+    def test_a_stored_mount_matrix_is_read_back(self):
+        # `mountMatrix` is deliberately not in SETTING_KEYS, so this is the
+        # only path that can get a `calibrate --write` back out of shell.json.
+        # If it is dropped, the write is a no-op and calibration silently does
+        # nothing -- which is why it is asserted rather than assumed.
+        stored = [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]
+        self._write_entry({"mountMatrix": stored})
+        self.assertEqual(fold.load_settings()["mountMatrix"], stored)
+
+    def test_a_stored_matrix_that_is_not_a_rotation_is_ignored(self):
+        # A reflection: determinant -1, so every turn comes out inverted and
+        # looks plausible until the screen is upside down. It must fall back to
+        # the shipped matrix rather than being used.
+        reflection = [[-1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+        self._write_entry({"mountMatrix": reflection})
+        self.assertEqual(
+            fold.load_settings()["mountMatrix"],
+            [list(r) for r in fold.DEFAULT_MOUNT_MATRIX],
+        )
+
+    def test_a_stored_matrix_of_the_wrong_shape_is_ignored(self):
+        self._write_entry({"mountMatrix": [[1.0, 0.0], [0.0, 1.0]]})
+        self.assertEqual(
+            fold.load_settings()["mountMatrix"],
+            [list(r) for r in fold.DEFAULT_MOUNT_MATRIX],
+        )
+
+    def test_a_stored_matrix_that_is_not_numbers_is_ignored(self):
+        self._write_entry(
+            {"mountMatrix": [["a", "b", "c"], ["d", "e", "f"], ["g", "h", "i"]]}
+        )
+        self.assertEqual(
+            fold.load_settings()["mountMatrix"],
+            [list(r) for r in fold.DEFAULT_MOUNT_MATRIX],
+        )
+
+
+class IsRotationTests(unittest.TestCase):
+    """The one check standing between a stored matrix and the screen.
+
+    Every mount matrix passes through here -- on the way in from
+    `calibrate --write` and on the way out of shell.json -- so its two failure
+    modes are worth pinning separately: a reflection (determinant -1) and a
+    non-rotation that is not a reflection at all (a scale). Both must be
+    refused, and both look like perfectly ordinary 3x3 matrices of numbers.
+    """
+
+    def test_the_shipped_matrix_is_a_rotation(self):
+        self.assertTrue(fold.is_rotation(fold.DEFAULT_MOUNT_MATRIX))
+
+    def test_identity_is_a_rotation(self):
+        self.assertTrue(
+            fold.is_rotation([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+        )
+
+    def test_a_reflection_is_not_a_rotation(self):
+        self.assertFalse(
+            fold.is_rotation([[-1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+        )
+
+    def test_a_scale_is_not_a_rotation(self):
+        self.assertFalse(
+            fold.is_rotation([[2.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+        )
+
+    def test_a_shear_of_determinant_one_is_refused(self):
+        # determinant +1 but not orthonormal: row0 . row1 = 1. Accepted by a
+        # determinant-only check, so `is_rotation` checks the rows too -- a
+        # shear skews every angle without ever flipping the screen, and the
+        # matrix arrives from hand-typed numbers (`calibrate --write`, or a
+        # hand-edited shell.json). `calibration.md` and `hardware.md` both
+        # promise a "proper rotation" with "rows orthonormal".
+        shear = [[1.0, 1.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+        self.assertEqual(fold.determinant(shear), 1.0)
+        self.assertFalse(fold.is_rotation(shear))
+
+    def test_scaled_rows_are_refused_even_with_det_one(self):
+        # A row scaled down with another scaled up keeps det at +1.
+        scale = [[0.5, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 1.0]]
+        self.assertEqual(fold.determinant(scale), 1.0)
+        self.assertFalse(fold.is_rotation(scale))
+
+    def test_the_wrong_shape_is_not_a_rotation(self):
+        for matrix in (
+            [[1.0, 0.0], [0.0, 1.0]],
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0, 0.0]],
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            [],
+        ):
+            with self.subTest(matrix=matrix):
+                self.assertFalse(fold.is_rotation(matrix))
+
+    def test_a_ragged_row_is_not_a_rotation(self):
+        self.assertFalse(
+            fold.is_rotation([[1.0, 0.0, 0.0], [0.0, 1.0], [0.0, 0.0, 1.0]])
+        )
+
+    def test_something_that_is_not_a_matrix_at_all_is_not_a_rotation(self):
+        for matrix in (None, "identity", 42, {"rows": 3}, [1.0, 0.0, 0.0]):
+            with self.subTest(matrix=matrix):
+                self.assertFalse(fold.is_rotation(matrix))
+
+    def test_a_matrix_of_strings_that_parse_is_a_rotation(self):
+        # `calibrate --write` takes floats from argparse, but the value read
+        # back out of shell.json has been through JSON and could have been
+        # hand-edited as strings. float() accepts them, so the check does too.
+        self.assertTrue(
+            fold.is_rotation([["1", "0", "0"], ["0", "1", "0"], ["0", "0", "1"]])
+        )
+
+    def test_a_determinant_that_is_merely_close_is_refused(self):
+        # The tolerance is 1e-6. Anything looser would accept a matrix that is
+        # not quite a rotation, and the error compounds into the turn.
+        almost = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0001]]
+        self.assertFalse(fold.is_rotation(almost))
+
+    def test_a_determinant_inside_the_tolerance_is_accepted(self):
+        inside = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0 + 1e-7]]
+        self.assertTrue(fold.is_rotation(inside))
 
 
 class ModelTests(unittest.TestCase):
@@ -1756,12 +2489,16 @@ class MachineTests(unittest.TestCase):
         self.assertIsNotNone(m)
 
     def test_machine_as_dict(self):
-        m = fold.Machine("LENOVO", "20FE", "ThinkPad Yoga 260", "31", "20FES04T1M", "N1GETA9W")
+        m = fold.Machine(
+            "LENOVO", "20FE", "ThinkPad Yoga 260", "31", "20FES04T1M", "N1GETA9W"
+        )
         d = m.as_dict()
         self.assertIn("matches", d)
 
     def test_machine_matches(self):
-        m = fold.Machine("LENOVO", "20FE", "ThinkPad Yoga 260", "31", "20FES04T1M", "N1GETA9W")
+        m = fold.Machine(
+            "LENOVO", "20FE", "ThinkPad Yoga 260", "31", "20FES04T1M", "N1GETA9W"
+        )
         self.assertTrue(m.matches())
 
     def test_machine_does_not_match(self):
@@ -1814,6 +2551,9 @@ class MotionTests(unittest.TestCase):
         m = fold.Motion(None, 9.0)
         self.assertFalse(m.available)
         rate, ok = m.read()
+        # An unreadable gyro must not read as "turning"; a nonzero rate here
+        # would freeze every screen that has no gyro at all.
+        self.assertEqual(rate, 0.0)
         self.assertFalse(ok)
 
     def test_motion_is_still(self):
@@ -1945,6 +2685,7 @@ class ReadPublishedStateTests(unittest.TestCase):
 
     def test_read_published_state_valid(self):
         import tempfile
+
         with tempfile.TemporaryDirectory() as td:
             real = fold.STATE_FILE
             fold.STATE_FILE = Path(td) / "state.json"
@@ -1966,7 +2707,9 @@ class CalibrateTests(unittest.TestCase):
             fold.SHELL_JSON.write_text(json.dumps({}))
             real_detect = fold.Machine.detect
             fold.Machine.detect = classmethod(
-                lambda cls: cls("ACME", "NOTA-YOGA", "Some Other Laptop", "10", "X", "Y")
+                lambda cls: cls(
+                    "ACME", "NOTA-YOGA", "Some Other Laptop", "10", "X", "Y"
+                )
             )
             try:
                 rc = fold.calibrate(type("Args", (), {"write": None})())
@@ -1975,14 +2718,125 @@ class CalibrateTests(unittest.TestCase):
                 fold.Machine.detect = real_detect
         self.assertEqual(rc, 1)
 
+    def test_calibrate_write_takes_exactly_nine_floats(self):
+        # The parser is the only thing that decides how many numbers
+        # `calibrate --write` accepts. Nine goes through as nine floats in
+        # row-major order, which is the shape `calibrate` slices into rows.
+        parser = fold.build_parser()
+        args = parser.parse_args(
+            ["calibrate", "--write", "1", "0", "0", "0", "1", "0", "0", "0", "1"]
+        )
+        self.assertEqual(args.write, [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0])
+
+    def test_calibrate_write_refuses_eight_numbers(self):
+        # One short of a 3x3, and argparse has to reject it rather than pass a
+        # short list on for `calibrate` to slice into ragged rows.
+        parser = fold.build_parser()
+        with self.assertRaises(SystemExit) as caught:
+            parser.parse_args(
+                ["calibrate", "--write", "1", "0", "0", "0", "1", "0", "0", "0"]
+            )
+        self.assertNotEqual(caught.exception.code, 0)
+
+    def test_calibrate_write_refuses_ten_numbers(self):
+        parser = fold.build_parser()
+        with self.assertRaises(SystemExit) as caught:
+            parser.parse_args(
+                [
+                    "calibrate",
+                    "--write",
+                    "1",
+                    "0",
+                    "0",
+                    "0",
+                    "1",
+                    "0",
+                    "0",
+                    "0",
+                    "1",
+                    "0",
+                ]
+            )
+        self.assertNotEqual(caught.exception.code, 0)
+
+    def test_calibrate_without_write_leaves_it_none(self):
+        parser = fold.build_parser()
+        args = parser.parse_args(["calibrate"])
+        self.assertIsNone(args.write)
+
 
 class CmdAnalyzeTests(unittest.TestCase):
+    def _write_recording(
+        self, *, wall: bool, label: str | None, transforms: tuple[int, ...] = (0,)
+    ) -> str:
+        """Four samples: three of one pose, one of another, plus junk lines.
+
+        The blank line, the unparseable line and the row whose `kind` is
+        neither header nor sample are deliberate -- the reader skips all
+        three, and a test that never feeds one proves nothing about that.
+        `wall` adds three wall-clock stamps making two adjacent pairs: the
+        first runs 3.9s ahead of the recording (a suspend), the second keeps
+        pace. `transforms` round-robins over the samples; the default repeats
+        one value, which leaves transforms the recording never reached.
+        """
+        rows: list[str] = []
+        if label is not None:
+            rows.append(
+                json.dumps(
+                    {
+                        "kind": "header",
+                        "label": label,
+                        "settings": {"mapping": "standard"},
+                    }
+                )
+            )
+        rows.append(json.dumps({"kind": "marker"}))
+        specs = [
+            (0.1, 104.0, True),
+            (0.2, 104.2, False),
+            (0.3, 270.0, False),
+            (0.4, 104.1, False),
+        ]
+        walls = (100.0, 104.0, 104.1, None)
+        for index, (t, fold, still) in enumerate(specs):
+            row: dict = {
+                "kind": "sample",
+                "t": t,
+                "fold": fold,
+                "still": still,
+                "axis": "y",
+                "sign": 1,
+                "tiltDeg": 12.5,
+                "marginDeg": 4.0,
+                "orientation": "landscape",
+                "lidUp": [0.0, 1.0, 0.0],
+                "baseUp": [0.0, 0.0, 1.0],
+                "raw": [0, -9000, -1000],
+                "mode": "laptop",
+                "transform": transforms[index % len(transforms)],
+                "panelTransform": 0,
+                "residual": 0.0,
+                "hingeOk": True,
+            }
+            if wall and walls[index] is not None:
+                row["wall"] = walls[index]
+            rows.append(json.dumps(row))
+        rows.append("")
+        rows.append("not json")
+        with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as handle:
+            handle.write("\n".join(rows) + "\n")
+        self.addCleanup(lambda: os.unlink(handle.name))
+        return handle.name
+
     def test_cmd_analyze_no_file(self):
-        rc = fold.cmd_analyze(type("Args", (), {"path": "/nonexistent.jsonl", "json": False})())
+        rc = fold.cmd_analyze(
+            type("Args", (), {"path": "/nonexistent.jsonl", "json": False})()
+        )
         self.assertEqual(rc, 1)
 
     def test_cmd_analyze_empty(self):
         import tempfile
+
         with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as f:
             f.write("")
             path = f.name
@@ -1990,20 +2844,81 @@ class CmdAnalyzeTests(unittest.TestCase):
         self.assertEqual(rc, 1)
         os.unlink(path)
 
+    def test_cmd_analyze_groups_poses_and_reports_them(self):
+        path = self._write_recording(wall=True, label="fixture")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = fold.cmd_analyze(type("Args", (), {"path": path, "json": True})())
+        self.assertEqual(rc, 0)
+        report = json.loads(out.getvalue())
+        self.assertEqual(report["label"], "fixture")
+        self.assertEqual(report["samples"], 4)
+        self.assertEqual(report["seconds"], 0.3)
+        self.assertEqual(report["stillFraction"], 0.25)
+        self.assertEqual(report["foldMin"], 104.0)
+        self.assertEqual(report["foldMax"], 270.0)
+        self.assertEqual(len(report["poses"]), 2)
+        self.assertEqual(report["poses"][0]["n"], 3)
+        self.assertEqual(report["poses"][1]["n"], 1)
+        # wall 100.0 at t=0.1 and wall 104.0 at t=0.2: the wall clock gained
+        # 3.9s more than the recording clock, which is a suspend. The next
+        # pair keeps pace with the recording, so only the first one counts.
+        self.assertEqual(len(report["suspends"]), 1)
+        self.assertEqual(report["suspends"][0]["seconds"], 3.9)
+
+    def test_cmd_analyze_prints_the_table(self):
+        path = self._write_recording(wall=True, label=None)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = fold.cmd_analyze(type("Args", (), {"path": path, "json": False})())
+        self.assertEqual(rc, 0)
+        text = out.getvalue()
+        self.assertIn("recording", text)
+        self.assertIn("SUSPENDS    1", text)
+        self.assertIn("transforms never chosen", text)
+        self.assertNotIn("label       ", text)
+
+    def test_cmd_analyze_without_walls_reports_no_suspends(self):
+        path = self._write_recording(
+            wall=False, label="labelled", transforms=(0, 1, 2, 3)
+        )
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = fold.cmd_analyze(type("Args", (), {"path": path, "json": False})())
+        self.assertEqual(rc, 0)
+        text = out.getvalue()
+        self.assertIn("suspends    none", text)
+        self.assertIn("label       labelled", text)
+        self.assertNotIn("transforms never chosen", text)
+
 
 class CmdRecordTests(unittest.TestCase):
     def test_cmd_record(self):
         import tempfile
+
         with tempfile.TemporaryDirectory() as td:
             out = Path(td) / "r.jsonl"
-            rc = fold.cmd_record(type("Args", (), {"out": str(out), "seconds": 0.1, "hz": 10, "label": "test"})())
+            rc = fold.cmd_record(
+                type(
+                    "Args",
+                    (),
+                    {"out": str(out), "seconds": 0.1, "hz": 10, "label": "test"},
+                )()
+            )
             self.assertEqual(rc, 0)
             self.assertTrue(out.exists())
 
 
 MONITOR = {
-    "name": "eDP-1", "width": 1366, "height": 768, "refreshRate": 60.0,
-    "x": 0, "y": 0, "scale": 1.0, "transform": 0, "description": "eDP-1",
+    "name": "eDP-1",
+    "width": 1366,
+    "height": 768,
+    "refreshRate": 60.0,
+    "x": 0,
+    "y": 0,
+    "scale": 1.0,
+    "transform": 0,
+    "description": "eDP-1",
 }
 
 DEVICES = {
@@ -2033,19 +2948,31 @@ class CmdRotateTests(unittest.TestCase):
         self._real_shell = fold.SHELL_JSON
         self.td = tempfile.TemporaryDirectory()
         shell = Path(self.td.name) / "shell.json"
-        shell.write_text(json.dumps(
-            {"bar": {"layout": {"right": [{"id": "estrocondoso.yoga260-fold"}]}}}
-        ))
+        shell.write_text(
+            json.dumps(
+                {"bar": {"layout": {"right": [{"id": "estrocondoso.yoga260-fold"}]}}}
+            )
+        )
         fold.SHELL_JSON = shell
         self._real_run = fold.subprocess.run
         self._real_json = fold.subprocess.run
 
         class Done:
             returncode = 0
-            stdout = json.dumps([
-                {"name": "eDP-1", "width": 1366, "height": 768, "refreshRate": 60.0,
-                 "x": 0, "y": 0, "scale": 1.0, "transform": 0}
-            ])
+            stdout = json.dumps(
+                [
+                    {
+                        "name": "eDP-1",
+                        "width": 1366,
+                        "height": 768,
+                        "refreshRate": 60.0,
+                        "x": 0,
+                        "y": 0,
+                        "scale": 1.0,
+                        "transform": 0,
+                    }
+                ]
+            )
             stderr = ""
 
         def fake_run(cmd, **kwargs):
@@ -2078,9 +3005,15 @@ class CmdRotateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             real = fold.SHELL_JSON
             fold.SHELL_JSON = Path(td) / "shell.json"
-            fold.SHELL_JSON.write_text(json.dumps(
-                {"bar": {"layout": {"right": [{"id": "estrocondoso.yoga260-fold"}]}}}
-            ))
+            fold.SHELL_JSON.write_text(
+                json.dumps(
+                    {
+                        "bar": {
+                            "layout": {"right": [{"id": "estrocondoso.yoga260-fold"}]}
+                        }
+                    }
+                )
+            )
             try:
                 fold.cmd_rotate(fold.load_settings(), "normal", force=True)
                 written = json.loads(fold.SHELL_JSON.read_text())
@@ -2098,9 +3031,15 @@ class CmdRotateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             real = fold.SHELL_JSON
             fold.SHELL_JSON = Path(td) / "shell.json"
-            fold.SHELL_JSON.write_text(json.dumps(
-                {"bar": {"layout": {"right": [{"id": "estrocondoso.yoga260-fold"}]}}}
-            ))
+            fold.SHELL_JSON.write_text(
+                json.dumps(
+                    {
+                        "bar": {
+                            "layout": {"right": [{"id": "estrocondoso.yoga260-fold"}]}
+                        }
+                    }
+                )
+            )
             try:
                 self.assertEqual(fold.cmd_rotate(settings, "next", force=True), 0)
                 entry = fold.shell_entry()
@@ -2126,13 +3065,23 @@ class CmdDebugTests(unittest.TestCase):
 
     def test_debug_prints_a_header_and_rows_and_then_stops_when_interrupted(self):
         seen = {"n": 0}
+        first: dict = {}
         real_read_pose = fold.FoldDaemon.read_pose
 
         def fake_read_pose(self):
             seen["n"] += 1
             if seen["n"] > 2:
                 raise KeyboardInterrupt
-            return real_read_pose(self)
+            if seen["n"] == 2:
+                # The dedup row keys on two consecutive poses being equal, and
+                # two real gyro samples a moment apart only *usually* round
+                # alike -- so the branch ran or not depending on ambient
+                # vibration, and the coverage gate was a coin flip. Replay the
+                # first pose: the state the dedup exists for, by construction.
+                return dict(first)
+            pose = real_read_pose(self)
+            first.update(pose)
+            return pose
 
         with tempfile.TemporaryDirectory() as td:
             real_state = fold.STATE_FILE
@@ -2153,9 +3102,13 @@ class CmdDebugTests(unittest.TestCase):
             real_state = fold.STATE_FILE
             fold.STATE_FILE = Path(td) / "state.json"
             try:
-                with patch.object(fold.FoldDaemon, "read_pose", side_effect=KeyboardInterrupt):
-                    with contextlib.redirect_stdout(out):
-                        fold.cmd_debug(fold.load_settings())
+                with (
+                    patch.object(
+                        fold.FoldDaemon, "read_pose", side_effect=KeyboardInterrupt
+                    ),
+                    contextlib.redirect_stdout(out),
+                ):
+                    fold.cmd_debug(fold.load_settings())
             finally:
                 fold.STATE_FILE = real_state
         self.assertIn("#", out.getvalue())
@@ -2164,6 +3117,7 @@ class CmdDebugTests(unittest.TestCase):
 class FoldDaemonInitTests(unittest.TestCase):
     def test_fold_daemon_init(self):
         import tempfile
+
         with tempfile.TemporaryDirectory() as td:
             real = fold.SHELL_JSON
             fold.SHELL_JSON = Path(td) / "shell.json"
@@ -2174,14 +3128,37 @@ class FoldDaemonInitTests(unittest.TestCase):
             daemon = fold.FoldDaemon(fold.load_settings())
             self.assertIsNotNone(daemon)
             self.assertIsNotNone(daemon.state)
-            self.assertIn(daemon.blocking_reason() or "", (None, "").__class__ and
-                          [daemon.blocking_reason(), ""])
+            # The gate's contract, not this machine's answer: every condition
+            # `blocking_reason` checks, recomputed here. When all of them hold
+            # the reason has to be None, and when one does not it has to be a
+            # sentence somebody can act on. Asserting only that the reason is
+            # None would pass on the laptop this suite runs on and say nothing
+            # about the daemon -- and would fail outright on a machine the
+            # plugin was never meant to drive, which is the case the gate
+            # exists for.
+            gate = (
+                daemon.machine.matches(),
+                daemon.hypr.available,
+                daemon.accel.available,
+                daemon.hinge.available,
+                bool(daemon.state.panel),
+                bool(daemon.state.touch),
+                bool(daemon.state.pen),
+                abs(fold.determinant(daemon.accel.matrix) - 1.0) <= 1e-6,
+            )
+            reason = daemon.blocking_reason()
+            if all(gate):
+                self.assertIsNone(reason)
+            else:
+                self.assertTrue(reason, "blocked but no reason given")
+                self.assertTrue(reason.strip(), "reason is blank")
             fold.SHELL_JSON = real
 
 
 class FoldDaemonRunTests(unittest.TestCase):
     def test_fold_daemon_run(self):
         import tempfile
+
         with tempfile.TemporaryDirectory() as td:
             real = fold.SHELL_JSON
             fold.SHELL_JSON = Path(td) / "shell.json"
@@ -2216,6 +3193,11 @@ class FoldDaemonRunTests(unittest.TestCase):
         daemon.changed = MagicMock(side_effect=counted)
         daemon.settling = MagicMock(return_value=settling)
         daemon.step = MagicMock()
+        # `run()` takes the sample itself now and hands the same one to both
+        # `changed` and `step`, so the loop no longer depends on those two
+        # reading the hardware between them. Mocking the read here is what lets
+        # the tests below check that it is threaded through.
+        daemon.read_pose = MagicMock(return_value={"sample": True})
         daemon._publish = MagicMock(return_value=True)
         daemon.blocking_reason = MagicMock(return_value=blocked)
         daemon.verify = MagicMock()
@@ -2228,6 +3210,27 @@ class FoldDaemonRunTests(unittest.TestCase):
         daemon = self._looping_daemon(changed=True)
         self.assertEqual(daemon.run(), 0)
         daemon.step.assert_called()
+
+    def test_run_hands_step_the_very_sample_it_detected_on(self):
+        """One read per pass, and it is the one that decides.
+
+        This is the regression guard for the change that removed the second
+        sensor read. The loop used to call `changed()`, which read all six
+        sensors and discarded them, and then call `step()`, which read the same
+        six again and acted on those. Two reads of a 10 Hz sensor can describe
+        two different reports, so the pass that *decided* and the pass that
+        *acted* could be working from different instants.
+
+        So `changed` and `step` must both receive the identical object the loop
+        read once, and `read_pose` must be called once per pass -- not twice.
+        """
+        daemon = self._looping_daemon(changed=True)
+        self.assertEqual(daemon.run(), 0)
+        sample = {"sample": True}
+        daemon.read_pose.assert_called()
+        daemon.changed.assert_called_with(sample)
+        daemon.step.assert_called_with(sample)
+        self.assertEqual(daemon.read_pose.call_count, daemon.changed.call_count)
 
     def test_run_executes_step_when_settling_and_nothing_changed(self):
         daemon = self._looping_daemon(changed=False, settling=True)
@@ -2280,11 +3283,28 @@ class AnnounceTests(unittest.TestCase):
         self.daemon.hypr.env = {}
 
     def test_announce_no_error(self):
-        self.daemon.announce()
+        with (
+            patch.object(
+                fold, "which", return_value="/usr/bin/omarchy-osd"
+            ) as which_mock,
+            patch.object(fold.subprocess, "run") as run_mock,
+        ):
+            self.daemon.announce()
+        which_mock.assert_called_once_with("omarchy-osd")
+        run_mock.assert_called_once()
+        self.assertEqual(run_mock.call_args.args[0][4], "Laptop · landscape")
 
     def test_announce_with_error(self):
         self.daemon.state.last_error = "test error"
-        self.daemon.announce()
+        with (
+            patch.object(
+                fold, "which", return_value="/usr/bin/omarchy-osd"
+            ) as which_mock,
+            patch.object(fold.subprocess, "run") as run_mock,
+        ):
+            self.daemon.announce()
+        which_mock.assert_not_called()
+        run_mock.assert_not_called()
 
 
 class VerifyTests(unittest.TestCase):
@@ -2295,7 +3315,7 @@ class VerifyTests(unittest.TestCase):
         self.daemon.state.transform = 0
         self.daemon.hypr = MagicMock()
         self.daemon.hypr.current_transform.return_value = 0
-        self.daemon.hypr.set_transform.return_value = (True, "")
+        self.daemon.hypr.rotate_transaction.return_value = (True, "")
         self.daemon.hypr.set_device_transform.return_value = (True, "")
         self.daemon.state.touch = None
         self.daemon.state.pen = None
@@ -2305,10 +3325,14 @@ class VerifyTests(unittest.TestCase):
 
     def test_verify_no_change(self):
         self.daemon.verify()
+        self.daemon.hypr.rotate_transaction.assert_not_called()
 
     def test_verify_reasserts(self):
         self.daemon.hypr.current_transform.return_value = 2
         self.daemon.verify()
+        self.daemon.hypr.rotate_transaction.assert_called_once_with(
+            "eDP-1", 0, [None, None]
+        )
 
 
 class ResolveDevicesTests(unittest.TestCase):
@@ -2331,13 +3355,21 @@ class ResolveDevicesTests(unittest.TestCase):
             "touchpad": ["etps/2-elantech-touchpad"],
             "keyboard": ["at-translated-set-2-keyboard"],
         }
-        self.daemon.hypr.match_device.side_effect = lambda pattern, kinds: "wacom-pen-and-multitouch-sensor-finger" if "finger" in pattern else "wacom-pen-and-multitouch-sensor-pen"
-        self.daemon.hypr.match_any.side_effect = lambda candidates, present: [c for c in candidates if c in present]
+        self.daemon.hypr.match_device.side_effect = lambda pattern, kinds: (
+            "wacom-pen-and-multitouch-sensor-finger"
+            if "finger" in pattern
+            else "wacom-pen-and-multitouch-sensor-pen"
+        )
+        self.daemon.hypr.match_any.side_effect = lambda candidates, present: [
+            c for c in candidates if c in present
+        ]
         self.daemon.hypr.internal_monitor.return_value = "eDP-1"
 
     def test_resolve_devices(self):
         self.daemon.resolve_devices()
-        self.assertEqual(self.daemon.state.touch, "wacom-pen-and-multitouch-sensor-finger")
+        self.assertEqual(
+            self.daemon.state.touch, "wacom-pen-and-multitouch-sensor-finger"
+        )
         self.assertEqual(self.daemon.state.pen, "wacom-pen-and-multitouch-sensor-pen")
 
 

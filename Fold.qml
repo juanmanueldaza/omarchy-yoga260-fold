@@ -27,8 +27,6 @@ Panel {
 
   readonly property bool supported: service ? service.supported : false
   readonly property string blockedBy: service ? service.blockedBy : ""
-  readonly property bool sensorAccel: service ? service.sensorAccel : false
-  readonly property bool sensorHinge: service ? service.sensorHinge : false
   readonly property bool hingeOk: service ? service.hingeOk : false
   readonly property bool folded: service ? service.folded : false
   readonly property string mode: service ? service.mode : "book"
@@ -37,7 +35,6 @@ Panel {
   // turned in its own plane. Gravity points the same way however the machine is
   // spun on the desk, so any direction claimed here would be invented.
   readonly property bool flat: service ? service.flat : false
-  readonly property real flatDeg: service ? service.flatDeg : 0
   readonly property bool locked: setting("locked", false)
   readonly property bool lockKeyboard: setting("lockKeyboard", true)
   readonly property bool lockPointers: setting("lockPointers", true)
@@ -46,6 +43,9 @@ Panel {
   readonly property var tilt: service ? service.tilt : ({})
   readonly property var osk: service && service.osk ? service.osk
     : { installed: [], drivable: false, auto: false, pluginId: "" }
+  // One number that moves only on lines the daemon streams of its own accord;
+  // the staleness watchdog below watches it instead of polling.
+  readonly property int statusSerial: service ? service.statusSerial : 0
 
   // ----------------------------------------------------------------- settings
 
@@ -75,6 +75,7 @@ Panel {
   // confident wrong answer.
   readonly property string status: {
     if (!supported) return blockedBy || "Not this model"
+    if (daemonQuiet) return "The fold daemon has gone quiet"
     if (messages && messages.length > 0) return messages[0]
     if (locked) return "Rotation locked"
     if (!hingeOk) return "Hinge sensor unsettled"
@@ -135,12 +136,44 @@ Panel {
     else if (row === "mapping") save("mapping", mappingOptions[cursorCell].value)
   }
 
+  // The daemon prints roughly once a second while it is alive, so five quiet
+  // seconds with the panel open means it has hung: the restart backoff runs
+  // only on process exit, and a hung daemon would otherwise freeze the panel
+  // on its last values. Reaching the deadline probes with one refresh() and
+  // watches for the answer, so nothing polls while the daemon is talking.
+  // Closing the panel stops the timer, leaving the bar with none at all.
+  property bool daemonQuiet: false
+
+  Timer {
+    id: staleWatchdog
+    // Off until the panel opens: a Timer's default is to start with the
+    // component, which would put a probe on the bar itself.
+    running: false
+    interval: 5000
+    repeat: false
+    onTriggered: {
+      if (!root.service) return
+      root.daemonQuiet = true
+      root.service.refresh()
+      staleWatchdog.restart()
+    }
+  }
+
+  onStatusSerialChanged: {
+    daemonQuiet = false
+    if (opened) staleWatchdog.restart()
+  }
+
   onOpenedChanged: {
-    if (!opened) return
+    if (!opened) {
+      staleWatchdog.stop()
+      return
+    }
     cursorActive = false
     settingsShown = false
     cursorRow = 0
     cursorCell = 0
+    staleWatchdog.restart()
     if (service) service.refresh()
   }
   onRowsChanged: if (cursorRow >= rows.length) cursorRow = rows.length - 1
@@ -401,10 +434,7 @@ Panel {
             options: root.mappingOptions
             value: root.mappingOptions.some(function(o) { return o.value === root.mapping })
               ? root.mapping : "standard"
-            onChosen: function(v) {
-              root.save("mapping", v)
-              if (root.service) root.service.setMapping(v)
-            }
+            onChosen: function(v) { root.save("mapping", v) }
           }
 
           Text {

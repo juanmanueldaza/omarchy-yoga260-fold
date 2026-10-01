@@ -16,32 +16,23 @@ Item {
   // Observed state. The daemon prints a JSON line whenever any of it changes.
   property bool supported: false
   property string blockedBy: ""
-  property bool sensorAccel: false
-  property bool sensorHinge: false
   property bool hingeOk: false
   property bool folded: false
-  property string mode: "laptop"
-  property string orientation: "normal"
+  property string mode: "book"
   property string orientationLabel: "landscape"
   // Flat enough that the accelerometer is blind to rotation in the plane of the
   // screen, so the panel says it cannot tell instead of naming a direction.
   property bool flat: false
-  property real flatDeg: 0.0
-  // Named panelTransform, not transform: `transform` is a FINAL property on the
-  // base Item and cannot be redeclared.
-  property int panelTransform: 0
-  property bool verified: false
-  property bool still: true
-  property bool keyboardDisabled: false
-  property bool pointersDisabled: false
   property var messages: []
-  property string panel: "eDP-1"
-  property string touch: ""
-  property string pen: ""
   property var tilt: ({})
   // Always an object with the keys Fold.qml reads, so a widget that binds to it
   // before the first status line arrives sees an empty list rather than undefined.
   property var osk: ({ installed: [], drivable: false, auto: false, pluginId: "" })
+  // Bumped on every line the daemon streams on its own, so Fold.qml can tell a
+  // daemon that is talking from one that has gone quiet. A `status` reply does
+  // not count: with the daemon hung that command still answers by probing the
+  // hardware itself, which proves nothing about the daemon.
+  property int statusSerial: 0
 
   // How long to wait before bringing a crashed daemon back.
   property int restartDelay: 2000
@@ -68,25 +59,28 @@ Item {
     lockProc.running = true
   }
 
-  function setMapping(value) {
-    if (mappingProc.running) return
-    mappingProc.command = [root.cli, "mapping", value]
-    mappingProc.running = true
-  }
-
-  function setSetting(name, value) {
-    if (settingProc.running) return
-    settingProc.command = [root.cli, "setting", name, value]
-    settingProc.running = true
-  }
-
   function toggleKeyboard() {
     if (keyboardProc.running) return
     keyboardProc.command = [root.cli, "keyboard", "toggle"]
     keyboardProc.running = true
   }
 
-  function applyStatus(line) {
+  // A one-shot CLI call that hangs (a blocked hyprctl, a pipe that never
+  // closes) would park its own `running` guard and drop every later call for
+  // the rest of the session. One watchdog covers all of them: each process
+  // restarts it as it starts, and a trigger releases whatever is still running
+  // so the next call can try again. A call that finishes in time simply pushes
+  // the deadline, and a trigger that finds nothing running does nothing.
+  function releaseHungProcs() {
+    const procs = [statusProc, rotateProc, lockProc, keyboardProc]
+    for (let i = 0; i < procs.length; i++) {
+      if (!procs[i].running) continue
+      console.warn("omarchy-yoga260-fold: a CLI call did not answer in 5s; releasing it")
+      procs[i].running = false
+    }
+  }
+
+  function applyStatus(line, live) {
     var data
     try {
       data = JSON.parse(line)
@@ -96,29 +90,18 @@ Item {
     root.supported = data.supported === true
     root.blockedBy = data.blockedBy || ""
     if (data.sensor) {
-      root.sensorAccel = data.sensor.accel === true
-      root.sensorHinge = data.sensor.hinge ? data.sensor.hinge.available === true : false
       root.hingeOk = data.sensor.hinge ? data.sensor.hinge.ok === true : false
     }
     const state = data.state || {}
     root.folded = state.folded === true
-    root.mode = state.mode || "laptop"
-    root.orientation = state.orientation || "normal"
+    root.mode = state.mode || "book"
     root.orientationLabel = state.orientationLabel || ""
     root.flat = state.flat === true
-    root.flatDeg = Number(state.flatDeg) || 0
-    root.panelTransform = Number(state.transform) || 0
-    root.verified = state.verified === true
-    root.still = state.still !== false
-    root.keyboardDisabled = state.keyboardDisabled === true
-    root.pointersDisabled = state.pointersDisabled === true
     root.messages = state.messages || []
-    root.panel = state.panel || ""
-    root.touch = state.touch || ""
-    root.pen = state.pen || ""
     root.tilt = state.tiltDeg || {}
     root.osk = data.osk && data.osk.installed ? data.osk
       : { installed: [], drivable: false, auto: false, pluginId: "" }
+    if (live) root.statusSerial++
   }
 
   Component.onCompleted: daemonProc.running = true
@@ -131,7 +114,7 @@ Item {
         // A daemon that reports is a daemon that started; the next crash gets
         // the short pause again.
         root.restartDelay = 2000
-        root.applyStatus(line)
+        root.applyStatus(line, true)
       }
     }
     stderr: SplitParser {
@@ -155,9 +138,10 @@ Item {
   Process {
     id: statusProc
     command: [root.cli, "status"]
+    onRunningChanged: if (running) cliWatchdog.restart()
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: root.applyStatus(text)
+      onStreamFinished: root.applyStatus(text, false)
     }
     stderr: StdioCollector {
       waitForEnd: true
@@ -166,26 +150,30 @@ Item {
 
   Process {
     id: rotateProc
+    onRunningChanged: if (running) cliWatchdog.restart()
     onExited: root.refresh()
   }
 
   Process {
     id: lockProc
-    onExited: root.refresh()
-  }
-
-  Process {
-    id: mappingProc
-    onExited: root.refresh()
-  }
-
-  Process {
-    id: settingProc
+    onRunningChanged: if (running) cliWatchdog.restart()
     onExited: root.refresh()
   }
 
   Process {
     id: keyboardProc
+    onRunningChanged: if (running) cliWatchdog.restart()
     onExited: root.refresh()
+  }
+
+  // One shot: armed by a process starting, rearmed by the next one. A healthy
+  // call never lets it fire, and one that does fire finds only hung processes
+  // to release (or none, and stops there).
+  Timer {
+    id: cliWatchdog
+    running: false
+    interval: 5000
+    repeat: false
+    onTriggered: root.releaseHungProcs()
   }
 }
