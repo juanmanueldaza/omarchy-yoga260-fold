@@ -211,28 +211,70 @@ asserts the stamp is non-zero.
 
 ## NOT taken: event-driven hinge reads
 
-This was the most promising item and **it is not available unprivileged.**
+This was the most promising item and **it is confirmed impossible unprivileged,
+by systematic testing not inference.**
 
-Measured: polling four open file descriptors of
-`/sys/bus/iio/devices/iio:device5/in_angl{0,1,2}_raw` and `in_angl_scale` for
-`POLLPRI` for three seconds, against a sensor streaming at 10 Hz, produced
-**zero** events. `inotify` is the same mechanism and behaves identically. sysfs
-IIO raw attributes emit no change notification.
+### Systematic investigation (all run on the live machine, uid 1000, kernel 7.2.5)
 
-Doing it properly means opening `/dev/iio:device5` and running a triggered
-buffer through `IIO_BUFFER`, which needs root and is a substantially larger
-piece of work. The plugin is explicitly no-root by design, so that is a
-trade-off to make deliberately, not quietly to fake.
+1. **inotify directly on sysfs files**, not just POLLPRI:
+   `inotify_add_watch(fd, "/sys/bus/iio/devices/iio:device5", IN_ALL_EVENTS)`
+   plus watches on each `in_angl{N}_raw`. Hammered the attributes for 5 s
+   (each read was a real `open()`+`read()`). **Result: 103 inotify batches
+   received** — every one of them is our *own* IN_OPEN | IN_ACCESS. inotify
+   fires on *access*, never on *value change*. sysfs IIO attributes are
+   synthesized per-read by `->show()`, so there is no underlying file whose
+   mtime or value changes to notify on.
 
-Shortening `pollSec` does not substitute — see consequence 1 above.
+2. **POLLPRI on the raw attribute files**: same result, zero events.
 
-So the honest statement of what is left on the table: **one sensor period,
-always**, 100 ms, plus one compositor call. The floor is now the hardware's, not
-this code's.
+3. **The triggered-buffer hardware exists but is root-gated**:
+   `/sys/bus/iio/devices/iio:device5/buffer0/` contains `enable`, `length`,
+   and `in_angl0_en` — all the controls a userspace IIO buffer consumer needs.
+   `current_trigger` reads `hinge-dev5`. BUT every one of those
+   control attributes is `-rw-r--r-- root root` for a non-root user, so:
+   - you cannot enable the buffer,
+   - you cannot select scan elements,
+   - and even if you could, the sample data comes from `/dev/iio:device5`
+     which is `crw------- root root` — the IIO char device is not readable
+     unprivileged.
+   The `buffer0/data_available` attribute is *readable* (it reports 0 while
+   disabled), but enabling the buffer to make it meaningful requires root.
 
-The pass itself is now ~21 ms against a 100 ms budget, so there is headroom, but
-polling faster than 10 Hz would only re-read a report the sensor has not
-refreshed. The headroom is spare capacity, not a missed opportunity.
+4. **`in_angl_sampling_frequency` is also root-only** (`-rw-r--r-- root root`),
+   so an unprivileged user cannot raise the sensor rate above 10 Hz either.
+
+5. **lseek / pread semantics**: `pread(fd, 4, offset)` on `in_angl0_raw`
+   returns the value only at offset 0 and **`b""` at every other offset**.
+   This is why a persistent-fd benchmark is a measurement of the absent of
+   work (see "A measurement that was wrong" above): the driver only accepts
+   a fresh `read(2)` at offset 0.
+
+### What the read-cost distribution actually shows
+
+200 reads, no pause: min 3.52 ms, p10 8.68 ms, median 10.09 ms, p90 19.83 ms,
+max 30.27 ms — an **8.6× spread**, not a fixed cost. Reads back-to-back amortise
+(3 channels at 30.35 ms, 3× individual reads at 30.99 ms median) because the
+HID report that satisfies one covers the next. There is no per-attribute
+cache that makes the 2nd and 3rd cheap; the 5–10 ms is the synchronous ISHTP
+round-trip each time the driver decides it needs a fresh sample.
+
+This is driver behaviour in kernel-space, not sysfs overhead, and it cannot be
+moved from userspace.
+
+### Why "poll faster" is not a substitute
+
+`pollSec=0.1` is the sensor's **declared 10 Hz rate**, not a conservative
+default. The sensor publishes a new sample every 100 ms. Polling faster than
+that reads the same report again; polling slower misses reports. The only way
+to react faster is to consume whole HID input reports as they arrive — which is
+exactly what requires the IIO char device (`/dev/iio:device5`, root-only).
+
+### Honest statement of what is left on the table
+
+**One sensor period, always: 100 ms, plus one compositor call.** The pass
+itself is now ~21 ms against a 100 ms budget. There is headroom, but it is
+spare capacity, not a missed opportunity — the floor is now the hardware's
+report rate, not this code's read latency.
 
 ## What to copy, still open
 
