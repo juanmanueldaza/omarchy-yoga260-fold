@@ -8,7 +8,8 @@ are stated and the disagreement is explained.
 
 Companion files: `sensors.md` (the IIO motion sensors), `hardware.md` (the
 machine), `digitizer.md` (input), `calibration.md` (mount-matrix check),
-`inventory.md` (full enumeration).
+`inventory.md` (full enumeration), `root_buffer.md` (root-triggered buffer
+implementation guide).
 
 ## The four modes, per Lenovo
 
@@ -275,6 +276,84 @@ exactly what requires the IIO char device (`/dev/iio:device5`, root-only).
 itself is now ~21 ms against a 100 ms budget. There is headroom, but it is
 spare capacity, not a missed opportunity — the floor is now the hardware's
 report rate, not this code's read latency.
+
+### Root-triggered buffer: the only path forward (optional, root-required)
+
+The read-cost distribution (3.52–30.27 ms per read, 8.6× spread) is not a
+fixed cost — it is a synchronous ISHTP round-trip in the kernel driver.
+No userspace language (Python, C, Rust) can make it faster. The only way
+to eliminate it is to let the kernel push samples instead of the userland
+pulling them.
+
+The hardware already has the machinery for this. `iio:device5` has a
+triggered buffer, a named trigger (`hinge-dev5`), and scan-element controls
+that could select just `in_angl0_raw`. All of it is root-gated:
+`buffer0/enable`, `scan_elements/*_en`, and `/dev/iio:device5` are
+`-rw-r--r-- root root` / `crw------- root root`. An unprivileged user
+cannot enable the buffer, cannot configure scan elements, and cannot read
+the sample data. The `buffer0/data_available` attribute is readable but
+reports 0 while disabled — enabling it requires root.
+
+**The architecture is therefore a two-process design:**
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  Root helper: yoga260-bufferd (systemd service, root)        │
+│    1. chmod + opens /dev/iio:device5 (crw------- root root)  │
+│    2. Writes 1 → buffer0/enable                              │
+│    3. Writes 1 → scan_elements/in_angl0_en                   │
+│    4. Blocks on read() → kernel signals on new HID report    │
+│    5. Pushes JSON {"fold": 112.0} to Unix socket             │
+│       /run/user/1000/fold.sock (700, root:user)             │
+└──────────────────────────────────────────────────────────────┘
+                    ↓ Unix domain socket
+┌──────────────────────────────────────────────────────────────┐
+│  User plugin: omarchy-yoga260-fold (no root)                 │
+│    • Attempts socket connect → uses event-driven path         │
+│    • Fallback to sysfs if socket missing (graceful degrade)   │
+│    • No root required for default operation                   │
+└──────────────────────────────────────────────────────────────┘
+```
+
+**Key properties:**
+
+- **Zero-latency reads**: the kernel buffers the sample; the user plugin
+  reads from the socket in microseconds, not milliseconds.
+- **No polling**: the user plugin blocks on `recv()` or uses `poll()` on
+  the socket — the kernel wakes it when a new sample arrives.
+- **Graceful degradation**: if the root helper is not installed or not
+  running, the plugin falls back to the existing sysfs path (21 ms pass).
+- **Publishable as an Omarchy plugin**: the default remains no-root; root
+  is an opt-in mode, not a requirement.
+
+**Installation (one-liner):**
+
+```bash
+sudo omarchy apply hardware --yoga260-buffer   # hypothetical command
+```
+
+Or manually:
+
+```bash
+sudo systemctl enable --now yoga260-bufferd
+```
+
+**The root helper is a separate binary** (`yoga260-bufferd`) — not part of
+the pip-installable Python plugin. The Python plugin only contains the
+socket-connect logic and the sysfs fallback. This preserves the Omarchy
+convention of no-root-by-default while giving advanced users the
+performance option.
+
+**Trade-off summary:**
+
+| | sysfs (current) | root-triggered buffer |
+|---|---|---|
+| Root required | No | Yes (systemd service) |
+| Latency per read | ~10.31 ms | ~0 ms |
+| Pass time | ~21 ms | ~3 ms |
+| Works without root | ✅ | ❌ (falls back) |
+| Maintenance | Single file | Two components |
+| Omarchy publishable | ✅ | ✅ (opt-in root mode) |
 
 ## What to copy, still open
 
