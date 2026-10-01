@@ -243,7 +243,7 @@ manifest.json                     the plugin contract
 Service.qml                       mounts the daemon once, owns the state
 Fold.qml                          the bar button and its panel
 bin/omarchy-yoga260-fold          the daemon and CLI, Python 3, no dependencies
-tests/                            228 tests; the arithmetic is the point
+tests/                            275 tests; the arithmetic is the point
 docs/hardware.md                  this machine, in the detail it deserves
 docs/calibration.md               how to confirm it by hand
 ```

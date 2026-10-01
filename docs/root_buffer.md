@@ -1,677 +1,300 @@
-# Root-Triggered Buffer Implementation Guide for Yoga 260 Fold Plugin
+# Root-Triggered Buffer — a PROPOSAL, not an implementation
 
-## Table of Contents
-1. [Overview](#overview)
-2. [Architecture](#architecture)
-3. [Socket Protocol](#socket-protocol)
-4. [Root Helper Implementation](#root-helper-implementation)
-5. [Fallback Logic](#fallback-logic)
-6. [Build and Deployment](#build-and-deployment)
-7. [Testing](#testing)
-8. [Configuration](#configuration)
-9. [Monitoring and Diagnostics](#monitoring-and-diagnostics)
-10. [Security Considerations](#security-considerations)
-11. [Migration Guide](#migration-guide)
-12. [Performance Benchmarks](#performance-benchmarks)
-13. [Future Enhancements](#future-enhancements)
-14. [Conclusion](#conclusion)
+> **Status: NOT IMPLEMENTED. Nothing in this document has been built, installed,
+> or measured.** There is no `yoga260-bufferd` binary, no systemd unit, no
+> socket, and no C source in this repository. Every latency figure below is
+> either (a) measured on this machine and marked **[MEASURED]**, (b) a
+> projection from the mechanism and marked **[PROJECTED]**, or (c) a design
+> choice still to be validated and marked **[PROPOSED]**.
+>
+> This file exists so the option is *on the table* with its trade-offs written
+> down honestly. Do not read it as a description of working software.
 
-## Overview
+## Why this document exists
 
-This document describes an optional performance enhancement for the Yoga 260 Fold plugin that eliminates the 10.31 ms per-read latency caused by polling sysfs. Instead of polling, this implementation uses the Linux IIO triggered buffer mechanism to receive HID sensor events from the Intel ISH sensor hub in near real-time.
+The current plugin polls `in_angl0_raw` on a timer. That read costs
+**10.31 ms median**, and it is not something a faster language can fix
+**[MEASURED]**:
 
-**Key Benefit**: Reduce the per-read cost from ~10.31 ms to ~0 ms, cutting the total pass time from ~21 ms to ~2-3 ms.
+| | measured value |
+|---|---|
+| Python overhead for a whole arithmetic+JSON pass | **7.91 µs median** |
+| One sysfs read of `in_angl0_raw` | **10.31 ms median** |
+| Ratio | **~1300×** |
 
-**Trade-off**: Requires a root-privileged systemd service running as a daemon. The user plugin remains unprivileged and falls back to sysfs if the root helper is unavailable.
+The cost is a synchronous round-trip inside the kernel driver (ISHTP to the
+sensor hub), not userspace work. The only way to remove it is to stop pulling
+and let the kernel push.
 
-## Architecture
+## What the kernel already offers **[MEASURED]**
 
-### User Plugin (omarchy-yoga260-fold)
+`/sys/bus/iio/devices/iio:device5/` on this machine:
 
-The user plugin remains a no-root Python daemon that:
+| attribute | value / state | who can write it |
+|---|---|---|
+| `trigger/current_trigger` | `hinge-dev5` | root |
+| `buffer/enable` | `0` (disabled) | root |
+| `buffer/length` | `2` | root |
+| `buffer/watermark` | `1` | root |
+| `buffer/direction` | `in` | root |
+| `buffer/data_available` | `0` | — (readable by anyone) |
+| `buffer0/in_angl{0,1,2}_en` | `0` | root |
+| `scan_elements/in_angl{0,1,2}_en` | `0` | root |
+| `scan_elements/in_timestamp_en` | `0` | root |
+| `dev` | `510:5` → `/dev/iio:device5` | — |
+| `/dev/iio:device5` perms | **`crw------- root root`** | root only |
 
-1. **Checks for the root helper socket** (`/run/user/1000/fold.sock`)
-2. **Connects if available** → uses event-driven mode
-3. **Falls back to sysfs** → legacy polling mode if socket unavailable
-4. **Maintains compatibility** → works on any machine, with or without root helper
+So the full IIO triggered-buffer path exists and is correctly formed. It is
+simply **root-gated at three independent points**: enable the buffer, select
+scan elements, and read the sample data. There is no unprivileged subset that
+yields data.
 
-### Root Helper (yoga260-bufferd)
+This also corrects an earlier claim in `windows.md`: the hinge device is *not*
+`INDIO_DIRECT_MODE`-only. `buffer/` and `buffer0/` are both present, and
+`current_trigger` names a real trigger. The blocker is permissions, not
+absence.
 
-A systemd service running as `root` that:
+## What a root helper would have to do **[PROPOSED]**
 
-1. **Sets up IIO triggered buffer** (enables `buffer0/`, configures scan elements)
-2. **Opens `/dev/iio:device5`** in blocking mode (kernel signals availability)
-3. **Pushes data to a Unix domain socket** (`/run/user/1000/fold.sock`)
-4. **Logs errors and provides status** (can be queried via `systemctl status yoga260-bufferd`)
-
-**Installation Commands**:
-
-```bash
-# One-time setup for maximum performance
-sudo systemctl enable --now yoga260-bufferd
-
-# Alternative: manual setup for testing
-sudo mkdir -p /run/user/1000
-# The systemd service will manage the buffer setup
+```
+1. open /dev/iio:device5                      (root; crw-------)
+2. write "1" to scan_elements/in_angl0_en     (select the fold channel only)
+3. write N to buffer/length                   (small — see Latency note)
+4. write "1" to buffer/watermark              (signal on every sample)
+5. write "1" to buffer/enable                 (start the DMA into the buffer)
+6. blocking read() on the fd                  (kernel returns when data_available)
+7. decode sample, publish newest fold angle
+8. on shutdown, write "0" to buffer/enable    (leave the device as found)
 ```
 
-## Socket Protocol
+### Latency note — buffer length is a latency knob, not a throughput knob **[PROPOSED]**
 
-### Connection
+For a "latest value" consumer, a *larger* buffer is strictly worse. With
+`length = 10` at 10 Hz you buffer 1.0 s of reports, and the sample you read
+can be up to ~0.9 s stale — which is **worse than the 10.31 ms poll it
+replaces**. `length = 1..2` with `watermark = 1` gives the newest report with
+no queueing.
 
-The user plugin connects to the root helper using a Unix domain socket:
+*(An earlier draft of this file claimed `length = 10` was "0.3 s of data".
+At 10 Hz, 10 samples is 1.0 s. The figure was wrong.)*
 
-```python
-import socket
-import json
+## Architecture **[PROPOSED]**
 
-sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-sock.connect("/run/user/1000/fold.sock")
-
-# Heartbeat / status check
-sock.sendall(b"GET_STATUS\n")
-response = sock.recv(1024)
+```
+┌────────────────────────────────────────────────────────────────┐
+│ system service: yoga260-fold-buffer.service   (User=root)      │
+│   reads /dev/iio:device5, publishes to                        │
+│   /run/yoga260-fold/fold.sock                                  │
+└────────────────────────────────────────────────────────────────┘
+                    │  unix stream, SOCK_DGRAM-like line protocol
+┌────────────────────────────────────────────────────────────────┐
+│ user plugin: omarchy-yoga260-fold            (uid 1000)       │
+│   if socket present → consume it                               │
+│   else             → current sysfs path (unchanged)            │
+└────────────────────────────────────────────────────────────────┘
 ```
 
-### Message Format
+### Why the socket is NOT in `/run/user/1000`
 
-The root helper sends fold angle updates as JSON lines:
+An earlier draft put it at `/run/user/1000/fold.sock` and told the installer
+to `mkdir -p /run/user/1000`. **That is wrong.** `/run/user/<uid>` is created
+and destroyed by `systemd --user` / `pam_systemd`; a system-level daemon
+writing into it fights logind, and the directory can disappear underneath the
+service on logout.
 
-```json
-{"fold": 112.0, "timestamp": 1724223480}
+The correct mechanism is `RuntimeDirectory=`, which systemd creates, owns, and
+removes for you:
+
+```ini
+[Service]
+RuntimeDirectory=yoga260-fold
+RuntimeDirectoryMode=0750
 ```
 
-**Available Commands**:
+That yields `/run/yoga260-fold/`, mode 0750, owned `root:<group>`. Put the
+invoking user in `<group>` (e.g. a `fold` group) and no world-readable socket
+exists.
 
-| command | description |
-|---------|-------------| 
-| `GET_STATUS` | Returns connection status and capabilities |
-| `PING` | Simple connectivity test |
-| `SHUTDOWN` | Gracefully terminate the connection |
-
-## Root Helper Implementation Details
-
-### IIO Buffer Setup
-
-The root helper performs these operations on `/sys/bus/iio/devices/iio:device5`:
-
-```bash
-# 1. Enable the buffer (sysfs: rw-r--r-- root root)
-echo 1 > /sys/bus/iio/devices/iio:device5/buffer0/enable
-
-# 2. Configure scan elements (which channels to include)
-echo 1 > /sys/bus/iio/devices/iio:device5/scan_elements/in_angl0_en
-# (angle1/angle2 are telemetry; we only enable angl0 for performance)
-
-# 3. Set buffer length (how many samples to queue)
-echo 10 > /sys/bus/iio/devices/iio:device5/buffer0/length
-
-# 4. Set watermark (when to signal data_available)
-echo 1 > /sys/bus/iio/devices/iio:device5/buffer0/watermark
-
-# 5. Enable the trigger
-echo hinge-dev5 > /sys/bus/iio/devices/iio:device5/trigger/current_trigger
-```
-
-### Systemd Service
-
-`systemd/system/yoga260-bufferd.service`:
+## systemd unit sketch **[PROPOSED — not written, not tested]**
 
 ```ini
 [Unit]
-Description=Yoga 260 Buffer Daemon
-After=network.target
-Wants=network.target
+Description=Yoga 260 fold angle buffer helper
+Documentation=man:iio
 
 [Service]
 Type=simple
 User=root
-Group=root
-ExecStart=/usr/local/bin/yoga260-bufferd
+RuntimeDirectory=yoga260-fold
+RuntimeDirectoryMode=0750
+ExecStart=/usr/lib/yoga260-fold/fold-bufferd
 Restart=on-failure
 RestartSec=3
-StandardOutput=journal
-StandardError=journal
+StateDirectory=yoga260-fold
+
+# Hardening — this process reads exactly one device and writes one socket.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=
+ProtectKernelTunables=no   # REQUIRED: we must write the sysfs buffer controls
+DeviceAllow=/dev/iio:device5 char-510:5
+RestrictAddressFamilies=AF_UNIX
+CapabilityBoundingSet=
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-### Binary Interface
-
-`yoga260-bufferd` (C++ / Python binary):
-
-1. **Initialize IIO buffer**
-   - Open `/dev/iio:device5`
-   - Configure `buffer0/enable = 1`
-   - Set `buffer0/length = 10` (for ~0.3s of data)
-
-2. **Spawn socket listener**
-   - Listen on `/run/user/1000/fold.sock`
-   - Accept multiple connections (for plugin and diagnostic tools)
-
-3. **Main event loop**
-   ```c
-   while (true) {
-       // Blocking read until kernel signals data available
-       ssize_t n = read(iio_fd, buffer, sizeof(buffer));
-       if (n > 0) {
-           // Parse IIO sample
-           // Extract fold angle from channel 0
-           // Send via socket to connected clients
-           send_all_sockets(fold_angle_json);
-       }
-   }
-   ```
-
-## Fallback Logic
-
-### User Plugin Behavior
-
-When the user plugin starts:
-
-1. **Check socket accessibility**
-   ```python
-   try:
-       sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-       sock.connect("/run/user/1000/fold.sock")
-       connected = True
-   except FileNotFoundError:
-       connected = False
-   ```
-
-2. **Log and proceed**
-   - If connected: use event-driven mode (socket)
-   - If not connected: use legacy mode (sysfs)
-
-3. **Health checks**
-   - Periodically verify socket connection
-   - Log warnings if root helper seems unresponsive
-
-### Root Helper Health
-
-The root helper should expose health information:
-
-```bash
-# systemctl status yoga260-bufferd
-# journalctl -u yoga260-bufferd --no-pager
-```
-
-The user plugin could also read `/proc/<pid>/status` to check if the root helper is responsive.
-
-## Build and Deployment
-
-### Dependencies
-
-For the root helper (`yoga260-bufferd`):
-
-```bash
-# Required system packages (Debian/Ubuntu)
-sudo apt-get update
-sudo apt-get install -y libiio-dev build-essential
-
-# Required Python packages (for user plugin)
-pip3 install --user --upgrade pip
-pip3 install --user iio
-pip3 install --user psutil
-```
-
-### Building
-
-```bash
-# Build the root helper (C++ example)
-g++ -std=c++17 -O2 -pthread -liio -o yoga260-bufferd yoga260-bufferd.cpp
-
-# Install to /usr/local/bin
- sudo cp yoga260-bufferd /usr/local/bin/
- sudo chmod +x /usr/local/bin/yoga260-bufferd
-
-# Create systemd service
-sudo cp yoga260-bufferd.service /etc/systemd/system/
-sudo systemctl daemon-reload
-
-# Start and enable
-sudo systemctl enable --now yoga260-bufferd
-```
-
-### Installation Script
-
-A comprehensive setup script (`install.sh`) could:
-
-1. **Install system dependencies**
-2. **Build the root helper**
-3. **Install systemd service**
-4. **Set up socket permissions**
-5. **Install user plugin to $HOME/.local/bin/**
-6. **Update omarchy configuration**
-
-```bash
-#!/bin/bash
-set -e
-
-# Check if running as root
-if [[ $EUID -ne 0 ]]; then
-   echo "This script requires root privileges"
-   exit 1
-fi
-
-# Install system dependencies
-apt-get update
-apt-get install -y libiio-dev build-essential python3-dev python3-pip
-
-# Install user-level dependencies (for the plugin)
-pip3 install --user --upgrade pip
-pip3 install --user iio psutil
-
-# Build the root helper
-g++ -std=c++17 -O2 -pthread -liio -o /usr/local/bin/yoga260-bufferd yoga260-bufferd.cpp
-chmod +x /usr/local/bin/yoga260-bufferd
-
-# Install systemd service
-cp yoga260-bufferd.service /etc/systemd/system/
-systemctl daemon-reload
-systemctl enable --now yoga260-bufferd
-
-# Set up socket directory (run as root)
-mkdir -p /run/user/1000
-chmod 700 /run/user/1000
-
-# Install user plugin
-cp -r . /home/user/.local/share/omarchy-yoga260-fold/
-chmod +x /home/user/.local/bin/omarchy-yoga260-fold
-
-# Add to PATH if needed
-if ! echo $PATH | grep -q "~/.local/bin"; then
-    echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
-fi
-
-echo "Installation complete. Root helper started and user plugin installed."
-```
-
-## Testing
-
-### Root Helper Tests
-
-```bash
-# Unit tests for buffer setup
-./test_buffer_setup
-
-# Socket connectivity test
-./test_socket_connection
-
-# Data parsing tests
-./test_iio_parsing
-
-# Fallback tests (with root helper disabled)
-sudo systemctl stop yoga260-bufferd
-./test_fallback_sysfs
-sudo systemctl start yoga260-bufferd
-```
-
-### User Plugin Tests
-
-The existing user plugin tests already cover:
-
-- **HingeTelemetryCadenceTests** (8 tests) → verify cheap-read behavior
-- **All existing sysfs tests** → regression protection
-
-New tests for root-triggered buffer:
-
-```python
-def test_root_triggered_buffer():
-    """Test that socket mode is used when root helper is available"""
-    # Check that socket can be opened
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    assert sock.connect_ex("/run/user/1000/fold.sock") == 0
-    sock.sendall(b"GET_STATUS")
-    response = sock.recv(1024)
-    assert b"CONNECTED" in response
-    sock.close()
-
-
-def test_fallback_to_sysfs():
-    """Test that sysfs is used when root helper is unavailable"""
-    # Temporarily disable socket
-    # Mock the connection to fail
-    pass
-```
-
-## Configuration
-
-### User Plugin Configuration
-
-No configuration changes needed. The plugin auto-detects:
-
-```python
-# Check for socket presence
-if os.path.exists('/run/user/1000/fold.sock'):\n    # Use socket mode
-    self.mode = 'event_driven'
-else:
-    # Use legacy mode
-    self.mode = 'sysfs_poll'
-```
-
-### Root Helper Configuration
-
-The root helper could support these configuration options:
-
-- `BUFFER_LENGTH` (default: 10) — number of samples to queue
-- `MIN_READ_INTERVAL` (default: 1) — minimum time between samples (ms)
-- `LOG_LEVEL` (default: INFO) — logging verbosity
-- `DEBUG_ENDPOINT` (default: false) — enable diagnostic HTTP endpoint
-
-Configuration could be loaded from:
-
-- Command line arguments
-- Environment variables (`YOGABUFFERD_BUFFER_LENGTH=20`)
-- Config file (`/etc/yoga260-bufferd.conf`)
-
-## Monitoring and Diagnostics
-
-### Systemd Integration
-
-```bash
-# Status
-systemctl status yoga260-bufferd
-
-# Logs (real-time)
-journalctl -u yoga260-bufferd -f
-
-# Health check (user plugin can call this)
-curl http://localhost:8080/health  # if HTTP endpoint is implemented
-```
-
-### User Plugin Diagnostics
-
-The user plugin can:
-
-1. **Log connection status**
-   ```python
-   if not connected:
-       log.warning("Root helper unavailable, using sysfs")
-   ```
-
-2. **Periodic health checks**
-   ```python
-   def health_check():
-       try:
-           sock.sendall(b"GET_STATUS\n")
-           response = sock.recv(1024)
-           if b"CONNECTED" not in response:
-               log.warning("Root helper unhealthy")
-       except:
-           log.error("Cannot communicate with root helper")
-   ```
-
-3. **Fallback recovery**
-   ```python
-   if root_helper_unavailable:
-       enable_sysfs_fallback()
-       # Queue a re-check when root helper becomes available
-       schedule_health_check(delay=5.0)
-   ```
-
-## Security Considerations
-
-### Socket Permissions
-
-The Unix socket should have restrictive permissions:
-
-```bash
-# Only root and the user can access the socket
-chmod 700 /run/user/1000
-chown root:user /run/user/1000
-```
-
-### Root Helper Security
-
-The root helper should:
-
-1. **Validate input** from the socket (prevent malformed data)
-2. **Rate limit** connections and messages
-3. **Log all access** (who connects, when, what data)
-4. **Fail securely** (no sensitive data exposure)
-5. **Drop privileges** when possible (run with least necessary permissions)
-
-### User Plugin Security
-
-The user plugin should:
-
-1. **Handle socket errors gracefully**
-2. **Validate fold angle values** (should be reasonable)
-3. **Monitor system resources**
-4. **Log diagnostic information**
-
-## Migration Guide
-
-### From Legacy to Root-Triggered Buffer
-
-1. **Install the root helper**
-   ```bash
-   sudo systemctl enable --now yoga260-bufferd
-   ```
-
-2. **Wait for initialization**
-   ```bash
-   # The root helper takes a few seconds to set up
-   sleep 5
-   ```
-
-3. **Verify the socket exists**
-   ```bash
-   ls -la /run/user/1000/fold.sock
-   ```
-
-4. **Restart user plugin** (or it auto-detects)
-
-5. **Monitor performance**
-   ```bash
-   # Check logs
-   journalctl -u yoga260-bufferd --since "5 minutes ago"
-   
-   # User plugin log
-   tail -f ~/.local/share/omarchy-yoga260-fold/var/log/plugin.log
-   ```
-
-### From Root-Triggered Buffer to Legacy
-
-1. **Stop the root helper**
-   ```bash
-   sudo systemctl stop yoga260-bufferd
-   ```
-
-2. **The user plugin will automatically fall back**
-   - Socket will be gone
-   - Plugin switches to sysfs mode
-   - Performance returns to legacy levels
-
-3. **Optional: Remove the root helper**
-   ```bash
-   sudo systemctl disable yoga260-bufferd
-   sudo rm /usr/local/bin/yoga260-bufferd
-   sudo rm /etc/systemd/system/yoga260-bufferd.service
-   sudo systemctl daemon-reload
-   ```
-
-## Troubleshooting
-
-### Common Issues
-
-#### Issue: Socket not found
-
-**Symptoms:** User plugin stays in sysfs mode when root helper is running
-
-**Check:**
-
-```bash
-# Root helper is running?
-systemctl is-active --quiet yoga260-bufferd
-
-# Socket exists?
-ls -la /run/user/1000/fold.sock
-
-# Permissions?
-stat /run/user/1000/fold.sock
-```
-
-**Solution:**
-
-```bash
-# Ensure socket directory exists and has proper permissions
-sudo mkdir -p /run/user/1000
-sudo chmod 700 /run/user/1000
-# The systemd service should create the socket file
-```
-
-#### Issue: Slow response time
-
-**Symptoms:** Root helper starts but user plugin still shows high latency
-
-**Check:**
-
-```bash
-# Root helper logs
-journalctl -u yoga260-bufferd --since "5 minutes ago" -f
-
-# Socket activity (if debug enabled)
-echo "Socket connected" > /var/log/yoga260-bufferd.sock.log
-```
-
-**Solution:**
-
-1. **Check buffer length** (`/sys/bus/iio/devices/iio:device5/buffer0/length`)
-2. **Verify IIO device** (`/proc/iomem | grep iio`)
-3. **Check kernel logs** (`dmesg | grep iio`)
-
-#### Issue: User plugin crashes with root helper
-
-**Symptoms:** User plugin errors or exits when root helper is present
-
-**Check:**
-
-```bash
-# User plugin logs
-~/.local/bin/omarchy-yoga260-fold --log-level debug
-
-# Network socket debugging
-python3 -c "
-import socket
-s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-print('Socket exists:', os.path.exists('/run/user/1000/fold.sock'))
-try:
-    s.connect('/run/user/1000/fold.sock')
-    print('Connected successfully')
-except Exception as e:
-    print('Connection failed:', e)
-"
-```
-
-**Solution:**
-
-1. **Fix socket permissions**
-2. **Ensure root helper is actually running**
-3. **Check for IPv6 vs IPv4 issues**
-4. **Verify buffer setup in root helper**
-
-## Performance Benchmarks
-
-### Expected Improvements
-
-| metric | legacy (sysfs) | root-triggered (buffer) | improvement |
-|---------|----------------|--------------------------|-------------|
-| per-read latency | ~10.31 ms | ~0 ms | **10×** |
-| pass time | ~21 ms | ~3 ms | **7×** |
-| CPU usage | Higher (busy-wait) | Lower (event-driven) | **2-3×** |
-| battery impact | More frequent wakeups | Fewer wakeups | **~3×** |
-
-### Real-World Test Results
-
-On a Yoga 260 with the root helper enabled:
-
-```
-$ time ./omarchy-yoga260-fold daemon
-
-Before (legacy mode):
-real    0m0.021s
-user   0m0.018s
- sys    0m0.001s
-
-After (root-triggered buffer):
-real    0m0.003s
-user   0m0.001s
- sys    0m0.000s
-
-Latency reduction: 21ms → 3ms (7× faster)
-```
-
-## Future Enhancements
-
-### Additional IIO Features
-
-- **Multiple sensor support**: Extend to other IIO devices
-- **Trigger configuration**: Allow users to customize trigger sources
-- **Buffer statistics**: Expose IIO buffer stats for monitoring
-- **Rate limiting**: Configurable minimum time between samples
-
-### Advanced Configuration
-
-- **Dynamic buffer sizing**: Adjust based on system load
-- **Fallback strategies**: Multiple fallback options (sysfs, direct I/O)
-- **Diagnostic tools**: Built-in tools for troubleshooting buffer issues
-
-### Integration
-
-- **Omarchy integration**: Seamless integration with Omarchy's configuration system
-- **System monitoring**: Integration with system monitoring tools
-- **Performance dashboards**: Real-time visualization of buffer performance
-
-## Conclusion
-
-The root-triggered buffer implementation provides a **dramatic performance improvement** while maintaining backward compatibility. Users can upgrade their systems for better performance while still having the legacy fallback as a safety net.
-
-**Key benefits**:
-
-1. **Near-zero latency** (~0 ms vs ~10 ms per read)
-2. **Better battery life** (fewer wakeups)
-3. **Lower CPU usage** (event-driven vs polling)
-4. **Zero configuration** (auto-detects root helper)
-5. **Safe fallback** (gracefully degrades to sysfs)
-6. **Publishable** (no security issues, follows Omarchy conventions)
-
-**Implementation requirements**:
-
-1. **Root helper** (`yoga260-bufferd`) — systemd service, IIO buffer setup
-2. **User plugin** (`omarchy-yoga260-fold`) — auto-detection, fallback logic
-3. **Documentation** — setup, troubleshooting, migration guide
-4. **Packaging** — pip package, systemd service files, configuration
-
-The root-triggered buffer represents a **significant architectural improvement** while maintaining the **user-friendly, no-root-default approach** that makes the Yoga 260 Fold plugin accessible to everyone.
-
----
-
-*This document should be updated with any issues found during testing and should be kept up-to-date as the implementation evolves.*
-
----
-
-## Revision History
-
-**v1.0 (Initial Draft)**:
-- Document structure completed
-- Core architecture defined
-- Basic implementation details
-- Performance expectations documented
-
-**v1.1**:
-- Added fallback logic
-- Improved socket protocol documentation
-- Added troubleshooting section
-
-**v1.2**:
-- Added systemd integration examples
-- Enhanced security section
-- Added comprehensive testing guidance
-
-**v1.3**:
-- Finalized deployment instructions
-- Added migration guide
-- Polish formatting and clarity
+Notes on the sketch, because several defaults are wrong here:
+
+- **No `After=network.target`.** An earlier draft had `After=network.target`
+  and `Wants=network.target`. This service reads a local I²C/SPI-attached
+  sensor over an internal transport. It needs no network, and declaring the
+  dependency just delays boot for nothing.
+- `ProtectSystem=strict` plus writing `/sys/bus/iio/.../buffer*` conflicts.
+  sysfs is not covered by `ReadWritePaths=` remapping in the way one might
+  hope; this needs testing before it can be claimed to work.
+- `CapabilityBoundingSet=` empty is correct — the service opens a device it is
+  already root-owned, it does not need any capability bit.
+
+## Socket protocol **[PROPOSED — invented for this document, not validated]**
+
+One JSON object per line, newline-delimited, both directions.
+
+Client → server:
+
+| line | meaning |
+|---|---|
+| `{"cmd":"hello"}` | client identifies; server replies with its config |
+| `{"cmd":"status"}` | request a `status` message |
+
+Server → client:
+
+| message | meaning |
+|---|---|
+| `{"type":"sample","fold":112.0,"t":1724223480.04}` | newest fold angle, monotonic `t` |
+| `{"type":"status","rate_hz":10.0,"connected":true}` | reply to hello/status |
+| `{"type":"error","code":"...","msg":"..."}` | something the client should surface |
+
+### Rules the implementation must obey
+
+1. **Validate `fold` before use.** Range-check to `0 <= fold <= 360` and reject
+   NaN/Inf. A root daemon feeding unvalidated floats into a compositor command
+   is a foot-gun. (The user-side daemon already range-checks; defence in depth,
+   but the producer should not emit garbage in the first place.)
+2. **Never block the client.** A slow or dead client must not stall sensor
+   capture. Either drop samples for that client (correct: a fold daemon wants
+   the *newest* value, not every value) or cap per-client buffers.
+3. **One line, no partial reads.** The client must handle a short `read()`
+   and buffer until `\n`.
+4. **Reconnect must be cheap and must not lose the fallback.** On socket error
+   the plugin drops back to the sysfs path immediately rather than retrying —
+   see below.
+5. **The server is the authority on `rate_hz`.** The plugin's `pollSec` only
+   governs the sysfs path.
+
+### Permissions are the real security surface
+
+The socket grants read access to the fold angle — low sensitivity — but it is
+a root process serving it. The mitigations that matter:
+
+- socket in `/run/yoga260-fold/`, mode `0750`, group-gated (above)
+- drop the client if it does not send `hello` within a short timeout
+- no `eval`, no shell, no arbitrary command dispatch — **the command set must
+  be a fixed enum**. The earlier draft listed a `SHUTDOWN` client command,
+  which is a remote-shutdown primitive on a root process for no benefit.
+  Remove it; the service stops via `systemctl`.
+- bind to `SOCK_STREAM` with `listen(1)`-style backlog, not an unbounded accept
+  loop.
+
+## Fallback behaviour **[PROPOSED]**
+
+| situation | plugin behaviour |
+|---|---|
+| socket absent at startup | sysfs path, forever (current behaviour) |
+| socket present, connects | sample path |
+| socket dies mid-session | **drop to sysfs within one poll interval**, log once |
+| socket present but silent | fall back on a timeout; do not block the pass |
+| helper disabled later | re-probe on a slow timer (e.g. every 30 s) |
+
+The one hard requirement: **the plugin must never depend on the root helper.**
+The root path is an optimisation. Any bug in it must degrade to the 10.31 ms
+poll, not to a broken screen.
+
+## Expected performance **[PROJECTED — not measured]**
+
+There is no implementation, so there are no measurements. What the mechanism
+predicts:
+
+| | current | projected |
+|---|---|---|
+| per-sample kernel cost | 10.31 ms | ~0 (pushed, not pulled) |
+| pass wall time | ~21 ms | dominated by the compositor call |
+| sensor-rate ceiling | 10 Hz (kernel-fixed) | 10 Hz (unchanged) |
+
+**The 10 Hz floor does not move.** The buffer changes *when* the plugin learns
+the angle, not *how often new angles exist*. The honest framing:
+
+- **Latency to notice a fold** improves — from "up to one poll period plus a
+  10.31 ms read" to "as soon as the report lands".
+- **Pass wall time** improves only by the read cost, i.e. ~10 ms of a ~21 ms
+  pass.
+- **Battery** improves marginally: fewer blocking wakeups, but the sensor still
+  reports at 10 Hz either way.
+
+> An earlier draft of this file contained a "Real-World Test Results" section
+> showing `real 0m0.003s` before and after. **Those numbers were invented.**
+> There was no implementation to run. They are removed, and should never be
+> reintroduced without an actual `time` capture from a real run.
+
+## Is it worth building? — the honest case
+
+**Against:**
+
+- The current plugin is already 5.1× faster than it was, and the pass fits the
+  100 ms budget with ~79 ms headroom **[MEASURED]**.
+- The floor is the sensor's 10 Hz rate, which the buffer does not change.
+- It adds a root system service to a plugin whose entire value proposition is
+  that it needs no root.
+- Every line of the helper is new, privileged, kernel-adjacent code on a
+  machine where the unprivileged path already works.
+- The benefit is bounded by ~10 ms per pass on a pass that already has 79 ms
+  of slack.
+
+**For:**
+
+- It removes the only remaining blocking kernel round-trip from the hot path.
+- It is the one mechanism the hardware explicitly provides for this.
+- If fold latency ever matters more than no-root (kiosk mode, a demo, a
+  one-off install), it is available.
+
+**Recommendation: do not build it.** Ship the no-root plugin. Keep this
+document as the record of why, and as the starting point for anyone who later
+has a reason to want it.
+
+## If someone does build it — checklist
+
+- [ ] Real `fold-bufferd` source in-repo, reviewed, no unexplained privileges
+- [ ] `RuntimeDirectory=`, group-gated socket, no `/run/user/` writes
+- [ ] `length` set small (1–2); **verify** rather than trusting this note
+- [ ] Sample validation (range, NaN, monotonic clock) on the producer side
+- [ ] Fixed enum command set; no client-triggered shutdown
+- [ ] Plugin falls back to sysfs on every failure mode, tested by killing the
+      helper mid-session
+- [ ] Tests for: socket present/absent, mid-session death, silent server,
+      malformed line, out-of-range fold, reconnect
+- [ ] `systemd-analyze verify` clean
+- [ ] Real `time` captures published, with the command used
+- [ ] Documented uninstall path
+- [ ] Confirmed it does not regress the 275 existing tests
+
+## Sources for the mechanism
+
+- `Documentation/iio/` — buffer/watermark/data_available/scan element ABI
+- `drivers/iio/industrialio-buffer.c` — `iio_buffer`, `data_available`
+- `drivers/hid/hid-sensor-custom-intel-hinge.c` — the hinge channels
+- `systemd.exec(5)` — `RuntimeDirectory`, `DeviceAllow`, `ProtectSystem`
+- Measured directly on this machine (kernel 7.2.5-3-omarchy, uid 1000) —
+  see the table above
