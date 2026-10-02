@@ -176,13 +176,16 @@ DEFAULTS = {
     # without any cooperation from the compositor.
     # Polling faster than the sensors report is pointless: the hardware
     # refreshes at 10 Hz, so a faster loop just re-reads the same report, and
-    # the three axis files are read separately so a faster loop also tears more
-    # samples. The loop runs at the accelerometer's own declared rate and the
-    # pose is averaged over a window of it.
+    # the axis files are read separately so a faster loop also tears more
+    # samples. The pose is the current sample, never an average -- see
+    # `read_pose` for why averaging restarted the settle timer every time.
     "pollSec": 0.1,
-    # How often the hinge's two telemetry channels are refreshed. The fold
-    # angle is read every pass regardless; these two are reported and nothing
-    # acts on them, and they cost ~21 ms of a ~54 ms pass. See `Hinge.read_fold`.
+    # How often the hinge's two non-decision channels are refreshed. The fold
+    # angle is read every pass regardless. These two are read to refresh the
+    # firmware's self-consistency check and to report the tilt estimate, and
+    # nothing that judges the machine's attitude acts on either. Between them
+    # they cost more than everything else in a pass, which is what this cadence
+    # exists to bound. See `Hinge.read_fold` and `Hinge.report`.
     "telemetrySec": 1.0,
     "verifySec": 5.0,
     "panel": "eDP-1",
@@ -534,13 +537,19 @@ class Motion:
         machine is flat this is the one motion the accelerometer cannot see at
         all, and the one that decides whether the screen is in portrait.
 
-        The mount matrix is applied here, which it never was before: the stillness
-        test only ever took the magnitude of the raw vector, so a sign error in
-        the matrix could not affect it. Direction cannot be taken without one,
-        because the sensor's axes are the chip's, not the machine's. Note that
-        this particular component -- the base's Z -- does not involve the
-        ambiguous X sign, so it does not depend on the calibration that
-        `calibrate` exists to settle.
+        The mount matrix is applied here, by `vector`, and it has to be: the
+        stillness test only ever took a magnitude of the raw axes, so a wrong
+        matrix could not affect it, but direction cannot be taken without one
+        because the sensor's axes are the chip's and not the machine's. The
+        daemon builds this with the same matrix it gives the accelerometer;
+        both chips are in the base. Constructed without one it silently fell
+        back to the identity and dotted a chip-frame vector against a base-frame
+        gravity vector, which for this machine reads a real turn as zero.
+
+        The remaining sign is settled by `yawSign`, not here. A machine lying
+        flat has its base X roughly along world X, so this component does lean on
+        the base's X sign -- the one `calibrate` exists to settle -- and the
+        previous claim that it did not was wrong.
         """
         w = self.vector()
         if w is None:
@@ -710,11 +719,26 @@ class Hinge:
     that never moves, a figure that grows with base tilt until it blocks the
     screen outright.
 
-    So: `angl0` is the fold angle and is what this plugin acts on. `angl1` and
-    `angl2` are reported, never trusted. Their internal consistency
-    (`angl0` against `wrap360(angl1 - angl2)`) is still checked, because it is
-    free and it did catch real trouble, but it is a check on the firmware's
-    arithmetic and not on the machine's attitude.
+    So: `angl0` is the fold angle and is what every decision is made from.
+    `angl1` and `angl2` are not a second opinion on the machine's attitude and
+    are never used as one -- that was tried, and comparing the accelerometer
+    against a channel that never moves produced a figure that grows with base
+    tilt until it blocks the screen outright.
+
+    What they *are* used for is a consistency check on the firmware, and this
+    distinction matters because two documents got it wrong in opposite
+    directions. `angl0` is compared against `wrap360(angl1 - angl2)`, both
+    computed independently by the firmware, and a disagreement beyond 150
+    degrees marks the sample `ok = False`, which `step` refuses to rotate the
+    screen on. So `angl1` and `angl2` *do* gate: they can stop a rotation, and
+    `test_step_hinge_not_consistent` pins it.
+
+    What they never gate is anything about the machine's attitude. The residual
+    between the two independent tilt estimates -- accelerometer against hinge --
+    is reported in the panel and, past 25 degrees, noted in `status`, and no
+    rotation is ever refused because of it. Those are two different figures and
+    conflating them is how "never trusted" came to be written next to a gate
+    that exists.
 
     All three update at 10 Hz, which means a fold that takes less than a tenth
     of a second can be stepped over entirely.
@@ -791,12 +815,17 @@ class Hinge:
             static in_angl_scale         0.1 ms
 
         So the hinge was 58% of the whole pass, and two thirds of that was
-        spent on `angl1` and `angl2` -- the two channels this file spends a
-        long docstring explaining are *telemetry that nothing gates on*.
-        `angl2` reads about zero whatever the base is doing (104/103/359 open,
-        132/132/359 tent). The residual derived from them is reported in the
-        panel and, past 25 degrees, written into `status` as a note. Nothing
-        ever refuses a rotation because of it.
+        spent on `angl1` and `angl2` -- the two channels the class docstring
+        says are *never* used to judge the machine's attitude, and which are
+        only read to refresh the firmware's own arithmetic. `angl2` reads about
+        zero whatever the base is doing (104/103/359 open, 132/132/359 tent).
+        The residual between the two independent tilt estimates is reported in
+        the panel and, past 25 degrees, written into `status` as a note.
+        Nothing ever refuses a rotation because of *that*.
+
+        Read the class docstring before trusting the word "only": the channels
+        do still gate, in one narrow way, and `report` below exists because that
+        gate made a naive `status` able to undo this whole optimisation.
 
         So the fold angle -- the one channel every decision is made from -- is
         read every pass, and the other two are refreshed on `telemetry_sec`.
@@ -829,6 +858,27 @@ class Hinge:
             return HingeSample(
                 fold, cached.screen_deg, cached.base_deg, None, cached.residual_deg, cached.ok
             )
+        return self.read()
+
+    def report(self, now: float, telemetry_sec: float) -> HingeSample:
+        """The sample to publish, without reading what the caller just read.
+
+        `read_fold` keeps the fold angle fresh while the two channels nothing
+        decides on age on a timer, and `read` leaves the full sample in
+        `_cached`. This returns that cache instead of taking a new one.
+
+        It exists because `status` is built on every pass -- `_publish` calls it
+        whether or not anything changed -- and a fresh `read()` there undid the
+        entire point of `read_fold`: two of the three channels came back on
+        every pass, having cost the same as not having split them at all.
+
+        A cold cache still takes one full read, because there is nothing to
+        report. `status` and `doctor` are separate processes that have sampled
+        nothing themselves, and printing nulls would be worse than paying for it.
+        """
+        cached = self._cached
+        if cached is not None and (now - self._cached_at) < telemetry_sec:
+            return cached
         return self.read()
 
     def as_dict(self, sample: HingeSample) -> dict[str, Any]:
@@ -1689,7 +1739,16 @@ class FoldDaemon:
         self.hypr = Hyprland()
         self.state = State()
         self.accel, self.hinge = open_sensors(settings)
-        self.motion = Motion(find_iio_device(settings["gyroName"]), settings["stillRotDeg"])
+        # The gyro takes the same matrix as the accelerometer. Both chips are in
+        # the base, so both are glued into it the same way, and `Motion` reads
+        # directionally where `Accelerometer` does not -- without this it fell
+        # back to the identity and `vertical_rate` dotted a vector in the chip's
+        # frame against a gravity vector in the base's.
+        self.motion = Motion(
+            find_iio_device(settings["gyroName"]),
+            settings["stillRotDeg"],
+            settings["mountMatrix"],
+        )
         self.osk = OnScreenKeyboard(settings)
         self.stop = False
         self.decision: int | None = None
@@ -2041,7 +2100,7 @@ class FoldDaemon:
         best = pose["candidates"][0]
         chosen = best
         if incumbent is not None and (best["label"], best["sign"]) != held and incumbent["tiltDeg"] - best["tiltDeg"] < float(self.settings["hystDeg"]):
-            chosen = incumbent  # pragma: no cover
+            chosen = incumbent
 
         orientation = ORIENTATION_FOR[(chosen["label"], chosen["sign"])]
         transform = transform_for(orientation, self.settings["mapping"])
@@ -2163,7 +2222,14 @@ class FoldDaemon:
                 "mountMatrix": [list(row) for row in self.accel.matrix],
                 "mountMatrixDeterminant": round(determinant(self.accel.matrix), 6),
                 "hinge": dict(
-                    self.hinge.as_dict(self.hinge.read()),
+                    # `report`, not `read`: this runs on every pass, and a full
+                    # read here would bring back the two channels `read_fold`
+                    # exists to hold back. See `Hinge.report`.
+                    self.hinge.as_dict(
+                        self.hinge.report(
+                            time.monotonic(), float(self.settings.get("telemetrySec", 1.0))
+                        )
+                    ),
                     hz=self.hinge.hz,
                     hysteresis=self.hinge.hysteresis,
                 ),
@@ -2548,10 +2614,12 @@ class FoldDaemon:
                 self.resolve_devices()
                 next_verify = now + verify
             # Keep to a schedule rather than sleeping a flat interval after the
-            # work. A pass costs about 62 ms of blocking sensor reads, and
-            # `sleep(poll)` on top of that made the real period roughly 162 ms
-            # while the published budget claimed 100 -- so the number the panel
-            # shows was optimistic by the entire cost of reading the hardware.
+            # work. The sensor reads block -- they are synchronous round trips
+            # into the driver -- so `sleep(poll)` on top of them made the real
+            # period longer than the published budget claimed, and the number
+            # the panel shows was optimistic by the entire cost of reading the
+            # hardware. How much that is depends on how many channels the pass
+            # touches; see `Hinge.read_fold` for the per-attribute cost.
             spent = time.monotonic() - now
             time.sleep(max(0.0, poll - spent))
         return 0
@@ -2560,7 +2628,7 @@ class FoldDaemon:
 
 
     def changed(self, pose: dict[str, Any] | None = None) -> bool:
-        """Cheap change detection, so the common case costs six sysfs reads.
+        """Cheap change detection, so an idle pass reads only what it must.
 
         A pass does a `hyprctl monitors` for the re-assert check and possibly
         more, so running one five times a second forever would be rude. What
@@ -2568,20 +2636,27 @@ class FoldDaemon:
         coarse: the fold angle to a degree and the attitude vector to a
         hundredth of g, which is well above the sensor's own jitter.
 
-        Three reads for the hinge's three channels and three for the
-        accelerometer's three axes. Reading the hinge first and skipping the
-        accelerometer when it has not moved would halve that, and was tried:
-        it is wrong, because the fold angle does not change when the machine is
-        turned about the hinge, which is the rotation that matters most. A
-        screen that would not follow a turn made by rotating the machine in its
-        own plane is worse than six file reads a pass.
+        An idle pass costs four live reads: the hinge's fold channel, plus the
+        accelerometer's three axes. It used to be six, because the hinge read
+        all three of its channels; `read_fold` now reads one of them per pass
+        and refreshes the other two on `telemetrySec`. A pass that acts on
+        something costs more -- the tilt channels come back on their cadence,
+        the gyro is read twice, and `status` adds a static rate probe -- which
+        is the point: the expensive passes are the rare ones.
+
+        Reading the hinge first and skipping the accelerometer when it has not
+        moved would halve that, and was tried: it is wrong, because the fold
+        angle does not change when the machine is turned about the hinge, which
+        is the rotation that matters most. A screen that would not follow a turn
+        made by rotating the machine in its own plane is worse than four file
+        reads a pass.
 
         ## Why the sample is kept rather than thrown away
 
         This used to read all six sensors, compare them against the last key,
         and return a bool -- and then `step()` read all six again to build the
         pose it acted on. Twelve reads a pass, of which the first six were
-        discarded, at roughly 62 ms of blocking per set.
+        discarded.
 
         It was not only the cost. `changed()` decided on one pose and `step()`
         acted on another, and the hardware only refreshes these attributes at
@@ -3405,12 +3480,17 @@ def cmd_rotate(settings: dict[str, Any], position: str, force: bool = False) -> 
     Turning it by hand also locks the rotation, which is what a tablet does and
     what stops the sensor turning it straight back.
 
-    Outside tablet mode the panel is deliberately held at landscape -- a laptop
-    on knees must not flip, and neither can an open one. So a turn issued while
-    the machine is open would be undone within a second, which reads as a broken
-    button. Say so instead, and keep `--force` for the cases where holding it
-    anyway is right: a panel that is genuinely upside down in tent mode, or
-    checking that the digitizer transform is being applied.
+    The daemon now follows the machine in every pose it can see, including an
+    open one, so there is no longer a rule saying the panel is held at
+    landscape while the lid is up. That rule ate most of a session on a machine
+    that is held open far more often than it is folded, and it was removed.
+
+    What still justifies refusing without `--force` is narrower and is about
+    this command rather than the daemon: a hand-issued turn is a deliberate
+    override, and a person who has just typed it while the machine is open is
+    usually testing the button. `--force` is for the cases where turning it
+    anyway is right -- a panel genuinely upside down in tent mode, or checking
+    that the digitizer transform is being applied.
     """
     hypr = Hyprland()
     panel = hypr.internal_monitor(settings["panel"])
@@ -3434,8 +3514,9 @@ def cmd_rotate(settings: dict[str, Any], position: str, force: bool = False) -> 
         mode, _ = daemon.mode_for(pose["fold"])
         if mode == "book":
             note = (
-                f"Laptop · landscape is held on purpose at {pose['fold']:.0f}°. "
-                "Fold it past a tent and the screen follows."
+                f"Laptop · open at {pose['fold']:.0f}°, so this is a hand turn "
+                "rather than a pose the screen can see. Re-run with --force, or "
+                "fold it past a tent and the screen follows on its own."
             )
             print(note, file=sys.stderr)
             # A keybinding runs with its output going nowhere, so a refusal that
@@ -3460,8 +3541,14 @@ def cmd_rotate(settings: dict[str, Any], position: str, force: bool = False) -> 
         # on the bar, with the way out -- silence here is what made it a
         # mystery the first time.
         name = {0: "Landscape", 1: "Portrait", 2: "Upside down", 3: "Portrait"}
+        # This names a binding that lives in the user's ~/.config/hypr/bindings.lua,
+        # not in anything this plugin ships: Omarchy 4.x configures Hyprland
+        # through Lua, and a plugin cannot declare bindings in its manifest. The
+        # bar's Lock button is the unconditional way out; the combo is the fast
+        # one, and it is the user's to have set.
         _osd(
-            f"{name.get(transform, transform)} \u00b7 locked \u2014 SUPER+ALT+SHIFT+R to unlock",
+            f"{name.get(transform, transform)} · locked — "
+            "SUPER+ALT+SHIFT+R to unlock, or the bar's Lock button",
             ICONS["lock"],
             hypr.env,
         )

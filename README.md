@@ -105,7 +105,7 @@ Or, from a checkout, copy it into place and enable it:
 
 ```bash
 cp -r . ~/.config/omarchy/plugins/estrocondoso.yoga260-fold
-omarchy shell rescanPlugins      # if it is already running
+omarchy shell shell rescanPlugins   # if it is already running
 omarchy bar move estrocondoso.yoga260-fold --section right
 ```
 
@@ -199,9 +199,9 @@ the thing that has to feel instant.
 
 - It refuses to touch anything that is not a Yoga 260. `product_version` has to
   say so; the board prefix cannot tell a Yoga from anything else.
-- It does not use `iio-sensor-proxy`. Reading the two IIO nodes directly needs no
-  package, and a proxy that applies an identity mount matrix to a sensor with no
-  mount matrix of its own reports the chip's axes rather than the machine's.
+- It does not use `iio-sensor-proxy`. Reading the three IIO nodes directly needs
+  no package, and a proxy that applies an identity mount matrix to a sensor with
+  no mount matrix of its own reports the chip's axes rather than the machine's.
 - It cannot give a folded machine its lock screen back an on-screen keyboard.
   Opening the lid restores the keyboard at once.
 
@@ -218,8 +218,13 @@ $fold calibrate     # guided, human-verified calibration
 $fold rotate next   # turn it by hand (not in book mode; --force overrides)
 $fold lock toggle
 $fold mapping standard
+$fold keyboard toggle   # the on-screen keyboard
 $fold libwacom status
 $fold hwdb show     # the systemd sensor entry, not applied
+$fold hwdb apply    # and write it, which wants sudo
+$fold record        # every sensor reading to a JSONL file, live
+$fold analyze       # summarise what `record` wrote
+$fold daemon        # the watcher itself; the shell starts this for you
 ```
 
 `doctor` and `self-test` are the two worth running first. `self-test` checks the
@@ -234,7 +239,18 @@ the base's X axis, and that the digitizer's transform is really being applied.
 sensor's independent tilt channels on the way.
 
 If the screen turns the wrong way, the panel's **Settings** offers the four
-mappings: Standard, Upright, Flat and 180. See [`docs/calibration.md`](docs/calibration.md).
+mappings as Standard, Upright, Flat and 180. Those are panel labels; the command
+takes the values underneath them, and rejects the labels:
+
+| panel label | command value |
+|---|---|
+| Standard | `standard` |
+| Upright | `portrait-swapped` |
+| Flat | `landscape-swapped` |
+| 180 | `rotated-180` |
+
+`$fold mapping upright` is an error. See
+[`docs/calibration.md`](docs/calibration.md).
 
 ## Layout
 

@@ -33,7 +33,11 @@ iio:device5  in_angl_sampling_frequency    10.000000   in_angl_hysteresis     1.
 This one number explains most of what went wrong before.
 
 **Polling faster than the hardware refreshes returns the same report over and
-over.** The recorder originally ran at 20 Hz against a 10 Hz sensor.
+over.** The recorder's default is still 20 Hz against a 10 Hz sensor, and that
+is now deliberate rather than an oversight: a capture that outruns the hardware
+is how you *see* a torn read instead of inferring one, and `record` stamps the
+rate it used into the file's header. Pass `--hz 10` to sample at the declared
+rate.
 
 **The three axis attributes are three separate files, and reading them one
 after another can straddle two reports.** The result describes no instant at
@@ -48,13 +52,23 @@ explicitly the *wrong* test for whether the machine is still. A rotating
 accelerometer still reads 1 g. Coherence and stillness are two different
 questions and need two different sensors.
 
-`Coherent` retries three times and keeps a rejection count, because a tool that
-silently discards bad input cannot be told apart from one that is not working.
-The rate is in `status` and `doctor` as `accelRejectionRate`.
+`Coherent` makes three attempts — a first read and two retries — and keeps a
+rejection count, because a tool that silently discards bad input cannot be told
+apart from one that is not working. The rate is in `status` and `doctor` as
+`accelRejectionRate`.
 
-The loop runs at the accelerometer's own declared rate and the pose is averaged
-over `poseWindowSec` (0.6 s, about six reports), so a pose rests on several
-samples rather than on whichever tenth of a second the loop landed in.
+The pose is **the current sample, never an average**, and the loop is paced by
+`pollSec` (0.1 s) rather than by the accelerometer's declared rate — the two
+happen to be equal at the defaults, which is a coincidence and not a
+derivation. The declared rate is read and published as `accelHz`, and nothing
+acts on it.
+
+Averaging over a window was tried and removed. It lagged the device by however
+long the window was, and because the candidate is derived from the average, the
+settle timer restarted every time the average crossed a boundary on its way to
+a new pose. A recording caught the orientation changing six times in one
+movement, each one resetting the timer, and the screen never moved at all. See
+`read_pose` in the implementation and `README.md`.
 
 ## Stillness comes from the gyroscope
 
@@ -71,8 +85,22 @@ An earlier version tested acceleration magnitude instead and **passed 98% of the
 samples in a recording of the machine being carried through every position it
 has** — because you cannot rotate your way past 1 g.
 
-The threshold is read from `stillRotDeg` and is visible in the panel and in
-`debug`.
+The threshold is read from `stillRotDeg`. It is published in `status` and
+`doctor` as `stillDeg` / `settings.stillRotDeg`, and `debug` prints the
+instantaneous rate in its `d/s` column beside the `still` verdict — but the
+threshold *value* itself appears in neither the panel nor `debug`. Only
+`status` shows it.
+
+The mount matrix reaches the gyroscope too, and this is worth being explicit
+about: `vertical_rate` is the one place in this plugin that reads the gyro
+directionally rather than for magnitude, so it is the one place a missing
+matrix is visible. The daemon hands `Motion` the same matrix it gives the
+accelerometer, because both chips are in the base. Constructed without one it
+substituted the identity, and `dot(w_sensor, base_up)` for this machine's
+matrix reads a genuine 900 °/s turn as **0.0** — silently, because a flat
+machine that is not turning reports zero as well. `yawSign` settles the
+remaining sign. Whether the digitizer's own transform reaches libinput is
+settled in [`digitizer.md`](digitizer.md) and nothing here depends on it.
 
 ## The hinge sensor: three numbers the firmware made
 
@@ -107,17 +135,28 @@ Measured across two very different poses:
 
 **Consequences, and they matter:**
 
-- `angl0` is the fold angle, and it is the only channel this plugin acts on.
-- `angl1` and `angl2` are reported and never trusted. An earlier version used
-  them as an independent check on the accelerometer, which meant comparing the
-  accelerometer against a channel that never moves — a figure that grows with
-  base tilt (12.5° flat, 40.8° with the base propped at 42°) until it blocks
-  the screen outright.
-- Their internal consistency, `angl0` against `wrap360(angl1 - angl2)`, is still
-  checked, because it is free. It is a check on the **firmware's arithmetic**,
-  not on the machine's attitude, and the tolerance is deliberately loose at
-  150°: the three channels have been seen 131° apart mid-fold, and a real fold
-  must not be stopped by that.
+- `angl0` is the fold angle, and it is what every **decision** is made from: the
+  mode, and the pose through `lid_vector`.
+- `angl1` and `angl2` are never used to judge the machine's attitude. An earlier
+  version used them as an independent check on the accelerometer, which meant
+  comparing the accelerometer against a channel that never moves — a figure that
+  grows with base tilt (12.5° flat, 40.8° with the base propped at 42°) until it
+  blocks the screen outright.
+- **But they do gate, in one narrow way, and "never trusted" was never
+  accurate.** Their internal consistency, `angl0` against
+  `wrap360(angl1 - angl2)`, is checked on every full read, and a disagreement
+  beyond the tolerance marks the sample `ok = False`, which `step` refuses to
+  rotate the screen on. The tolerance is deliberately loose at 150°: the three
+  channels have been seen 131° apart mid-fold, and a real fold must not be
+  stopped by that. `test_step_hinge_not_consistent` pins the refusal.
+- What the tolerance checks is the **firmware's arithmetic**, not the machine's
+  attitude, and it is the one thing that is cheap: both sides are computed
+  independently by the firmware, so a real disagreement means a stuck or
+  nonsensical channel rather than a machine in an interesting posture.
+- The *other* residual — the tilt difference between the accelerometer and the
+  hinge hub — is a different figure and is the one that is reported and never
+  enforced. It is shown in the panel and, past 25°, written into `status` as a
+  note, and no rotation is ever refused because of it.
 - All three update at 10 Hz, so **a fold that takes less than a tenth of a second
   can be stepped over entirely.**
 
@@ -196,10 +235,14 @@ directory. It needs no root. **It takes effect when the digitizer is next
 opened**, so after a logout; until then Hyprland still reports the raw USB
 descriptor name and the size derived from the digitizer's own axes.
 
-The finger node has **no `ABS_MT_TOUCH_MAJOR`**, only slot, position and
-tracking id. libinput decides palm-versus-pen by comparing a contact's size
-against the pen's, so with no size there is nothing to compare and **palm
-rejection is not available on this machine**. No configuration produces it.
+The finger node has **no `ABS_MT_TOUCH_MAJOR`**, and no `ABS_MT_POSITION_X/Y` and
+no `ABS_MT_TRACKING_ID` either. libinput decides palm-versus-pen by comparing a
+contact's size against the pen's, so with no size there is nothing to compare
+and **palm rejection is not available on this machine**. No configuration
+produces it. (`docs/digitizer.md` is where the axis masks were read off the
+kernel and where the consequence for rotation is worked through; an earlier
+version of this file said the finger had "only slot, position and tracking id",
+which contradicted that and was wrong.)
 
 ## Sources
 
@@ -208,7 +251,12 @@ rejection is not available on this machine**. No configuration produces it.
 - `Documentation/hid/` — the HID sensor hub and its report format
 - `/usr/lib/udev/hwdb.d/60-sensor.hwdb` and `60-sensor.rules` — the mount-matrix
   keys, and the 158 entries that do not include this machine
-- `wayland.freedesktop.org/libinput` — calibration is listed under **Tablets**,
-  which is why the pen follows the screen on Hyprland 0.56.2
+- `wayland.freedesktop.org/libinput` — calibration is listed under **Tablets**
+  and under **Touchscreens**, which is the basis for the claim that the pen
+  follows the screen on Hyprland 0.56.2. That claim *was* disputed by
+  measurement in [`digitizer.md`](digitizer.md), which saw `hyprctl eval` return
+  `ok` for the transform while `hyprctl -j devices` went on reporting
+  `transform = None`. The dispute was an artefact: Hyprland never emits that
+  field for a tablet. See [`digitizer.md`](digitizer.md) for the source trace.
 - The `Hw` section of [`../README.md`](../README.md) for what all this means in
   practice

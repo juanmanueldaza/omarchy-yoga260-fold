@@ -33,12 +33,21 @@ carries the inertial sensors and the light sensor.
 
 | node | driver name | HID usage | collection | hub |
 |---|---|---|---|---|
-| `iio:device0` | `accel_3d` | `HID-SENSOR-200073` | `.10` | base |
-| `iio:device1` | `gyro_3d` | `HID-SENSOR-200076` | `.4` | base |
+| `iio:device0` | `gyro_3d` | `HID-SENSOR-200076` | `.4` | base |
+| `iio:device1` | `gyro_3d` | `HID-SENSOR-200076` | `.8` | base |
 | `iio:device2` | `magn_3d` | `HID-SENSOR-200083` | `.14` | **lid** |
-| `iio:device3` | `gyro_3d` | `HID-SENSOR-200076` | `.8` | base |
+| `iio:device3` | `accel_3d` | `HID-SENSOR-200073` | `.10` | base |
 | `iio:device4` | `als` | `HID-SENSOR-200041` | `.3` | base |
 | `iio:device5` | `hinge` | `HID-SENSOR-INT-020b` | `.19` | **lid** |
+
+**This table is a snapshot of one boot, not a stable fact.** An earlier version
+of it claimed the accelerometer was `iio:device0` and that the `.4` gyro was
+`iio:device1`; on this machine right now it is the other way round, with the
+accelerometer at `device3`. The numbering follows the order the kernel happens
+to probe in, and that order is not fixed — which is exactly why
+[`sensors.md`](sensors.md) says nodes are found by their `name` file and never
+by number, and why `find_iio_device` takes a name. Read the rows as "these six
+sensors exist and here is which half each is in", not as addresses.
 
 The hinge is the odd one out: it is not a standard HID sensor usage, it is an
 Intel custom collection bound by `drivers/iio/position/hid-sensor-custom-intel-hinge.c`,
@@ -46,7 +55,7 @@ and it is a pure pass-through to the firmware.
 
 ### There are two gyroscopes, and it is not a problem
 
-`iio:device1` and `iio:device3` share the name `gyro_3d` and the usage
+`iio:device0` and `iio:device1` share the name `gyro_3d` and the usage
 `HID-SENSOR-200076`, differing only by collection (`.4` and `.8`). They return
 different values simultaneously, so they are two distinct collections, not one
 sensor enumerated twice.
@@ -57,10 +66,13 @@ a lid one, so it is measuring the half of the machine that actually sits on the
 desk. A lid gyro would have made every stillness reading meaningless.
 
 `find_iio_device("gyro_3d")` resolves by name and returns the first match in
-sorted order, which is `iio:device1` (collection `.4`). The 9 °/s gate was
-calibrated against 283 samples of *that* device at rest (max 6.57 °/s), so the
-threshold and the sensor in use match. The second collection is inventoried here
-and otherwise unused.
+sorted order, which on this boot is `iio:device0` (collection `.4`). The 9 °/s
+gate was calibrated against 283 samples of collection `.4` at rest (max
+6.57 °/s), so the threshold and the sensor in use match — **but by luck, not by
+design**. Which of the two gyroscopes sorts first is the same boot-order accident
+as everything else in the table above; the collection is what identifies the
+sensor, and a boot that enumerated the two the other way round would silently
+gate on `.8` instead, against a threshold that was never calibrated against it.
 
 ### Sensors present and deliberately unused
 

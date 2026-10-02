@@ -176,14 +176,39 @@ Live sensor data is roughly 100x more expensive to read than a static attribute
 on the same filesystem, so this is the driver's cost, not sysfs overhead.
 
 Two thirds of the hinge's cost was being spent on `angl1` and `angl2` — the
-two channels this plugin's own documentation describes as *telemetry that
-nothing gates on*. `mode_for` reads `angl0` and nothing else. The residual they
-produce is shown in the panel and, past 25°, written into `status` as a note; no
-rotation is ever refused because of it.
+two channels that never judge the machine's attitude. `read_pose` reads `angl0`
+and nothing else; `mode_for` takes the resulting float and does no I/O at all,
+so naming it here was always a shorthand for the pass. The residual they produce
+is shown in the panel and, past 25°, written into `status` as a note; no
+rotation is ever refused because of *it*.
+
+**But "never gates" was too strong, and this file once said so in a way that was
+plainly wrong.** `angl1`/`angl2` are never used to judge the machine's
+attitude — that was tried, and comparing the accelerometer against a channel
+that never moves produced a figure that grows with base tilt until it blocks
+the screen. They *do* still gate in one narrow way: the firmware's own
+self-consistency check, `angl0` against `wrap360(angl1 - angl2)`, at a
+deliberately loose 150°. A failure marks the sample `ok = False` and `step`
+refuses to rotate on it — `test_step_hinge_not_consistent` asserts
+`rotate_transaction` is never called. That is a *different* residual from the
+reported one: the firmware's arithmetic rather than the machine's attitude.
+`docs/calibration.md` has it right, and the error was copied from here into a
+test docstring, which is how it survived.
 
 So `Hinge.read_fold` reads the fold channel every pass and refreshes the other
 two on `telemetrySec` (default 1 s). Measured: **38.95 ms -> 11.02 ms** for the
 hinge, and the whole pass **49.57 ms -> 20.85 ms (2.38x)**.
+
+**That optimisation was inert until recently, and the reason is worth
+recording.** `status` is built on every pass — `_publish` calls it whether or
+not anything changed — and it took its own `hinge.read()`. So all three
+channels came back on every decision pass regardless of `telemetrySec`, and the
+counts in `HingeTelemetryCadenceTests` all passed because they exercised
+`Hinge` in isolation and never went through `read_pose -> step -> _publish`.
+`Hinge.report` now reports the cache the pass already filled; a cold cache (the
+`status` and `doctor` commands, which sample nothing themselves) still takes
+one real read. Counting attribute reads is what catches this — see the next
+section for what counting does *not* catch.
 
 This also *reduces* torn-read risk rather than adding to it. All three channels
 arrive in one HID input report, so reading them as three files can straddle two
@@ -301,11 +326,18 @@ It is documented as a starting point for whoever wants it, not recommended.
 
 ## What to copy, still open
 
-1. **Hinge-first, accel-second.** Done and should not regress: `mode_for` acts
-   on `angl0`, `lid_vector` on the accelerometer.
-2. **Treat `angl1`/`angl2` as telemetry, never gates.** Done. `angl2` sits at
-   ~0 whatever the base does (104/103/359 open, 132/132/359 tent); the residual
-   is reported and nothing blocks on it.
+1. **Hinge-first, accel-second.** Partly done, and should not regress: the
+   *decision* is hinge-first — `mode_for` acts on `angl0` and `lid_vector` on
+   the accelerometer, and the mode is what gates the keyboard. The *I/O order*
+   is the other way round: `read_pose` samples the accelerometer first and the
+   hinge second, because the accel sample is needed to build `base_up` before
+   the fold angle can be turned through it. So "hinge-first" describes the
+   priority of the decision, not the order of the reads.
+2. **Treat `angl1`/`angl2` as telemetry, never attitude gates.** Done.
+   `angl2` sits at ~0 whatever the base does (104/103/359 open, 132/132/359
+   tent); the attitude residual is reported and nothing blocks on it. They still
+   gate the firmware's own self-consistency check at 150°, deliberately and
+   deliberately only — see the section above.
 3. **Keyboard off belongs to the fold transition, not the steady state.**
    Still open. Windows killed the keys on the 0xCC edge. Here it is decided
    from `mode_for` but re-checked on every pass that changes anything, and the
@@ -314,8 +346,13 @@ It is documented as a starting point for whoever wants it, not recommended.
    true lockout — but it could be sampled on the transition rather than on
    every change.
 4. **Digitizer rotation is a display-driver feature on Windows; on Linux it is a
-   libinput calibration matrix or nothing.** `hl.device transform` is accepted
-   and dropped for these nodes (`transform=None` after `ok`). The udev
+   libinput calibration matrix or nothing.** Hyprland 0.56.2 does hand that
+   matrix to libinput for both nodes — `setTabletConfigs()` and
+   `setTouchDeviceConfigs()` both call
+   `libinput_device_config_calibration_set_matrix`. This was long recorded here
+   as "accepted and dropped", on the evidence that `hyprctl -j devices` reported
+   `transform = None` after `ok`; that field is never emitted for tablets, so the
+   evidence was of an absent key. See [`digitizer.md`](digitizer.md). The udev
    `LIBINPUT_CALIBRATION` hwdb route is the only remaining mechanism, and it
    needs observed raw ranges (the declared range is 0..0), root, and a device
    reopen. Do not ship a guessed matrix.

@@ -27,11 +27,16 @@ and the hinge hub estimate each half's tilt independently; the residual is
 shown in the panel, and past 25° it is also written into `status` as a note —
 never used to stop a rotation, because `angl2` is static on this machine, so
 the figure rises with base tilt and says nothing about whether the screen
-should turn. See the note at the end of
+should turn. See the "A disagreement worth knowing about" section of
 [`hardware.md`](hardware.md) about the ~13° this sits at on a desk.
 
-**The machine is still.** Below 0.8 g of measured acceleration is movement, not
-attitude, and a moving machine holds its last reading.
+**The machine is still.** The gyroscope has to be reading under `stillRotDeg`,
+9 deg/s by default, for any change to be acted on, and a moving machine holds
+its last reading. That gate is rotation rate, not acceleration: a machine being
+carried reads about one g all the way through every position it has, so an
+acceleration gate would pass it. The accelerometer's own band is 0.75–1.30 g and
+it is a different test entirely — a torn read, not stillness — see
+[`sensors.md`](sensors.md).
 
 ## What you check
 
@@ -70,6 +75,14 @@ to the shipped matrix if it does not hold.
 This is the part no amount of reading code can settle, because whether a tap
 lands where you touched is not something the software can observe.
 
+It is now a question about the **finger only**. Hyprland 0.56.2 does hand the
+calibration matrix to libinput for the pen — see [`digitizer.md`](digitizer.md)
+for the source trace, and for why the `transform = None` that used to be read as
+proof otherwise proves nothing. The finger's path is gated on a libinput
+capability the compositor does not report back, so it is still worth testing.
+Do the pen anyway: it is the half that confirms the plumbing, and it costs
+nothing.
+
 Fold the machine flat, turn it so the screen is upright, then:
 
 - tap each of the four corners of the panel
@@ -93,10 +106,25 @@ Note that the two nodes need turning **separately**. They are one physical
 digitizer read out twice, Hyprland treats them as two devices, and the pen will
 not follow the panel on its own.
 
-`$fold rotate right --force` does all three and puts it back. The `--force` is
-needed while the machine is open: in book mode the panel is deliberately held
-at landscape, and without it the command declines instead of turning the
-screen and having the daemon straighten it a second later.
+`$fold rotate right --force` turns the panel and both digitizer nodes, in three
+separate `hyprctl eval` calls rather than the daemon's single transaction chunk.
+It does **not** put anything back when you are done: there is no restore path. A
+hand turn writes `locked: true` into `shell.json` and leaves the panel turned,
+which is how a tablet behaves and also how you end up stuck looking at a portrait
+screen. To get back to normal:
+
+```bash
+$fold rotate normal     # back to landscape, and keep the lock on
+$fold lock off          # let the sensor drive the screen again
+```
+
+The `--force` is needed while the machine is open, but not for the old reason.
+There used to be a rule that held the panel at landscape whenever the lid was up;
+it ate almost the whole session on a machine that is held open far more often
+than it is folded, and it was removed. What is left is narrower and is about this
+command rather than the daemon: while the machine is open a hand-issued turn is a
+deliberate override of a pose the screen can see on its own, so the command
+declines rather than contradicting the sensor.
 
 ## If the screen turns the wrong way
 
@@ -121,7 +149,17 @@ model it is not, so a problem here means something else changed.
 $fold debug
 ```
 
-Streams the fold angle, both tilt channels, the derived screen vector, the
-chosen pose and whether the machine is still, updating only when something
-changes. Fold it, turn it, and watch which way each column goes. This is the
-fastest way to see what a threshold is doing while you move the machine.
+Streams one row per change: `mode`, `reason`, the three hinge channels (`fold`,
+`screen`, `base`), `resid`, `still`, `d/s` — the instantaneous rotation rate —
+`margin`, `pose`, `flat` and the `transform` the panel is being given. The
+**derived screen vector is not one of the columns**; it is computed by the same
+`read_pose` but only printed by `record`.
+
+Fold it, turn it, and watch which way each column goes. This is the fastest way
+to see what a threshold is doing while you move the machine.
+
+One thing to know before you trust what you see: the rows are deduplicated on
+`(orientation, round(fold), round(rotationRate), still)`. The `screen` and `base`
+tilt columns are **not** part of that key, so they only refresh when one of the
+other four changes, and on a machine sitting still they can be arbitrarily stale
+on screen. Watching those two channels is what `record` is for.

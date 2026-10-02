@@ -3,7 +3,8 @@
 Everything here was read off this machine, not taken from the USB descriptors or
 from what the hardware ought to do. Where a claim in this file contradicts
 something the tooling or an older version of the docs said, this file is right
-and that thing was wrong.
+and that thing was wrong. The rotation question below was the one place this
+file was the wrong one, and it says so where it happens.
 
 The companion files are `sensors.md` for the IIO motion sensors, `hardware.md`
 for the whole machine, and `calibration.md` for the guided mount-matrix check.
@@ -82,36 +83,109 @@ for ev in ("/dev/input/event5", "/dev/input/event6"):
 PY
 ```
 
-## Why the picture rotates and the input does not
+## The picture rotates, and the input follows — settled
+
+**This was recorded here as an unresolved contradiction between this file and
+`hardware.md`/`sensors.md`. It is resolved, and the evidence was an artefact.**
 
 The plugin rotates the panel and sets a transform on both input nodes. The panel
 rotation works and is verifiable: at transform 3 the framebuffer is genuinely
 768 × 1366, confirmed with `grim`.
 
-The input side is inert, and it is not a plugin bug:
+### The measurement that settled it, and why it was worthless
 
-1. `hyprctl eval 'hl.device({ name = "wacom-pen-and-multitouch-sensor-pen", transform = 3 })'`
-   returns `ok`.
-2. `hyprctl -j devices` then still reports `transform = None` for that node.
-3. That `ok` is not a silent-parse artefact. The same call with `accel` is
-   rejected outright — `hl.device: unknown field 'accel'` — so Hyprland really
-   is parsing `transform` and really is discarding it for these devices.
+This file previously argued, from three observations, that Hyprland accepts the
+transform and drops it. Observations 1 and 3 were sound:
 
-On Wayland the only mechanism that can rotate a pointer is a libinput
-**calibration matrix**, and libinput applies it to device classes that have a
-declared axis range and multi-touch position axes. This digitizer has neither.
-A single-point device reporting `0..0` has no coordinate space for a matrix to
-act within, so the transform is accepted and dropped.
+1. `hyprctl eval 'hl.device({ name = "wacom-pen-and-multitouch-sensor-pen",
+   transform = 3 })'` returns `ok`.
+2. `hyprctl -j devices` then still reports `transform = None`.
+3. The same call with a bogus field is rejected outright —
+   `hl.device: unknown field 'accel'` — so Hyprland *is* parsing `transform`.
 
-Hyprland normalises the digitizer across whichever output it is bound to, so
-the *stretching* to the panel follows the panel automatically. The *rotation* is
-the missing half, and nothing above the evdev layer provides it here.
+**Observation 2 is meaningless.** Hyprland never emits a `transform` key for a
+tablet or a touch device at all. In v0.56.2 the serialiser writes a fixed
+two-key object and nothing else:
 
-**Consequence: with the panel in portrait, both the pen and the finger report
-positions in the panel's native landscape frame, and both are 90° out.** The
-picture is correct; the glass is answering about a different orientation. The
-plugin's `output` binding is what keeps the digitizer on the laptop's own panel
-when a monitor is attached, and that part works.
+```cpp
+// src/debug/HyprCtl.cpp:822-829
+for (auto const& d : g_pInputManager->m_tablets) {
+    result += std::format(
+        R"#(    {{
+    "address": "0x{:x}",
+    "name": "{}"
+}},)#",
+        rc<uintptr_t>(d.get()), escapeJSONStrings(d->m_hlName));
+}
+```
+
+The `touch` branch at `:845-852` is identical. `grep transform` over that file
+finds the word only in `monitorsRequest`. So `transform = None` here was a
+Python `.get()` on a key that does not exist, reported as `None` — the same as a
+genuinely unset field, and carrying no information at all. Confirmed live: with
+a transform set on the pen, `hyprctl -j devices` returns
+`{"address": ..., "name": ...}` and nothing more.
+
+### What actually happens, from the source
+
+The transform does reach libinput, for both nodes:
+
+- `hl.device` stores the field as config keyed by device name —
+  `src/config/lua/bindings/LuaBindingsConfigRules.cpp:1093`
+- which trips `REFRESH_INPUT_DEVICES` —
+  `src/config/supplementary/propRefresher/PropRefresher.cpp:63`
+- which re-runs `setTabletConfigs()` for the pen —
+  `src/managers/input/InputManager.cpp:2027-2030`:
+
+```cpp
+const int ROTATION = std::clamp(Config::mgr()->getDeviceInt(NAME, "transform", "input:tablet:transform"), -1, 7);
+Log::logger->log(Log::DEBUG, "Setting calibration matrix for device {}", NAME);
+if (ROTATION > -1)
+    libinput_device_config_calibration_set_matrix(LIBINPUTDEV, MATRICES[ROTATION]);
+```
+
+and `setTouchDeviceConfigs()` for the finger, `:1979-1984`, with the same call
+behind a `libinput_device_config_calibration_has_matrix()` capability check.
+Both `input:tablet:transform` and `input:touchdevice:transform` exist in
+v0.56.2, `Int`, default `0`, min 0 max 6 (`src/config/values/ConfigValues.cpp:345,362`).
+
+`MATRICES` is an eight-entry rotation table (`src/managers/input/InputManager.hpp:67-81`),
+so the mapping is a genuine quarter-turn matrix, not a no-op.
+
+**The earlier claim that libinput applies calibration only where there are
+multi-touch position axes and a declared range was wrong.** libinput 1.31.3's own
+header lists `libinput_device_config_calibration_set_matrix()` under *both*
+`Touchscreens` and `Tablets`:
+
+```
+- Touchscreens:
+   - libinput_device_config_calibration_set_matrix()
+- Tablets:
+   - libinput_device_config_calibration_set_matrix()
+```
+
+### What is still genuinely unknown
+
+One bit, and it is only about the finger: whether
+`libinput_device_config_calibration_has_matrix()` returns true for *this*
+Wacom touchscreen. The pen's path is unconditional. The compositor exposes no way
+to find out — the field it would report is never emitted, and the DEBUG line
+that would reveal it is not reachable because `debug:disable_logs` is `true`.
+
+So: **the pen transform is applied.** Whether the *finger* rotates is the only
+thing left, and step 2 of [`calibration.md`](calibration.md) — tap each corner,
+turn, tap again — is the procedure that answers it. It is no longer a question
+about the pen.
+
+What is **not** in dispute is the half that Hyprland gives for free: it
+normalises the digitizer across whichever output it is bound to, so the
+*stretching* to the panel follows the panel automatically. It is the *rotation*
+half that step 2 of [`calibration.md`](calibration.md) is for, and after the
+above it is a question about the finger only. That procedure is how it gets
+settled: fold the machine flat, tap each screen corner, turn it and tap again,
+and see whether the input follows. Do the same with the pen to confirm the half
+that is now settled. If you follow it on the old reading in `hardware.md`, it
+will tell you your pen is broken when it is not.
 
 ## The route that would work, and why it is not wired up
 
@@ -132,25 +206,36 @@ than effort:
   re-acquire them.
 
 `hwdb show` and `hwdb apply` in this plugin write a udev entry for the IIO
-*mount matrix*, which is a different property (`INPUT_PROP_ACCELEROMETER` and a
-mount matrix) and has nothing to do with input rotation. It is kept because it
-makes the kernel agree with the matrix this plugin already carries; it does not
-fix this.
+*mount matrix*, which is a different property (`ACCEL_MOUNT_MATRIX` and
+`ACCEL_LOCATION=base`, under a `sensor:modalias:platform:HID-SENSOR-200073` key)
+and has nothing to do with input rotation. It is kept because it makes the kernel
+agree with the matrix this plugin already carries; it does not fix this.
 
 ## Measuring the digitizer properly
 
-`/tmp/opencode/capture.py` records both evdev nodes alongside the IIO motion
-sensors and the current panel transform on one clock, without grabbing the
-devices, so the pen and finger keep working while it runs. It needs root, since
-the nodes are otherwise unreadable.
+[`tools/capture-digitizer.py`](../tools/capture-digitizer.py) records both evdev
+nodes alongside the IIO motion sensors and the current panel transform on one
+clock. It finds the nodes by USB id and by udev property rather than by event
+number, uses nothing outside the standard library, and **does not grab the
+devices** — no `EVIOCGRAB`, no exclusive open — so the pen and the finger keep
+working while it runs, which is the only way to collect this data at all. It
+needs root, because the nodes are `crw------- root root`.
 
 ```sh
-sudo python3 /tmp/opencode/capture.py --seconds 120 --out /tmp/opencode/digitizer.jsonl
+sudo ./tools/capture-digitizer.py --seconds 120 --out /tmp/digitizer.jsonl
 ```
 
 The useful routine is: tap each screen corner in landscape, rotate to portrait,
-tap each corner again, then draw with the pen. Comparing the raw `ABS_X`/`ABS_Y`
-values for the same physical spot before and after the rotation shows directly
-that the digitizer's numbers do not change with the panel — which is the
-diagnosis above, established by measurement rather than by inference — and the
-observed minima and maxima give the native range a calibration matrix would need.
+tap each corner again, then draw with the pen. Each line is one sample carrying
+the two nodes' current `ABS_X`/`ABS_Y`, the accelerometer, the gyroscope, the
+hinge's three channels and the transform the panel is being given, so every tap
+has the posture and the orientation it happened in attached to it.
+
+What it settles is the thing the two readings above disagree about: whether the
+raw numbers for the same physical spot change when the panel turns. Comparing
+the same corner before and after the turn either shows the axes following the
+panel — the `hardware.md` reading — or shows them unchanged and answering about
+the machine's native landscape frame. The observed minima and maxima also give
+the native range that a calibration matrix would need, which is the input
+[`hwdb`'s `LIBINPUT_CALIBRATION` route](#the-route-that-would-work-and-why-it-is-not-wired-up)
+is still missing.

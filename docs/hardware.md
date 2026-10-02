@@ -242,8 +242,12 @@ reason this one is written against one model.
   touchpad-only device key is accepted for it — even though `hyprctl devices`
   lists it under `mice`. So `input.touchpad` settings do apply. There is no
   `touchpads` category in that output, and no need for one.
-- Screen, power button, sleep button and the built-in keyboard are all separate
-  Hyprland Keyboard devices, which is what the tablet-mode lock switches off.
+- The tablet-mode lock switches off exactly **two** devices:
+  `at-translated-set-2-keyboard` and `thinkpad-extra-buttons`. That is the
+  `keyboardNames` list, and it is the whole list — `set_devices` iterates it and
+  nothing else. The separate Hyprland Keyboard devices for the **screen, power
+  button and sleep button** are never touched, folded or not. Whether that is
+  deliberate or an omission is not something the code records.
 - `hl.device` accepts `sensitivity`, `enabled`, `transform` and `output`. It does
   **not** accept `active`; the bar's highlight is presentation, not device state.
 - `hyprctl keyword` is refused by the Lua config (`keyword can't work with
@@ -251,8 +255,15 @@ reason this one is written against one model.
   `hyprctl eval`.
 - Hyprland 0.56.2 does apply `transform` to the **pen**: `setTabletConfigs()`
   calls `libinput_device_config_calibration_set_matrix`, and libinput 1.31 lists
-  calibration under "Tablets". Older reports that stylus transforms are
-  unsupported are out of date.
+  calibration under both "Tablets" **and** "Touchscreens". Older reports that
+  stylus transforms are unsupported are out of date. **This was contradicted by
+  an earlier version of [`digitizer.md`](digitizer.md)**, on the strength of
+  `hyprctl -j devices` reporting `transform = None` for the pen. That field is
+  never emitted for tablets — it is a fixed two-key object at
+  `src/debug/HyprCtl.cpp:822-829` — so the reading was of an absent key and
+  proved nothing. The transform is applied; whether the *finger* rotates depends
+  on a libinput capability the compositor does not report back, and step 2 of
+  [`calibration.md`](calibration.md) is the procedure for that.
 
 ## Environment
 

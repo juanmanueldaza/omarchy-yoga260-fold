@@ -794,13 +794,34 @@ class Hysteresis(unittest.TestCase):
     def test_a_small_margin_keeps_the_incumbent(self):
         # settleSec 0 so the settle window cannot mask which candidate won; that
         # is what `SettleTests` is for.
+        #
+        # The order of these two numbers is the whole test, and it was the wrong
+        # way round. `_pose` sorts ascending, so `candidates[0]` is the smallest
+        # tilt and is the one the code reads as the challenger. Passing
+        # (incumbent 80, challenger 84) put the *incumbent* first, so the
+        # best candidate was already the incumbent, the hysteresis branch was
+        # never entered, and the assertion held for a reason that had nothing to
+        # do with hysteresis -- which is why the line carried
+        # `# pragma: no cover` and nobody noticed.
         daemon = bare_daemon(hystDeg=12.0, settleSec=0.0)
         daemon.state.axis, daemon.state.signed = "right", 1
         daemon.state.transform = 3
         # The challenger is 4 degrees better: inside the 12 degree margin.
-        transform, _ = daemon.desired_transform(self._pose(80.0, 84.0), "book")
+        transform, _ = daemon.desired_transform(self._pose(84.0, 80.0), "book")
         self.assertEqual(transform, 3)
         self.assertEqual((daemon.state.axis, daemon.state.signed), ("right", 1))
+
+    def test_the_incumbent_is_kept_even_with_no_incumbent_transform(self):
+        # The branch keeps the incumbent *candidate*, not the transform that is
+        # currently on the panel, so `mapping` is still applied afterwards. A
+        # non-standard mapping has to survive the hysteresis rather than being
+        # dropped by it.
+        daemon = bare_daemon(hystDeg=12.0, settleSec=0.0, mapping="rotated-180")
+        daemon.state.axis, daemon.state.signed = "right", 1
+        daemon.state.transform = 1
+        transform, _ = daemon.desired_transform(self._pose(84.0, 80.0), "book")
+        self.assertEqual(transform, fold.transform_for("right", "rotated-180"))
+        self.assertNotEqual(transform, fold.transform_for("right", "standard"))
 
     def test_a_large_margin_takes_the_challenger(self):
         daemon = bare_daemon(hystDeg=12.0, settleSec=0.0)
@@ -986,6 +1007,194 @@ class HingeTelemetryCadenceTests(unittest.TestCase):
         hinge.read()
         self.assertIsNotNone(hinge._cached)
         self.assertGreater(hinge._cached_at, 0.0)
+
+    def test_reporting_the_status_does_not_read_the_hinge_again(self):
+        # The other half of the same optimisation, and the half that was
+        # missing. `status` runs on every pass, because `_publish` builds it
+        # whether or not anything changed. If `status` takes its own
+        # three-channel read then `angl1` and `angl2` are read every pass and
+        # everything the tests above prove about `read_fold` is decoration.
+        #
+        # Counted rather than timed. The milliseconds are a property of the
+        # driver and vary by an order of magnitude between reads; the count is a
+        # property of this code and is either right or wrong every time.
+        hinge = self._hinge()
+        hinge.read()  # warm the cache, as a pass would have
+        daemon = self._daemon(hinge)
+        self.reads.clear()
+
+        payload = daemon.status()
+
+        # The figures the pass actually decided on are the ones published.
+        self.assertAlmostEqual(payload["sensor"]["hinge"]["foldDeg"], 102.0, places=1)
+        # No hinge channel. `status` still probes the gyro's declared rate,
+        # which is a static attribute costing ~0.1 ms against ~10 ms for a live
+        # one, and is not what this is about.
+        self.assertEqual([n for n in self.reads if n.endswith("_raw")], [])
+
+    def test_reporting_the_status_on_a_cold_cache_still_produces_figures(self):
+        # `status` and `doctor` are separate processes that have sampled
+        # nothing. There is no cache to report, so one real read is owed --
+        # withholding it would leave the command printing nulls.
+        hinge = self._hinge()
+        daemon = self._daemon(hinge)
+        self.reads.clear()
+
+        payload = daemon.status()
+
+        self.assertAlmostEqual(payload["sensor"]["hinge"]["foldDeg"], 102.0, places=1)
+        self.assertEqual(
+            {name for name in self.reads if name.endswith("_raw")},
+            {"in_angl0_raw", "in_angl1_raw", "in_angl2_raw"},
+        )
+
+    def _daemon(self, hinge):
+        """A daemon carrying a real `Hinge` and mocks for everything else."""
+        real_shell = fold.SHELL_JSON
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        self.addCleanup(lambda: setattr(fold, "SHELL_JSON", real_shell))
+        fold.SHELL_JSON = Path(td.name) / "shell.json"
+        fold.SHELL_JSON.write_text(json.dumps({"bar": {"layout": {"right": []}}}))
+
+        daemon = fold.FoldDaemon.__new__(fold.FoldDaemon)
+        daemon.settings = fold.load_settings()
+        daemon.state = fold.State()
+        daemon.machine = fold.Machine(
+            "LENOVO", "20FE", "ThinkPad Yoga 260", "31", "20FES04T1M", "N1GETA9W"
+        )
+        daemon.hypr = MagicMock()
+        daemon.hypr.available = True
+        daemon.accel = MagicMock()
+        daemon.accel.available = True
+        daemon.accel.matrix = [list(row) for row in fold.DEFAULT_MOUNT_MATRIX]
+        daemon.accel.reader.rejection_rate = 0.0
+        daemon.hinge = hinge
+        daemon.motion = MagicMock()
+        daemon.motion.available = True
+        # A real path, so the rate probe inside `status` misses cleanly instead
+        # of dividing a MagicMock and recording its id as an attribute name.
+        daemon.motion.device = Path("/dev/iio:none")
+        daemon.osk = MagicMock()
+        daemon.keyboards = []
+        daemon.pointers = []
+        daemon.touchpads = []
+        return daemon
+
+
+class ProductionWiringTests(unittest.TestCase):
+    """The sensors the daemon builds for itself, not hand-built stand-ins.
+
+    Every decision test in this file builds a `FoldDaemon` with `__new__` and
+    fills in the fields it cares about. That is the right way to test a
+    decision and the wrong way to test a wiring mistake: a sensor constructed
+    with the wrong argument behaves perfectly in all of them, because the mock
+    already holds the right answer, and wrong in production, where the argument
+    is whatever the constructor was passed.
+
+    `Motion` is the case in point. Built with no matrix it substitutes the
+    identity, so `vertical_rate` dots a vector in the chip's frame against a
+    gravity vector in the base's. The unit tests construct it with the matrix
+    explicitly and so pass either way.
+    """
+
+    def setUp(self):
+        real_shell = fold.SHELL_JSON
+        self._shell_td = tempfile.TemporaryDirectory()
+        self.addCleanup(self._shell_td.cleanup)
+        self.addCleanup(lambda: setattr(fold, "SHELL_JSON", real_shell))
+        fold.SHELL_JSON = Path(self._shell_td.name) / "shell.json"
+        fold.SHELL_JSON.write_text(json.dumps({"bar": {"layout": {"right": []}}}))
+
+        self.gyro = Path(self._shell_td.name) / "gyro"
+        self.gyro.mkdir()
+        (self.gyro / "name").write_text("gyro_3d\n")
+        # One degree per count, so the numbers below are the numbers asserted.
+        (self.gyro / "in_anglvel_scale").write_text(f"{math.pi / 180.0!r}\n")
+        for axis, value in zip("xyz", (0, 900, 0)):
+            (self.gyro / f"in_anglvel_{axis}_raw").write_text(f"{value}\n")
+
+    def _build(self):
+        hypr = MagicMock()
+        # Every category `resolve_devices` indexes into, empty. A bare {} fails
+        # with KeyError before a single sensor is touched.
+        hypr.device_names.return_value = {
+            key: [] for key in ("touch", "pen", "pointer", "keyboard", "touchpad")
+        }
+        with (
+            patch.object(fold, "Machine"),
+            patch.object(fold, "Hyprland", return_value=hypr),
+            patch.object(fold, "OnScreenKeyboard"),
+            patch.object(fold, "open_sensors", return_value=(MagicMock(), MagicMock())),
+            patch.object(fold, "find_iio_device", return_value=self.gyro),
+        ):
+            return fold.FoldDaemon(fold.load_settings())
+
+    def test_the_gyro_is_given_the_mount_matrix_the_accelerometer_is(self):
+        # Both chips are in the base, so both take the base's matrix. The
+        # accelerometer has had it all along; the gyro was left on the identity.
+        daemon = self._build()
+        self.assertEqual(
+            [list(row) for row in daemon.motion.matrix],
+            [list(row) for row in daemon.settings["mountMatrix"]],
+        )
+        self.assertNotEqual(
+            [list(row) for row in daemon.motion.matrix],
+            [list(row) for row in ((1.0, 0, 0), (0, 1.0, 0), (0, 0, 1.0))],
+        )
+
+    def test_a_calibrated_matrix_reaches_the_gyro_too(self):
+        # `calibrate --write` puts the matrix in settings, so the gyro has to
+        # read it from there rather than from the shipped constant. Otherwise a
+        # corrected accelerometer and an uncorrected gyro disagree about which
+        # way is up, which is the exact failure `calibrate` exists to fix.
+        #
+        # A quarter turn about the base's Z: a proper rotation, so it survives
+        # `load_settings`' own determinant check, and nothing like the shipped
+        # matrix, so passing it by accident is not possible.
+        corrected = [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]
+        fold.SHELL_JSON.write_text(
+            json.dumps(
+                {
+                    "bar": {
+                        "layout": {
+                            "right": [{"id": fold.PLUGIN_ID, "mountMatrix": corrected}]
+                        }
+                    }
+                }
+            )
+        )
+        daemon = self._build()
+        self.assertEqual([list(row) for row in daemon.motion.matrix], corrected)
+        self.assertNotEqual(
+            [list(row) for row in daemon.motion.matrix],
+            [list(row) for row in fold.DEFAULT_MOUNT_MATRIX],
+        )
+
+    def test_the_vertical_rate_is_read_in_the_bases_frame(self):
+        # The failure this pins is not subtle once you know to look: with the
+        # identity in place the sensor's +Y is taken as the base's Z, so a turn
+        # one way reads as 0.0 and the yaw integrator is handed nothing at all.
+        # Silent, because a flat machine that is not turning reports zero either.
+        daemon = self._build()
+        # base_Z is the sensor's -Y, so a +Y rate is a turn about -base_Z.
+        self.assertAlmostEqual(
+            daemon.motion.vertical_rate((0.0, 0.0, 1.0)), -900.0, places=6
+        )
+        # The magnitude is a property of the chip and no matrix may touch it.
+        self.assertAlmostEqual(daemon.motion.read()[0], 900.0, places=6)
+
+    def test_the_stillness_gate_is_unaffected_by_the_matrix(self):
+        # The gate takes a magnitude of the raw axes, which no rotation can
+        # change. Asserted so that correcting the frame cannot be mistaken for
+        # moving the 9 deg/s threshold that was calibrated against 283 samples
+        # of this exact sensor at rest.
+        with_matrix = fold.Motion(self.gyro, 9.0, fold.DEFAULT_MOUNT_MATRIX)
+        without = fold.Motion(self.gyro, 9.0)
+        self.assertAlmostEqual(with_matrix.read()[0], without.read()[0], places=9)
+        self.assertEqual(
+            with_matrix.is_still(*with_matrix.read()), without.is_still(*without.read())
+        )
 
 
 class HyprlandTests(unittest.TestCase):
@@ -2540,6 +2749,29 @@ class AttitudeTests(unittest.TestCase):
 
 
 class CoherentTests(unittest.TestCase):
+    def test_it_tries_three_times_before_giving_up(self):
+        # Three *attempts*, which is a first read and two retries. The docs used
+        # to say "three retries", which reads as four, and nothing pinned the
+        # count -- a change from 3 to 1 would have looked identical in the API
+        # and gone unnoticed, at the cost of a third of the tolerance against
+        # torn reads.
+        with tempfile.TemporaryDirectory() as td:
+            dev = FakeAccelDevice(td, (0, 0, 0), 9.806e-06)  # never coherent
+            reader = fold.Coherent(dev.device, 9.806e-06, 0.75, 1.30)
+            self.assertIsNone(reader.read())
+            self.assertEqual(reader.tries, 3)
+            self.assertEqual(reader.rejected, 3)
+            self.assertAlmostEqual(reader.rejection_rate, 1.0)
+
+    def test_a_coherent_sample_stops_after_the_first_attempt(self):
+        with tempfile.TemporaryDirectory() as td:
+            raw, _ = raw_for_base_up((0.0, 0.0, 1.0), 9.806e-06)
+            dev = FakeAccelDevice(td, raw, 9.806e-06)
+            reader = fold.Coherent(dev.device, 9.806e-06, 0.75, 1.30)
+            self.assertIsNotNone(reader.read())
+            self.assertEqual(reader.tries, 1)
+            self.assertEqual(reader.rejected, 0)
+
     def test_coherent_no_device(self):
         c = fold.Coherent(None, None, 0.75, 1.30)
         self.assertIsNone(c.read())
