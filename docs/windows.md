@@ -156,8 +156,14 @@ threshold below the exit (`bookReleaseDeg`, default 170): past 190 it is a
 tablet, back below 170 it is a book, and in between it keeps whatever it was.
 A lid parked at 189/191 no longer takes the keyboard on and off.
 
-Only that crossing gets the band. The 270 and 340 boundaries change a label and
-gate no input, so they stay exact and keep meaning what the user guide says.
+That crossing got the first band. The 270 and 340 boundaries have one now too
+(`modeHystDeg`, default 10°): entry stays exactly on the guide's angles, and
+an engaged mode rides the band past them. The earlier claim here -- that those
+edges "change a label and gate no input" -- was wrong about 340, which decides
+tablet, and tablet decides the keyboard. A tent propped near 340 flexes ±6°
+under hand load with the machine held still, and bare comparisons fluttered
+tablet/tent/book, taking the keyboard off and on with it. Found live, fixed,
+pinned by round-trip tests on both edges.
 
 ## Taken: read only the channel a decision is made from
 

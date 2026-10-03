@@ -147,7 +147,10 @@ Remove the whole thing with `omarchy plugin remove estrocondoso.yoga260-fold` an
   switch at 190 and release at 190 either — it engages partway through with
   hysteresis of its own, which is why convertible documentation puts the cut-out
   near 225 — so a bare comparison on one number chatters on a lid left near the
-  edge. The 270 and 340 boundaries change only the label, so they stay exact.
+   edge. The 270 and 340 boundaries keep the guide's exact angles for entry,
+   and an engaged mode rides `modeHystDeg` (10°) past them before it lets go:
+   a tent propped near 340 flexes under hand load and bare comparisons
+   fluttered tablet/tent, taking the keyboard with it.
 
   On top of that, the mode is only recomputed while the machine is still: one
   being carried keeps the mode it last settled in, and a keyboard that switches

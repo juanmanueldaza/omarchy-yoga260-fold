@@ -60,6 +60,7 @@ HWDB_LOCAL = Path("/etc/udev/hwdb.d/61-sensor-local.hwdb")
 # the keybindings and this daemon all read and write one place.
 SETTING_KEYS = (
     "mapping", "locked", "lockKeyboard", "lockPointers", "oskAuto", "oskPlugin",
+    "modeHystDeg",
     # The flat-case turn settings, so the one value that has to be confirmed by
     # hand on the machine -- which way a turn reads -- can be set from the command
     # line or the panel without editing this file.
@@ -115,6 +116,12 @@ DEFAULTS = {
     "bookReleaseDeg": 170.0,
     "tentEnterDeg": 270.0,
     "tentExitDeg": 340.0,
+    # Hysteresis band for the tent edges. Entry thresholds stay exactly on the
+    # Lenovo ranges; an engaged mode rides out hinge flex this wide before it
+    # lets go. A tent propped near 340 flexes ±6° under hand load with the
+    # machine held still, and bare comparisons fluttered tablet/tent/book --
+    # taking the keyboard off and on with it.
+    "modeHystDeg": 10.0,
     # How long a pose has to hold before the screen is turned. The gyroscope
     # already refuses to act while the machine is being turned, so this is only
     # there to catch a transient -- and it was 1.2 s, which on top of the
@@ -207,7 +214,8 @@ DEFAULTS = {
     # they are offered. Each maps to the command that shows or hides it; a
     # plugin not listed here can still be pointed at with `oskCommand`.
     "oskPlugins": {
-        "io.github.abdxdev.onscreen-keyboard": "",
+        "io.github.abdxdev.onscreen-keyboard": "omarchy-shell shell toggle io.github.abdxdev.onscreen-keyboard",
+        "piccolo.osk": "omarchy-shell osk toggle",
         "io.github.frostmute.tablet-keyboard": "",
         "m44f4.omatouch": "",
         "io.github.mtolhuys.onscreen-keyboard": "omarchy-shell shell summon io.github.mtolhuys.onscreen-keyboard",
@@ -1624,6 +1632,34 @@ class OnScreenKeyboard:
             "output": (run.stdout + run.stderr).strip()[:400],
         }
 
+    def is_shown(self) -> bool | None:
+        """Whether the preferred keyboard is currently visible.
+
+        Only Piccolo answers: `omarchy-shell osk state` carries `shown`.
+        Anything else returns None (unknown), and the unfold path then hides
+        blind -- correct for the common flow, wrong if the board was already
+        dismissed by hand. See `step`.
+        """
+        entry = self.target()
+        if entry is None or entry["id"] != "piccolo.osk":
+            return None
+        try:
+            run = subprocess.run(
+                ["omarchy-shell", "osk", "state"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, ValueError):
+            return None
+        if run.returncode != 0:
+            return None
+        try:
+            return bool(json.loads(run.stdout).get("shown"))
+        except (ValueError, AttributeError):
+            return None
+
     def as_dict(self) -> dict[str, Any]:
         installed = self.installed()
         entry = self.target()
@@ -1762,6 +1798,10 @@ class FoldDaemon:
         self.yaw_turning = False
         self._last_yaw_at: float | None = None
         self._was_still = True
+        # When stillness was last lost. The settle window restarts on a
+        # landing, but a 1-2 pass tremor dropout is not a landing -- see
+        # `step`. 0.0 so the first edge always counts as one.
+        self._false_since = 0.0
         self.last_applied = 0.0
         self.last_status = ""
         self.last_signature: tuple | None = None
@@ -1929,18 +1969,30 @@ class FoldDaemon:
         Without this, a lid parked at 189/191 would take the keyboard on and off
         indefinitely.
 
-        Only the book/tablet crossing gets the band. The 270 and 340 boundaries
-        change the label and nothing else -- no input is gated on them -- so they
-        stay exact, which is also what keeps the published ranges meaning what
-        the user guide says they mean.
+        Only the book/tablet crossing got a band at first. The 270 and 340
+        boundaries were left exact on the reasoning that they "change the
+        label and nothing else" -- which was wrong: 340 decides tablet, and
+        tablet decides the keyboard. A tent propped near 340 flexes ±6° under
+        hand load with the machine held still, and bare comparisons fluttered
+        tablet/tent/book, taking the keyboard off and on with it. So every
+        edge that gates input gets a band: entry thresholds stay exactly on
+        the Lenovo ranges, and an engaged mode rides out flex `modeHystDeg`
+        wide before it lets go.
         """
         book_exit = float(self.settings["bookExitDeg"])
         tent_enter = float(self.settings["tentEnterDeg"])
         tent_exit = float(self.settings["tentExitDeg"])
         book_release = float(self.settings.get("bookReleaseDeg", book_exit - 20.0))
+        band = float(self.settings.get("modeHystDeg", 10.0))
 
-        if fold >= tent_exit:
+        if current == "tablet" and fold >= tent_exit - band:
+            # Already past a keyboard-gating edge: ride out hinge flex on the
+            # way back down instead of fluttering the keyboard.
             return "tablet", True
+        if fold >= tent_exit + (band if current == "tent" else 0.0):
+            return "tablet", True
+        if current == "tent" and fold >= tent_enter - band:
+            return "tent", False
         if fold >= tent_enter:
             return "tent", False
         if fold >= book_exit:
@@ -2014,11 +2066,17 @@ class FoldDaemon:
             self.yaw_turning = False
             return
         if not self.yaw_turning:
-            # Start of a turn. The angle already banked on the previous one is
-            # committed to the anchor first, so consecutive quarter turns in one
-            # movement accumulate instead of each replacing the last.
-            self.yaw_anchor = self._anchor_after(self.yaw_anchor, self.yaw_deg)
-            self.yaw_deg = 0.0
+            # Start of a turn. Whole quarters already banked are committed to
+            # the anchor first, so consecutive quarter turns accumulate instead
+            # of each replacing the last -- but the remainder is carried, not
+            # zeroed. Committing the raw total with round() booked a 71-degree
+            # partial turn as three full quarters and corrupted the anchor on
+            # every set-down bump; truncation banks only complete 90s and lets
+            # a hesitant multi-stage turn finish where it left off.
+            whole = math.trunc(self.yaw_deg / 90.0)
+            if whole:
+                self.yaw_anchor = self._anchor_after(self.yaw_anchor, whole * 90.0)
+                self.yaw_deg -= whole * 90.0
             self.yaw_turning = True
         # Signed by `yawSign`, which is the one thing here that cannot be settled
         # by reading a sensor: this machine's gyroscope sits at ~0.2 deg/s, so no
@@ -2196,10 +2254,24 @@ class FoldDaemon:
                     self.state.lock_safe = "kept on: the session is locked"
         if keyboard == self.state.keyboard_disabled and pointers == self.state.pointers_disabled:
             return
+        failed: list[str] = []
         for name in self.keyboards:
-            self.hypr.set_device_enabled(name, not keyboard)
+            ok, message = self.hypr.set_device_enabled(name, not keyboard)
+            if not ok:
+                failed.append(f"keyboard {name}: {message}")
         for name in self.pointers + self.touchpads:
-            self.hypr.set_device_enabled(name, not pointers)
+            ok, message = self.hypr.set_device_enabled(name, not pointers)
+            if not ok:
+                failed.append(f"pointer {name}: {message}")
+        if failed:
+            # Leave the flags alone so the next pass retries instead of
+            # recording a state the hardware never reached. A recorded
+            # "enabled" over a disabled keyboard is a machine that never
+            # recovers without a hand on hyprctl -- which is how a laptop
+            # mode ended up with a dead keyboard and a clean status.
+            self.state.last_error = "; ".join(failed)
+            return
+        self.state.last_error = ""
         self.state.keyboard_disabled = keyboard
         self.state.pointers_disabled = pointers
 
@@ -2340,17 +2412,30 @@ class FoldDaemon:
         self.state.mode = mode
         self.still = bool(pose["still"])
         self.state.still = self.still
-        if self.decision is not None and self.still and not self._was_still:
-            # The machine has just come to rest in a new pose. The settle window
-            # starts *here*, at the landing, and not at the moment the candidate
-            # first appeared -- which is the instant the turn begins, far longer
-            # than the window ago, so the decision was already expired and
-            # `settling()` false by the time anything was still running to apply
-            # it. Resetting only while moving does not help either: by then the
-            # clock has already run down and the loop stops calling `step()` at
-            # all, which is how the daemon came to decide correctly and turn the
-            # screen exactly never.
-            self.decision_since = time.monotonic()
+        now = time.monotonic()
+        if self.still:
+            if (
+                self.decision is not None
+                and not self._was_still
+                and now - self._false_since >= float(self.settings["settleSec"])
+            ):
+                # The machine has come to rest after real motion, in a new
+                # pose. The settle window starts *here*, at the landing, and
+                # not at the moment the candidate first appeared -- which is
+                # the instant the turn begins, far longer than the window ago,
+                # so the decision was already expired and `settling()` false
+                # by the time anything was still running to apply it.
+                #
+                # The `settleSec` guard on the outage is the other half: a
+                # stillness dropout shorter than the window is tremor, not a
+                # landing, and must not restart the clock. Without it every
+                # rising edge re-arms the window, so hands on the machine
+                # hold the screen forever -- the mode (which has no settle
+                # timer) flips while the rotation starves, and repeated folds
+                # act differently from the first clean one.
+                self.decision_since = now
+        else:
+            self._false_since = now
         self._was_still = self.still
         # Published so the status line cannot disagree with the settings. It was
         # never assigned, so `status` reported the lock as off no matter what
@@ -2403,8 +2488,8 @@ class FoldDaemon:
             # does there. It used to be added straight to the transform, which
             # meant the mapping was bypassed and the two paths could disagree
             # about which way was portrait.
-            transform = transform_for(yaw_orientation, self.settings["mapping"])  # pragma: no cover
-            why = f"turned flat \u00b7 {yaw_orientation}"  # pragma: no cover
+            transform = transform_for(yaw_orientation, self.settings["mapping"])
+            why = f"turned flat \u00b7 {yaw_orientation}"
         if not messages:
             # Track the real attitude even while locked or undecided, so the
             # panel can say which way the machine is actually being held.
@@ -2428,6 +2513,16 @@ class FoldDaemon:
             self.state.osk_asked = True
             self.osk.toggle()
         elif mode != "tablet":
+            shown = self.osk.is_shown()
+            if self.state.osk_asked and shown is not False:
+                # Unfolding hides what auto-show summoned. When visibility is
+                # known hidden the toggle is skipped; when it is unknown (a
+                # board with no state query) the toggle fires blind -- correct
+                # for the common flow (unfold with the board still up), wrong
+                # in the rare one (dismissed by hand, then unfolded, so it
+                # comes back). There is no signal to tell them apart; the
+                # common flow wins, and the bar icon dismisses the mistake.
+                self.osk.toggle()
             self.state.osk_asked = False
 
         self.verify()

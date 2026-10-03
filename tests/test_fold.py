@@ -528,6 +528,31 @@ class FlatTurnTracking(unittest.TestCase):
         # first.
         self.assertEqual(d.yaw_orientation(), "inverted")
 
+    def test_a_partial_turn_survives_a_pause_and_finishes(self):
+        # 36 banked, a pause, then 36 more: the continuation starts from 36,
+        # not from zero, and the anchor never moves for a sub-quarter total.
+        d = self._daemon("normal")
+        t = self._run(d, 40.0, 1.0)
+        self.assertIsNone(d.yaw_orientation())
+        t = self._run(d, 0.0, 0.5, t0=t)
+        self._run(d, 40.0, 1.0, t0=t)
+        self.assertAlmostEqual(d.yaw_deg, 72.0, delta=8.0)
+        self.assertEqual(d.yaw_anchor, "normal")
+        self.assertEqual(d.yaw_orientation(), "left")
+
+    def test_a_setdown_bump_after_a_partial_turn_keeps_the_anchor(self):
+        # The live failure: 72 banked, a pause, then a small bump. The old
+        # code committed round(72 / 90) = a full quarter on turn start,
+        # booking a partial turn as 90 degrees and zeroing the rest; the
+        # anchor moved and the banked turn vanished into it.
+        d = self._daemon("normal")
+        t = self._run(d, 40.0, 1.9)
+        t = self._run(d, 0.0, 0.5, t0=t)
+        self._run(d, 40.0, 0.2, t0=t)
+        self.assertEqual(d.yaw_anchor, "normal")
+        self.assertAlmostEqual(d.yaw_deg, 80.0, delta=8.0)
+        self.assertEqual(d.yaw_orientation(), "left")
+
     def test_tilting_the_machine_hands_authority_back_to_the_accelerometer(self):
         d = self._daemon()
         t = self._run(d, 40.0, 2.25)
@@ -1481,15 +1506,40 @@ class ModeBandTests(unittest.TestCase):
         self.assertEqual(daemon.mode_for(190.0, "book"), ("tablet", True))
         self.assertEqual(daemon.mode_for(189.0, "book"), ("book", False))
 
-    def test_the_tent_boundaries_stay_exact(self):
-        # The band is only for the crossing that gates input. The other two
-        # change a label and nothing else, so they must keep meaning what the
-        # user guide says: tablet to 269, tent from 270 to 339, stand from 340.
+    def test_the_tent_boundaries_hold_engaged_modes_through_flex(self):
+        # Entry thresholds stay exactly on the user guide; an engaged mode
+        # rides `modeHystDeg` past them. A tent propped near 340 flexes ±6°
+        # under hand load with the machine held still, and bare comparisons
+        # fluttered tablet/tent -- taking the keyboard with it, since 340
+        # decides tablet and tablet decides the keyboard.
         daemon = self._daemon()
         self.assertEqual(daemon.mode_for(269.0, "tablet"), ("tablet", True))
         self.assertEqual(daemon.mode_for(270.0, "tablet"), ("tent", False))
         self.assertEqual(daemon.mode_for(339.0, "tent"), ("tent", False))
-        self.assertEqual(daemon.mode_for(340.0, "tent"), ("tablet", True))
+        # Engaged tent rides upward flex: 340 no longer flips it by itself.
+        self.assertEqual(daemon.mode_for(340.0, "tent"), ("tent", False))
+        self.assertEqual(daemon.mode_for(345.0, "tent"), ("tent", False))
+        self.assertEqual(daemon.mode_for(355.0, "tent"), ("tablet", True))
+        # Engaged tablet rides downward flex the same way.
+        self.assertEqual(daemon.mode_for(335.0, "tablet"), ("tablet", True))
+        self.assertEqual(daemon.mode_for(345.0, "tablet"), ("tablet", True))
+        self.assertEqual(daemon.mode_for(325.0, "tablet"), ("tent", False))
+        # And the lower edge: engaged tent rides down to 260, not 270.
+        self.assertEqual(daemon.mode_for(265.0, "tent"), ("tent", False))
+        self.assertEqual(daemon.mode_for(275.0, "tent"), ("tent", False))
+        self.assertEqual(daemon.mode_for(255.0, "tent"), ("tablet", True))
+
+    def test_a_round_trip_across_the_stand_edge_never_toggles(self):
+        # The tent version of the 190 round trip: fold parked on the edge,
+        # jittering either side, must not take the keyboard on and off.
+        daemon = self._daemon()
+        mode = "tent"
+        readings = [339, 340, 339, 341, 340, 339, 340, 339]
+        seen = []
+        for fold_deg in readings:
+            mode, _folded = daemon.mode_for(float(fold_deg), mode)
+            seen.append(mode)
+        self.assertEqual(set(seen), {"tent"})
 
     def test_the_band_is_configurable(self):
         narrow = self._daemon(release=188.0)
@@ -1573,6 +1623,7 @@ class SessionLockTests(unittest.TestCase):
         daemon.state.pointers_disabled = False
         daemon.hypr = MagicMock()
         daemon.hypr.session_locked.return_value = True
+        daemon.hypr.set_device_enabled.return_value = (True, "")
         daemon.keyboards, daemon.pointers, daemon.touchpads = ["kb"], ["ptr"], ["pad"]
         daemon.set_devices(True, True)
         self.assertFalse(daemon.state.keyboard_disabled)
@@ -1586,6 +1637,7 @@ class SessionLockTests(unittest.TestCase):
         daemon.state.pointers_disabled = False
         daemon.hypr = MagicMock()
         daemon.hypr.session_locked.return_value = None
+        daemon.hypr.set_device_enabled.return_value = (True, "")
         daemon.keyboards, daemon.pointers, daemon.touchpads = ["kb"], ["ptr"], ["pad"]
         daemon.set_devices(True, True)
         self.assertFalse(daemon.state.keyboard_disabled)
@@ -1599,6 +1651,7 @@ class SessionLockTests(unittest.TestCase):
         daemon.state.keyboard_disabled = False
         daemon.state.pointers_disabled = False
         daemon.hypr = MagicMock()
+        daemon.hypr.set_device_enabled.return_value = (True, "")
         daemon.keyboards, daemon.pointers, daemon.touchpads = ["kb"], ["ptr"], ["pad"]
 
         daemon.hypr.session_locked.return_value = True
@@ -1613,34 +1666,110 @@ class SessionLockTests(unittest.TestCase):
         self.assertEqual(daemon.state.lock_safe, "")
         self.assertTrue(daemon.state.keyboard_disabled)
 
+    def test_a_failed_enable_leaves_the_flags_for_retry(self):
+        # The live failure: one failed hyprctl recorded "enabled" over a
+        # disabled keyboard, and the early-return never retried -- book mode
+        # with a dead keyboard and a clean status.
+        daemon = bare_daemon(lockKeyboard=True, lockPointers=True)
+        daemon.state.keyboard_disabled = True
+        daemon.state.pointers_disabled = True
+        daemon.hypr = MagicMock()
+        daemon.hypr.session_locked.return_value = False
+        daemon.hypr.set_device_enabled.return_value = (False, "hyprctl hiccup")
+        daemon.keyboards, daemon.pointers, daemon.touchpads = ["kb"], ["ptr"], ["pad"]
+        daemon.set_devices(False, False)
+        self.assertTrue(daemon.state.keyboard_disabled)
+        self.assertTrue(daemon.state.pointers_disabled)
+        self.assertIn("hyprctl hiccup", daemon.state.last_error)
+
+    def test_retry_after_failure_recovers_and_clears_the_error(self):
+        daemon = bare_daemon(lockKeyboard=True, lockPointers=True)
+        daemon.state.keyboard_disabled = True
+        daemon.state.pointers_disabled = True
+        daemon.hypr = MagicMock()
+        daemon.hypr.session_locked.return_value = False
+        daemon.hypr.set_device_enabled.return_value = (False, "hyprctl hiccup")
+        daemon.keyboards, daemon.pointers, daemon.touchpads = ["kb"], ["ptr"], ["pad"]
+        daemon.set_devices(False, False)
+        self.assertTrue(daemon.state.keyboard_disabled)
+        daemon.hypr.set_device_enabled.return_value = (True, "")
+        daemon.set_devices(False, False)
+        self.assertFalse(daemon.state.keyboard_disabled)
+        self.assertFalse(daemon.state.pointers_disabled)
+        self.assertEqual(daemon.state.last_error, "")
+
 
 class OnScreenKeyboardTests(unittest.TestCase):
     def setUp(self):
-        self._real_path = fold.Path
         self.settings = {
             "oskPlugins": {"test-plugin": ""},
             "oskCommand": "",
             "oskPlugin": "",
         }
+        # `installed()` globs the real plugin directory. Without this, these
+        # tests pass only on machines with no keyboard plugin installed --
+        # installing one (as the live verification did) flips all four.
+        self._plug_td = tempfile.TemporaryDirectory()
+        self.addCleanup(self._plug_td.cleanup)
+
+    def _osk(self):
+        osk = fold.OnScreenKeyboard(self.settings)
+        osk.plugin_root = Path(self._plug_td.name)
+        return osk
 
     def test_installed_empty(self):
-        osk = fold.OnScreenKeyboard(self.settings)
-        self.assertEqual(osk.installed(), [])
+        self.assertEqual(self._osk().installed(), [])
 
     def test_target_none(self):
-        osk = fold.OnScreenKeyboard(self.settings)
-        self.assertIsNone(osk.target())
+        self.assertIsNone(self._osk().target())
 
     def test_toggle_no_plugin(self):
-        osk = fold.OnScreenKeyboard(self.settings)
-        result = osk.toggle()
+        result = self._osk().toggle()
         self.assertFalse(result["ok"])
 
     def test_as_dict(self):
-        osk = fold.OnScreenKeyboard(self.settings)
-        d = osk.as_dict()
+        d = self._osk().as_dict()
         self.assertIn("installed", d)
         self.assertFalse(d["drivable"])
+
+    def _osk_with_piccolo(self):
+        plugdir = Path(self._plug_td.name) / "piccolo.osk"
+        plugdir.mkdir(exist_ok=True)
+        (plugdir / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "id": "piccolo.osk",
+                    "name": "Piccolo",
+                    "description": "on-screen keyboard",
+                    "kinds": ["panel"],
+                }
+            )
+        )
+        settings = dict(self.settings)
+        settings["oskPlugins"] = {"piccolo.osk": "omarchy-shell osk toggle"}
+        osk = fold.OnScreenKeyboard(settings)
+        osk.plugin_root = Path(self._plug_td.name)
+        return osk
+
+    def test_is_shown_unknown_plugin(self):
+        self.assertIsNone(self._osk().is_shown())
+
+    def test_is_shown_true(self):
+        with patch.object(fold.subprocess, "run") as run:
+            run.return_value = MagicMock(returncode=0, stdout='{"shown": true}')
+            self.assertTrue(self._osk_with_piccolo().is_shown())
+
+    def test_is_shown_false(self):
+        with patch.object(fold.subprocess, "run") as run:
+            run.return_value = MagicMock(returncode=0, stdout='{"shown": false}')
+            self.assertFalse(self._osk_with_piccolo().is_shown())
+
+    def test_is_shown_unparsable_state(self):
+        with patch.object(fold.subprocess, "run") as run:
+            run.return_value = MagicMock(returncode=1, stdout="")
+            self.assertIsNone(self._osk_with_piccolo().is_shown())
+            run.return_value = MagicMock(returncode=0, stdout="not json")
+            self.assertIsNone(self._osk_with_piccolo().is_shown())
 
 
 class FoldDaemonStepTests(unittest.TestCase):
@@ -1736,6 +1865,7 @@ class FoldDaemonStepTests(unittest.TestCase):
         self.daemon.decision_since = 0
         self.daemon.still = True
         self.daemon._was_still = True
+        self.daemon._false_since = 0.0
         self.daemon.last_applied = 0
         self.daemon.last_status = ""
         self.daemon.last_signature = None
@@ -1887,6 +2017,92 @@ class FoldDaemonStepTests(unittest.TestCase):
         result = self.daemon.step()
         self.assertIsInstance(result, bool)
         self.daemon.hypr.rotate_transaction.assert_called()
+
+    def test_step_flat_banked_yaw_turns_the_screen(self):
+        # End to end for the path the suite never covered: flat, still, hinge
+        # consistent, and -64.7 banked from a level turn. The gyroscope
+        # decides, through the same mapping as the accelerometer path.
+        self.daemon.settings["yawSign"] = 1
+        self.daemon.settings["yawDeadbandDeg"] = 15.0
+        self.daemon.settings["yawQuarterDeg"] = 45.0
+        self.daemon.yaw_deg = -64.7
+        self.daemon.yaw_anchor = "normal"
+        self.daemon.yaw_turning = False
+        self.daemon._last_yaw_at = None
+        pose = self.daemon.read_pose()
+        pose["flat"] = True
+        pose["still"] = True
+        pose["verticalRate"] = 0.2
+        result = self.daemon.step(pose)
+        self.assertIsInstance(result, bool)
+        self.daemon.hypr.rotate_transaction.assert_called_with(
+            "eDP-1",
+            3,
+            [
+                "wacom-pen-and-multitouch-sensor-finger",
+                "wacom-pen-and-multitouch-sensor-pen",
+            ],
+        )
+        self.assertEqual(self.daemon.state.transform, 3)
+        self.assertIn("turned flat", self.daemon.state.reason)
+
+    def test_step_unfold_hides_auto_shown_keyboard(self):
+        self.daemon.settings["oskAuto"] = True
+        self.daemon.osk = MagicMock()
+        self.daemon.osk.is_shown.return_value = True
+        self.daemon.osk.as_dict.return_value = {
+            "installed": [],
+            "pluginId": None,
+            "command": None,
+            "drivable": False,
+            "auto": True,
+        }
+        self.daemon.state.osk_asked = True
+        self.daemon.reload_settings = MagicMock()
+        result = self.daemon.step()
+        self.assertIsInstance(result, bool)
+        self.daemon.osk.toggle.assert_called_once_with()
+        self.assertFalse(self.daemon.state.osk_asked)
+
+    def test_step_unfold_skips_hide_when_keyboard_hidden(self):
+        # The board was dismissed by hand in tablet mode: a blind toggle on
+        # the way out would show it again instead of hiding it.
+        self.daemon.settings["oskAuto"] = True
+        self.daemon.osk = MagicMock()
+        self.daemon.osk.is_shown.return_value = False
+        self.daemon.osk.as_dict.return_value = {
+            "installed": [],
+            "pluginId": None,
+            "command": None,
+            "drivable": False,
+            "auto": True,
+        }
+        self.daemon.state.osk_asked = True
+        self.daemon.reload_settings = MagicMock()
+        result = self.daemon.step()
+        self.assertIsInstance(result, bool)
+        self.daemon.osk.toggle.assert_not_called()
+        self.assertFalse(self.daemon.state.osk_asked)
+
+    def test_step_unfold_hides_when_visibility_unknown(self):
+        # Boards with no state query (abdxdev): the common flow is unfolding
+        # with the auto-summoned board still up, so the toggle fires blind.
+        self.daemon.settings["oskAuto"] = True
+        self.daemon.osk = MagicMock()
+        self.daemon.osk.is_shown.return_value = None
+        self.daemon.osk.as_dict.return_value = {
+            "installed": [],
+            "pluginId": None,
+            "command": None,
+            "drivable": False,
+            "auto": True,
+        }
+        self.daemon.state.osk_asked = True
+        self.daemon.reload_settings = MagicMock()
+        result = self.daemon.step()
+        self.assertIsInstance(result, bool)
+        self.daemon.osk.toggle.assert_called_once_with()
+        self.assertFalse(self.daemon.state.osk_asked)
 
     def test_step_tablet_mode_disables_keyboard(self):
         self.daemon.hinge.read_fold.return_value = fold.HingeSample(
@@ -2084,6 +2300,33 @@ class FoldDaemonStepTests(unittest.TestCase):
         self.daemon.still = True
         self.daemon.state.transform = 0
         self.assertTrue(self.daemon.settling())
+
+    def _step_at(self, still, at):
+        pose = self.daemon.read_pose()
+        pose["still"] = still
+        with patch.object(fold.time, "monotonic", return_value=at):
+            self.daemon.step(pose)
+
+    def test_step_tremor_blip_does_not_restart_settle(self):
+        # A stillness dropout shorter than the settle window is tremor, not
+        # a landing: the clock keeps counting instead of re-arming, or hands
+        # on the machine hold the screen forever while the modeless mode
+        # flips underneath it.
+        self.daemon.decision_since = 1000.0
+        self._step_at(True, 1000.0)
+        settled = self.daemon.decision_since
+        self._step_at(False, 1000.1)
+        self._step_at(True, 1000.2)
+        self.assertEqual(self.daemon.decision_since, settled)
+
+    def test_step_landing_after_real_motion_restarts_settle(self):
+        # The other half: after genuinely moving, the window starts at the
+        # landing, not at the moment the candidate first appeared.
+        self.daemon.decision_since = 1000.0
+        self._step_at(True, 1000.0)
+        self._step_at(False, 2000.0)
+        self._step_at(True, 2001.0)
+        self.assertEqual(self.daemon.decision_since, 2001.0)
 
     def test_check_resume_no_previous(self):
         self.daemon._last_wall = None
@@ -2304,7 +2547,19 @@ class CLITests(unittest.TestCase):
         self.assertEqual(rc, 1)
 
     def test_cmd_keyboard(self):
-        rc = fold.cmd_keyboard({}, "toggle")
+        # Same isolation as OnScreenKeyboardTests: `cmd_keyboard` builds its
+        # own OnScreenKeyboard against the real plugin directory, so a
+        # machine with a keyboard plugin installed would summon it here.
+        real = fold.OnScreenKeyboard
+        with tempfile.TemporaryDirectory() as td:
+
+            def isolated(settings):
+                osk = real(settings)
+                osk.plugin_root = Path(td)
+                return osk
+
+            with patch.object(fold, "OnScreenKeyboard", side_effect=isolated):
+                rc = fold.cmd_keyboard({}, "toggle")
         self.assertEqual(rc, 1)
 
     def test_cmd_setting(self):
