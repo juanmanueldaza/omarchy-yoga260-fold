@@ -1820,7 +1820,7 @@ class FoldDaemonStepTests(unittest.TestCase):
         fold.SHELL_JSON = Path(self._shell_td.name) / "shell.json"
         fold.SHELL_JSON.write_text(
             json.dumps(
-                {"bar": {"layout": {"right": [{"id": "estrocondoso.yoga260-fold"}]}}}
+                {"bar": {"layout": {"right": [{"id": "juanmanueldaza.yoga260-fold"}]}}}
             )
         )
         self.addCleanup(self._restore_shell)
@@ -2699,7 +2699,7 @@ class WriteShellEntryTests(unittest.TestCase):
                     "bar": {
                         "layout": {
                             "right": [
-                                {"id": "estrocondoso.yoga260-fold", "locked": False}
+                                {"id": "juanmanueldaza.yoga260-fold", "locked": False}
                             ]
                         }
                     }
@@ -3504,7 +3504,7 @@ class CmdRotateTests(unittest.TestCase):
         shell = Path(self.td.name) / "shell.json"
         shell.write_text(
             json.dumps(
-                {"bar": {"layout": {"right": [{"id": "estrocondoso.yoga260-fold"}]}}}
+                {"bar": {"layout": {"right": [{"id": "juanmanueldaza.yoga260-fold"}]}}}
             )
         )
         fold.SHELL_JSON = shell
@@ -3567,7 +3567,7 @@ class CmdRotateTests(unittest.TestCase):
                 json.dumps(
                     {
                         "bar": {
-                            "layout": {"right": [{"id": "estrocondoso.yoga260-fold"}]}
+                            "layout": {"right": [{"id": "juanmanueldaza.yoga260-fold"}]}
                         }
                     }
                 )
@@ -3593,7 +3593,7 @@ class CmdRotateTests(unittest.TestCase):
                 json.dumps(
                     {
                         "bar": {
-                            "layout": {"right": [{"id": "estrocondoso.yoga260-fold"}]}
+                            "layout": {"right": [{"id": "juanmanueldaza.yoga260-fold"}]}
                         }
                     }
                 )

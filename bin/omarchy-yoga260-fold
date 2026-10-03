@@ -46,7 +46,7 @@ from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
-PLUGIN_ID = "estrocondoso.yoga260-fold"
+PLUGIN_ID = "juanmanueldaza.yoga260-fold"
 PLUGIN_DIR = Path(__file__).resolve().parent.parent
 
 STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local/state"))

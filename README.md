@@ -104,18 +104,18 @@ omarchy plugin add https://github.com/juanmanueldaza/omarchy-yoga260-fold --enab
 Or, from a checkout, copy it into place and enable it:
 
 ```bash
-cp -r . ~/.config/omarchy/plugins/estrocondoso.yoga260-fold
+cp -r . ~/.config/omarchy/plugins/juanmanueldaza.yoga260-fold
 omarchy shell shell rescanPlugins   # if it is already running
-omarchy bar move estrocondoso.yoga260-fold --section right
+omarchy bar move juanmanueldaza.yoga260-fold --section right
 ```
 
 Then give the pen its proper libwacom entry, which this machine is missing:
 
 ```bash
-~/.config/omarchy/plugins/estrocondoso.yoga260-fold/bin/omarchy-yoga260-fold libwacom install
+~/.config/omarchy/plugins/juanmanueldaza.yoga260-fold/bin/omarchy-yoga260-fold libwacom install
 ```
 
-Remove the whole thing with `omarchy plugin remove estrocondoso.yoga260-fold` and
+Remove the whole thing with `omarchy plugin remove juanmanueldaza.yoga260-fold` and
 `omarchy-yoga260-fold libwacom remove`.
 
 ## What it does
@@ -211,7 +211,7 @@ the thing that has to feel instant.
 ## The command
 
 ```bash
-fold=~/.config/omarchy/plugins/estrocondoso.yoga260-fold/bin/omarchy-yoga260-fold
+fold=~/.config/omarchy/plugins/juanmanueldaza.yoga260-fold/bin/omarchy-yoga260-fold
 
 $fold doctor        # what this machine actually has, read-only
 $fold status        # the state the bar shows, as JSON

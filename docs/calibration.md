@@ -5,7 +5,7 @@ both are settled by a person at the keyboard. Everything else is checked
 automatically and the daemon refuses to act when a check fails.
 
 ```bash
-fold=~/.config/omarchy/plugins/estrocondoso.yoga260-fold/bin/omarchy-yoga260-fold
+fold=~/.config/omarchy/plugins/juanmanueldaza.yoga260-fold/bin/omarchy-yoga260-fold
 $fold calibrate
 ```
 

@@ -16,13 +16,13 @@ import qs.Ui
 // no middle button. So a tap opens it and every control in it is a big target.
 Panel {
   id: root
-  moduleName: "estrocondoso.yoga260-fold"
-  ipcTarget: "estrocondoso.yoga260-fold"
+  moduleName: "juanmanueldaza.yoga260-fold"
+  ipcTarget: "juanmanueldaza.yoga260-fold"
 
   readonly property var service: {
     var host = bar && bar.shell ? bar.shell : null
     if (!host || typeof host.serviceFor !== "function") return null
-    return host.serviceFor("estrocondoso.yoga260-fold")
+    return host.serviceFor("juanmanueldaza.yoga260-fold")
   }
 
   readonly property bool supported: service ? service.supported : false
