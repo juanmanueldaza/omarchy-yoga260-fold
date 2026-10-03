@@ -98,7 +98,7 @@ $fold setting yawSign -1     # if the screen turns the wrong way while flat
 ## Install
 
 ```bash
-omarchy plugin add https://github.com/estrocondoso/omarchy-yoga260-fold --enable
+omarchy plugin add https://github.com/juanmanueldaza/omarchy-yoga260-fold --enable
 ```
 
 Or, from a checkout, copy it into place and enable it:
