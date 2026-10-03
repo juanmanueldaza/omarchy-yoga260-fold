@@ -288,7 +288,7 @@ has a reason to want it.
 - [ ] `systemd-analyze verify` clean
 - [ ] Real `time` captures published, with the command used
 - [ ] Documented uninstall path
-- [ ] Confirmed it does not regress the 275 existing tests
+- [ ] Confirmed it does not regress the 311 existing tests
 
 ## Sources for the mechanism
 

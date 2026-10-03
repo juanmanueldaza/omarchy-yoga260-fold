@@ -11,3 +11,4 @@ __pycache__/
 AGENTS.md
 opencode.json
 opencode.template.json
+.specify/
