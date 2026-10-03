@@ -1767,6 +1767,11 @@ class FoldDaemon:
         self.last_signature: tuple | None = None
         self.last_publish: float = 0.0
         self._last_key: tuple | None = None
+        # Last observed lock state, watched on the slow timer. The lock
+        # screen changes without moving any sensor, so `changed()` can never
+        # see it; without this, locking a folded-and-still machine leaves the
+        # keyboard off at the password prompt. See `poll_lock_state`.
+        self._last_lock_state: bool | None = None
         # The pose this pass sampled, kept by `changed` so `step` acts on the
         # same reading rather than on a second one taken microseconds later.
         self._pose: dict[str, Any] | None = None
@@ -2607,6 +2612,12 @@ class FoldDaemon:
                     next_verify = now + verify
                     time.sleep(poll)
                     continue
+                if self.poll_lock_state():
+                    # A lock transition changes what `set_devices` must do,
+                    # so it gets a full pass instead of waiting for the next
+                    # fold or turn. Rare by construction: transitions, not
+                    # passes.
+                    self.step()
                 # A `hyprctl reload` rebuilds the monitor rules from the config
                 # files and straightens a turned panel. Re-asserting on a timer
                 # is how that heals, with no cooperation from the compositor.
@@ -2683,6 +2694,27 @@ class FoldDaemon:
             self._last_key = key
             return True
         return False
+
+    def poll_lock_state(self) -> bool:
+        """Watch the lock screen on the slow timer; True on a transition.
+
+        `changed()` watches sensors, and locking moves no sensor, so a lock
+        or unlock while the machine sits still would otherwise never reach
+        `set_devices`: folding and then locking leaves the keyboard off at
+        the password prompt, which is exactly the lockout `session_locked`
+        exists to prevent. The probe is one `hyprctl layers` plus one
+        `clients -j` every `verifySec`, next to the re-assert that already
+        costs the same order of round trips.
+
+        The first probe only records, so starting the daemon does not force
+        a pass before the first real change does.
+        """
+        locked = self.hypr.session_locked()
+        if locked == self._last_lock_state:
+            return False
+        first = self._last_lock_state is None
+        self._last_lock_state = locked
+        return not first
 
 
 

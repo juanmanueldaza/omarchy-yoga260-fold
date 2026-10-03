@@ -3434,6 +3434,9 @@ class FoldDaemonRunTests(unittest.TestCase):
         daemon.blocking_reason = MagicMock(return_value=blocked)
         daemon.verify = MagicMock()
         daemon.resolve_devices = MagicMock()
+        # The slow-timer lock watch: silent by default, so the loop tests
+        # below only exercise it when they opt in.
+        daemon.poll_lock_state = MagicMock(return_value=False)
         daemon.reload_settings = MagicMock()
         daemon.announce = MagicMock()
         return daemon
@@ -3501,6 +3504,83 @@ class FoldDaemonRunTests(unittest.TestCase):
         self.assertEqual(daemon.run(), 0)
         daemon.verify.assert_called()
         daemon.resolve_devices.assert_called()
+
+    def test_run_forces_a_pass_on_a_lock_transition(self):
+        # Locking moves no sensor, so `changed` never fires for it. The slow
+        # lock watch must force the pass that re-decides the keyboard.
+        daemon = self._looping_daemon(changed=False, settling=False)
+        calls = {"n": 0}
+
+        def once(*_args, **_kwargs):
+            calls["n"] += 1
+            return calls["n"] == 1
+
+        daemon.poll_lock_state = MagicMock(side_effect=once)
+        self.assertEqual(daemon.run(), 0)
+        daemon.step.assert_called()
+
+    def test_run_forces_no_pass_without_a_lock_transition(self):
+        daemon = self._looping_daemon(changed=False, settling=False)
+        daemon.poll_lock_state = MagicMock(return_value=False)
+        self.assertEqual(daemon.run(), 0)
+        daemon.step.assert_not_called()
+
+
+class PollLockStateTests(unittest.TestCase):
+    """The lock screen is watched on the slow timer, not on every change.
+
+    `changed()` watches sensors and locking moves no sensor, so a
+    fold-then-lock while the machine sits still would otherwise never reach
+    `set_devices` -- the keyboard stays off at the password prompt, which
+    is the lockout `session_locked` exists to prevent. The watch costs one
+    probe per `verifySec` and forces a pass only on transitions.
+    """
+
+    def _daemon(self, *locked):
+        daemon = fold.FoldDaemon.__new__(fold.FoldDaemon)
+        daemon.state = fold.State()
+        script = {"values": list(locked)}
+
+        class Hypr:
+            def session_locked(self):
+                return script["values"].pop(0)
+
+        daemon.hypr = Hypr()
+        daemon._last_lock_state = None
+        return daemon
+
+    def test_the_first_probe_only_records(self):
+        daemon = self._daemon(False)
+        self.assertIs(daemon.poll_lock_state(), False)
+        self.assertIs(daemon._last_lock_state, False)
+
+    def test_the_first_probe_records_locked_without_firing(self):
+        daemon = self._daemon(True)
+        self.assertIs(daemon.poll_lock_state(), False)
+        self.assertIs(daemon._last_lock_state, True)
+
+    def test_a_lock_transition_reports_true(self):
+        daemon = self._daemon(True)
+        daemon._last_lock_state = False
+        self.assertIs(daemon.poll_lock_state(), True)
+        self.assertIs(daemon._last_lock_state, True)
+
+    def test_an_unlock_transition_reports_true(self):
+        daemon = self._daemon(False)
+        daemon._last_lock_state = True
+        self.assertIs(daemon.poll_lock_state(), True)
+        self.assertIs(daemon._last_lock_state, False)
+
+    def test_no_transition_reports_false(self):
+        daemon = self._daemon(False)
+        daemon._last_lock_state = False
+        self.assertIs(daemon.poll_lock_state(), False)
+
+    def test_unknown_is_its_own_state(self):
+        daemon = self._daemon(None, None)
+        daemon._last_lock_state = True
+        self.assertIs(daemon.poll_lock_state(), True)
+        self.assertIs(daemon.poll_lock_state(), False)
 
 
 class AnnounceTests(unittest.TestCase):

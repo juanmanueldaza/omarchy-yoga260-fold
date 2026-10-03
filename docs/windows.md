@@ -339,12 +339,19 @@ It is documented as a starting point for whoever wants it, not recommended.
    gate the firmware's own self-consistency check at 150°, deliberately and
    deliberately only — see the section above.
 3. **Keyboard off belongs to the fold transition, not the steady state.**
-   Still open. Windows killed the keys on the 0xCC edge. Here it is decided
-   from `mode_for` but re-checked on every pass that changes anything, and the
-   lock-screen guard (`session_locked`) costs a `hyprctl layers` plus a
-   `clients -j` each time. The guard must stay — it is what prevents the one
-   true lockout — but it could be sampled on the transition rather than on
-   every change.
+   Done, but not as first suggested — the suggestion was wrong and the
+   opposite gap was real. Sampling the guard only on the fold transition
+   would have missed lock transitions entirely: `changed()` watches sensors
+   and locking moves no sensor, so locking a folded-and-still machine never
+   reached `set_devices` at all and the keyboard stayed off at the password
+   prompt — the exact lockout the guard exists to prevent. What shipped
+   instead: `poll_lock_state` watches the lock screen on the `verifySec`
+   slow timer (one probe per 5 s, next to the re-assert that already costs
+   the same order of round trips) and forces a full `step()` only on lock
+   transitions. The per-change probe inside `set_devices` is kept: it is
+   already bounded to change-passes, and its outcome depends on lock state,
+   so it cannot be skipped on steady-state grounds. First probe only
+   records, so startup forces no extra pass.
 4. **Digitizer rotation is a display-driver feature on Windows; on Linux it is a
    libinput calibration matrix or nothing.** Hyprland 0.56.2 does hand that
    matrix to libinput for both nodes — `setTabletConfigs()` and
