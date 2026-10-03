@@ -1136,6 +1136,7 @@ class HingeTelemetryCadenceTests(unittest.TestCase):
         # of dividing a MagicMock and recording its id as an attribute name.
         daemon.motion.device = Path("/dev/iio:none")
         daemon.osk = MagicMock()
+        daemon.fingerprint = MagicMock()
         daemon.keyboards = []
         daemon.pointers = []
         daemon.touchpads = []
@@ -1255,6 +1256,13 @@ class ProductionWiringTests(unittest.TestCase):
         self.assertEqual(
             with_matrix.is_still(*with_matrix.read()), without.is_still(*without.read())
         )
+
+    def test_the_daemon_carries_a_real_fingerprint_reader(self):
+        # `status` publishes `daemon.fingerprint.as_dict()`. Built by hand in
+        # the decision tests it is a MagicMock; built by the constructor it
+        # has to be the real reader, or `doctor` reports a mock's shape.
+        daemon = self._build()
+        self.assertIsInstance(daemon.fingerprint, fold.FingerprintReader)
 
 
 class HyprlandTests(unittest.TestCase):
@@ -1807,6 +1815,170 @@ class OnScreenKeyboardTests(unittest.TestCase):
             self.assertIsNone(self._osk_with_piccolo().is_shown())
 
 
+class FingerprintReaderTests(unittest.TestCase):
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.addCleanup(self._td.cleanup)
+        self.root = Path(self._td.name)
+
+    def _reader(self):
+        reader = fold.FingerprintReader()
+        reader.sysfs_root = self.root / "usb"
+        reader.pam_root = self.root / "pam.d"
+        return reader
+
+    def _usb_device(self, name, vendor, product):
+        dev = self.root / "usb" / name
+        dev.mkdir(parents=True, exist_ok=True)
+        (dev / "idVendor").write_text(f"{vendor}\n")
+        (dev / "idProduct").write_text(f"{product}\n")
+
+    def _pam(self, name, body):
+        pamd = self.root / "pam.d"
+        pamd.mkdir(parents=True, exist_ok=True)
+        (pamd / name).write_text(body)
+
+    def _run(self, mapping):
+        def fake(cmd, **kwargs):
+            key = tuple(cmd)
+            if key in mapping:
+                rc, out = mapping[key]
+                return MagicMock(returncode=rc, stdout=out)
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        return fake
+
+    def _healthy(self, *, sensor=True):
+        if sensor:
+            self._usb_device("1-1", "138a", "0090")
+        for name in ("sudo", "polkit-1", "omarchy-lock-fingerprint"):
+            self._pam(name, "auth sufficient pam_fprintd.so\n")
+        return {
+            ("systemctl", "is-enabled", "fprintd"): (0, "enabled\n"),
+            ("systemctl", "is-active", "fprintd"): (0, "active\n"),
+            ("fprintd-list",): (
+                0,
+                "found 1 devices\nUsing device /net/reactivated/Fprint/Device/0\nFingerprints:\n   - #0: right-index-finger\n   - #1: right-middle-finger\n",
+            ),
+        }
+
+    def test_sensor_absent_without_sysfs(self):
+        self.assertFalse(self._reader().sensor_present())
+
+    def test_sensor_absent_with_other_devices(self):
+        self._usb_device("1-1", "8087", "0a2b")
+        self._usb_device("1-2", "138a", "0011")
+        self.assertFalse(self._reader().sensor_present())
+
+    def test_sensor_present(self):
+        self._usb_device("1-1", "8087", "0a2b")
+        self._usb_device("1-2", "138a", "0090")
+        self.assertTrue(self._reader().sensor_present())
+
+    def test_unit_states_healthy(self):
+        reader = self._reader()
+        with patch.object(
+            fold.subprocess, "run", side_effect=self._run(self._healthy())
+        ):
+            self.assertEqual(reader.unit_states(), ("enabled", "active"))
+
+    def test_unit_states_masked(self):
+        reader = self._reader()
+        mapping = {
+            ("systemctl", "is-enabled", "fprintd"): (1, "masked\n"),
+            ("systemctl", "is-active", "fprintd"): (0, "inactive\n"),
+        }
+        with patch.object(fold.subprocess, "run", side_effect=self._run(mapping)):
+            self.assertEqual(reader.unit_states(), ("masked", "inactive"))
+
+    def test_unit_states_without_systemctl(self):
+        reader = self._reader()
+        with patch.object(fold.subprocess, "run", side_effect=OSError("no systemctl")):
+            self.assertEqual(reader.unit_states(), ("unknown", "unknown"))
+
+    def test_pam_wired_partial(self):
+        self._pam("sudo", "auth sufficient pam_fprintd.so\n")
+        self._pam("polkit-1", "auth include system-auth\n")
+        self.assertEqual(self._reader().pam_wired(), ["sudo"])
+
+    def test_enrolled_none_while_inactive(self):
+        reader = self._reader()
+        mapping = {
+            ("systemctl", "is-enabled", "fprintd"): (1, "masked\n"),
+            ("systemctl", "is-active", "fprintd"): (0, "inactive\n"),
+        }
+        with patch.object(
+            fold.subprocess, "run", side_effect=self._run(mapping)
+        ) as run:
+            self.assertIsNone(reader.enrolled())
+            self.assertNotIn(
+                ("fprintd-list",), [tuple(call.args[0]) for call in run.call_args_list]
+            )
+
+    def test_enrolled_counts_prints(self):
+        reader = self._reader()
+        with patch.object(
+            fold.subprocess, "run", side_effect=self._run(self._healthy())
+        ):
+            self.assertEqual(reader.enrolled(), 2)
+
+    def test_enrolled_zero_when_none_enrolled(self):
+        reader = self._reader()
+        mapping = self._healthy()
+        mapping[("fprintd-list",)] = (0, "found 1 devices\nNo fingerprints enrolled\n")
+        with patch.object(fold.subprocess, "run", side_effect=self._run(mapping)):
+            self.assertEqual(reader.enrolled(), 0)
+
+    def test_as_dict_healthy(self):
+        reader = self._reader()
+        with patch.object(
+            fold.subprocess, "run", side_effect=self._run(self._healthy())
+        ):
+            report = reader.as_dict(force=True)
+        self.assertTrue(report["ok"])
+        self.assertEqual(report["reason"], "")
+        self.assertTrue(report["sensor"]["present"])
+        self.assertEqual(report["sensor"]["usbId"], "138a:0090")
+        self.assertTrue(report["service"]["enabled"])
+        self.assertTrue(report["service"]["active"])
+        self.assertEqual(report["enrolled"], 2)
+        self.assertEqual(
+            report["pam"], ["sudo", "polkit-1", "omarchy-lock-fingerprint"]
+        )
+
+    def test_as_dict_reason_order(self):
+        # Each failure is reported in dependency order: hardware first,
+        # then the unit, then the PAM wiring, then the enrollments.
+        reader = self._reader()
+        with patch.object(
+            fold.subprocess, "run", side_effect=self._run(self._healthy(sensor=False))
+        ):
+            report = reader.as_dict(force=True)
+        self.assertFalse(report["ok"])
+        self.assertIn("138a:0090", report["reason"])
+
+        self._usb_device("1-1", "138a", "0090")
+        mapping = self._healthy()
+        mapping[("systemctl", "is-enabled", "fprintd")] = (1, "masked\n")
+        mapping[("systemctl", "is-active", "fprintd")] = (0, "inactive\n")
+        with patch.object(fold.subprocess, "run", side_effect=self._run(mapping)):
+            report = reader.as_dict(force=True)
+        self.assertIn("masked", report["reason"])
+        self.assertIsNone(report["enrolled"])
+
+    def test_as_dict_cached_between_ticks(self):
+        reader = self._reader()
+        with patch.object(
+            fold.subprocess, "run", side_effect=self._run(self._healthy())
+        ) as run:
+            first = reader.as_dict()
+            second = reader.as_dict()
+            self.assertIs(first, second)
+            calls = len(run.call_args_list)
+            reader.as_dict(force=True)
+            self.assertGreater(len(run.call_args_list), calls)
+
+
 class FoldDaemonStepTests(unittest.TestCase):
     def setUp(self):
         # `step` calls `reload_settings` on every pass, which reads the real
@@ -1895,6 +2067,7 @@ class FoldDaemonStepTests(unittest.TestCase):
         self.daemon.motion.read.return_value = (0.5, True)
         self.daemon.motion.is_still.return_value = True
         self.daemon.osk = fold.OnScreenKeyboard(self.daemon.settings)
+        self.daemon.fingerprint = fold.FingerprintReader()
         self.daemon.stop = False
         self.daemon.decision = None
         self.daemon.decision_since = 0
@@ -2532,6 +2705,7 @@ class FoldDaemonStepTests(unittest.TestCase):
         s = self.daemon.status()
         self.assertIn("state", s)
         self.assertIn("settings", s)
+        self.assertIn("fingerprint", s)
 
     def test_resolve_devices(self):
         # The mocks setUp already installed are the whole point: `resolve_devices`

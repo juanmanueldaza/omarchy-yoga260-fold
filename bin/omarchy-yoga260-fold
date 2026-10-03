@@ -1685,6 +1685,136 @@ class OnScreenKeyboard:
 # --------------------------------------------------------------------------
 
 
+FINGERPRINT_USB_VENDOR = "138a"
+FINGERPRINT_USB_PRODUCT = "0090"  # Validity VFS7500 in the Yoga 260
+FINGERPRINT_USB_ID = f"{FINGERPRINT_USB_VENDOR}:{FINGERPRINT_USB_PRODUCT}"
+FINGERPRINT_PAM_FILES = ("sudo", "polkit-1", "omarchy-lock-fingerprint")
+FINGERPRINT_CACHE_TTL = 30.0
+
+
+class FingerprintReader:
+    """Reports the Validity fingerprint stack, read-only.
+
+    The Yoga 260 carries a 138a:0090 sensor that stock libfprint does not
+    speak, so a working setup is three independent facts at once: the sensor
+    on USB, a driver behind fprintd, and pam_fprintd wired into the stacks
+    that ask. Each fails on its own -- a masked unit looks exactly like a
+    missing sensor to everything above it -- so each is reported on its own
+    rather than folded into one boolean.
+
+    Everything here is readable by the invoking user: sysfs for the USB id,
+    `systemctl is-enabled/is-active` for the unit, the PAM files themselves,
+    and `fprintd-list` for the caller's own prints. Nothing here writes, and
+    the enrollment probe only runs while the daemon is active, so a masked
+    unit is never dbus-activated once per tick just to be asked.
+    """
+
+    def __init__(self) -> None:
+        self.sysfs_root = Path("/sys/bus/usb/devices")
+        self.pam_root = Path("/etc/pam.d")
+        self._cached: dict[str, Any] | None = None
+        self._cached_at = 0.0
+
+    def sensor_present(self) -> bool:
+        try:
+            devices = sorted(self.sysfs_root.iterdir())
+        except OSError:
+            return False
+        for device in devices:
+            if read_text(device / "idVendor") != FINGERPRINT_USB_VENDOR:
+                continue
+            if read_text(device / "idProduct") == FINGERPRINT_USB_PRODUCT:
+                return True
+        return False
+
+    def _systemctl(self, *args: str) -> tuple[int, str]:
+        try:
+            done = subprocess.run(
+                ["systemctl", *args, "fprintd"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return 1, ""
+        return done.returncode, done.stdout.strip()
+
+    def unit_states(self) -> tuple[str, str]:
+        _, enabled = self._systemctl("is-enabled")
+        _, active = self._systemctl("is-active")
+        return enabled or "unknown", active or "unknown"
+
+    def pam_wired(self) -> list[str]:
+        wired = []
+        for name in FINGERPRINT_PAM_FILES:
+            text = read_text(self.pam_root / name)
+            if text is not None and "pam_fprintd.so" in text:
+                wired.append(name)
+        return wired
+
+    def enrolled(self) -> int | None:
+        _, active = self.unit_states()
+        if active != "active":
+            return None
+        try:
+            done = subprocess.run(
+                ["fprintd-list"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if done.returncode != 0:
+            return None
+        return sum(
+            1 for line in done.stdout.splitlines() if re.match(r"\s*-\s+#\d+:", line)
+        )
+
+    def as_dict(self, *, force: bool = False) -> dict[str, Any]:
+        now = time.monotonic()
+        if (
+            not force
+            and self._cached is not None
+            and now - self._cached_at < FINGERPRINT_CACHE_TTL
+        ):
+            return self._cached
+        present = self.sensor_present()
+        enabled_state, active_state = self.unit_states()
+        pam = self.pam_wired()
+        fingers = self.enrolled() if active_state == "active" else None
+        if not present:
+            reason = f"no {FINGERPRINT_USB_ID} fingerprint sensor on USB"
+        elif enabled_state != "enabled":
+            reason = f"fprintd unit is {enabled_state}"
+        elif active_state != "active":
+            reason = f"fprintd is {active_state}"
+        elif not pam:
+            reason = "pam_fprintd is not wired into sudo, polkit or the lock screen"
+        elif fingers == 0:
+            reason = "no fingerprints enrolled"
+        else:
+            reason = ""
+        report = {
+            "sensor": {"present": present, "usbId": FINGERPRINT_USB_ID},
+            "service": {
+                "enabled": enabled_state == "enabled",
+                "active": active_state == "active",
+                "unitState": enabled_state,
+                "activeState": active_state,
+            },
+            "pam": pam,
+            "enrolled": fingers,
+            "ok": not reason,
+            "reason": reason,
+        }
+        self._cached = report
+        self._cached_at = now
+        return report
+
+
 @dataclass
 class State:
     transform: int = 0
@@ -1794,6 +1924,7 @@ class FoldDaemon:
             settings["mountMatrix"],
         )
         self.osk = OnScreenKeyboard(settings)
+        self.fingerprint = FingerprintReader()
         self.stop = False
         self.decision: int | None = None
         self.decision_since = time.monotonic()
@@ -2381,6 +2512,7 @@ class FoldDaemon:
                 ),
             },
             "osk": self.osk.as_dict(),
+            "fingerprint": self.fingerprint.as_dict(),
             "mapping": {"options": list(MAPPINGS), "current": self.settings["mapping"]},
             "icons": ICONS,
             "orientationLabels": ORIENTATION_LABEL,
@@ -3512,6 +3644,7 @@ def cmd_doctor(settings: dict[str, Any]) -> int:
         # `docs/sensors.md` could not honestly name both.
         "sensors": daemon.status()["sensor"],
         "libwacom": libwacom_status(),
+        "fingerprint": daemon.fingerprint.as_dict(force=True),
         "blockedBy": daemon.blocking_reason(),
         "settings": load_settings()["mapping"],
         "shell": {"path": str(SHELL_JSON), "readable": shell_json_document() is not None,
