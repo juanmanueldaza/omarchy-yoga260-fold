@@ -118,6 +118,13 @@ Then give the pen its proper libwacom entry, which this machine is missing:
 Remove the whole thing with `omarchy plugin remove juanmanueldaza.yoga260-fold` and
 `omarchy-yoga260-fold libwacom remove`.
 
+Optional: an on-screen keyboard. This plugin drives one, it does not ship one —
+the Fold panel's keyboard button only appears when a keyboard plugin is installed:
+
+```bash
+omarchy plugin add https://github.com/abdxdev/omarchy-onscreen-keyboard --enable
+```
+
 ## What it does
 
 - **Follows the machine, in every pose it can see.** Rotate it and the screen
