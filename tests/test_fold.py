@@ -1856,7 +1856,7 @@ class FingerprintReaderTests(unittest.TestCase):
         return {
             ("systemctl", "is-enabled", "fprintd"): (0, "enabled\n"),
             ("systemctl", "is-active", "fprintd"): (0, "active\n"),
-            ("fprintd-list",): (
+            ("fprintd-list", fold._current_user()): (
                 0,
                 "found 1 devices\nUsing device /net/reactivated/Fprint/Device/0\nFingerprints:\n   - #0: right-index-finger\n   - #1: right-middle-finger\n",
             ),
@@ -1901,7 +1901,7 @@ class FingerprintReaderTests(unittest.TestCase):
         self._pam("polkit-1", "auth include system-auth\n")
         self.assertEqual(self._reader().pam_wired(), ["sudo"])
 
-    def test_enrolled_none_while_inactive(self):
+    def test_enrolled_none_while_masked(self):
         reader = self._reader()
         mapping = {
             ("systemctl", "is-enabled", "fprintd"): (1, "masked\n"),
@@ -1911,8 +1911,31 @@ class FingerprintReaderTests(unittest.TestCase):
             fold.subprocess, "run", side_effect=self._run(mapping)
         ) as run:
             self.assertIsNone(reader.enrolled())
-            self.assertNotIn(
-                ("fprintd-list",), [tuple(call.args[0]) for call in run.call_args_list]
+            self.assertFalse(
+                any(call.args[0][:1] == ["fprintd-list"] for call in run.call_args_list)
+            )
+
+    def test_enrolled_wakes_an_idle_but_startable_daemon(self):
+        # fprintd is dbus-activated: `static` and at rest is its normal state,
+        # and the list probe is what wakes it. Only `masked` is skipped.
+        reader = self._reader()
+        mapping = self._healthy()
+        mapping[("systemctl", "is-enabled", "fprintd")] = (0, "static\n")
+        mapping[("systemctl", "is-active", "fprintd")] = (0, "inactive\n")
+        with patch.object(fold.subprocess, "run", side_effect=self._run(mapping)):
+            self.assertEqual(reader.enrolled(), 2)
+
+    def test_enrolled_none_without_a_user(self):
+        reader = self._reader()
+        with (
+            patch.object(fold, "_current_user", return_value=None),
+            patch.object(
+                fold.subprocess, "run", side_effect=self._run(self._healthy())
+            ) as run,
+        ):
+            self.assertIsNone(reader.enrolled())
+            self.assertFalse(
+                any(call.args[0][:1] == ["fprintd-list"] for call in run.call_args_list)
             )
 
     def test_enrolled_counts_prints(self):
@@ -1925,7 +1948,10 @@ class FingerprintReaderTests(unittest.TestCase):
     def test_enrolled_zero_when_none_enrolled(self):
         reader = self._reader()
         mapping = self._healthy()
-        mapping[("fprintd-list",)] = (0, "found 1 devices\nNo fingerprints enrolled\n")
+        mapping[("fprintd-list", fold._current_user())] = (
+            0,
+            "found 1 devices\nNo fingerprints enrolled\n",
+        )
         with patch.object(fold.subprocess, "run", side_effect=self._run(mapping)):
             self.assertEqual(reader.enrolled(), 0)
 
@@ -1945,6 +1971,19 @@ class FingerprintReaderTests(unittest.TestCase):
         self.assertEqual(
             report["pam"], ["sudo", "polkit-1", "omarchy-lock-fingerprint"]
         )
+
+    def test_as_dict_static_and_active_is_healthy(self):
+        # The production shape: fprintd ships no [Install] section, so a
+        # working setup reports `static`, never `enabled`.
+        reader = self._reader()
+        mapping = self._healthy()
+        mapping[("systemctl", "is-enabled", "fprintd")] = (0, "static\n")
+        with patch.object(fold.subprocess, "run", side_effect=self._run(mapping)):
+            report = reader.as_dict(force=True)
+        self.assertTrue(report["ok"])
+        self.assertEqual(report["reason"], "")
+        self.assertTrue(report["service"]["enabled"])
+        self.assertEqual(report["service"]["unitState"], "static")
 
     def test_as_dict_reason_order(self):
         # Each failure is reported in dependency order: hardware first,

@@ -30,6 +30,7 @@ set of sensor values, because a wrong rotation is worse than no rotation.
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import math
 import os
@@ -1692,6 +1693,16 @@ FINGERPRINT_PAM_FILES = ("sudo", "polkit-1", "omarchy-lock-fingerprint")
 FINGERPRINT_CACHE_TTL = 30.0
 
 
+def _current_user() -> str | None:
+    user = os.environ.get("USER") or os.environ.get("LOGNAME")
+    if user:
+        return user
+    try:
+        return getpass.getuser()
+    except (ImportError, OSError, KeyError):
+        return None
+
+
 class FingerprintReader:
     """Reports the Validity fingerprint stack, read-only.
 
@@ -1705,8 +1716,8 @@ class FingerprintReader:
     Everything here is readable by the invoking user: sysfs for the USB id,
     `systemctl is-enabled/is-active` for the unit, the PAM files themselves,
     and `fprintd-list` for the caller's own prints. Nothing here writes, and
-    the enrollment probe only runs while the daemon is active, so a masked
-    unit is never dbus-activated once per tick just to be asked.
+    the enrollment probe is only skipped while the unit is masked, where
+    activation can never succeed and the attempt is pure noise.
     """
 
     def __init__(self) -> None:
@@ -1754,12 +1765,15 @@ class FingerprintReader:
         return wired
 
     def enrolled(self) -> int | None:
-        _, active = self.unit_states()
-        if active != "active":
+        enabled, _ = self.unit_states()
+        if enabled == "masked":
+            return None
+        user = _current_user()
+        if not user:
             return None
         try:
             done = subprocess.run(
-                ["fprintd-list"],
+                ["fprintd-list", user],
                 capture_output=True,
                 text=True,
                 timeout=10,
@@ -1784,23 +1798,30 @@ class FingerprintReader:
         present = self.sensor_present()
         enabled_state, active_state = self.unit_states()
         pam = self.pam_wired()
-        fingers = self.enrolled() if active_state == "active" else None
+        # A healthy fprintd is `static`: no [Install] section, started on
+        # demand over dbus. `is-enabled` says "static" for it, and the list
+        # probe below is what wakes it. Only a masked unit is skipped, because
+        # activation can never succeed and the attempt is pure noise.
+        fingers = self.enrolled() if enabled_state != "masked" else None
+        startable = enabled_state in ("enabled", "static")
         if not present:
             reason = f"no {FINGERPRINT_USB_ID} fingerprint sensor on USB"
-        elif enabled_state != "enabled":
+        elif enabled_state == "masked":
+            reason = "fprintd unit is masked"
+        elif not startable:
             reason = f"fprintd unit is {enabled_state}"
-        elif active_state != "active":
-            reason = f"fprintd is {active_state}"
         elif not pam:
             reason = "pam_fprintd is not wired into sudo, polkit or the lock screen"
         elif fingers == 0:
             reason = "no fingerprints enrolled"
+        elif active_state == "active" and fingers is None:
+            reason = "fprintd did not answer the enrollment probe"
         else:
             reason = ""
         report = {
             "sensor": {"present": present, "usbId": FINGERPRINT_USB_ID},
             "service": {
-                "enabled": enabled_state == "enabled",
+                "enabled": startable,
                 "active": active_state == "active",
                 "unitState": enabled_state,
                 "activeState": active_state,
