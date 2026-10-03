@@ -122,6 +122,14 @@ DEFAULTS = {
     # machine held still, and bare comparisons fluttered tablet/tent/book --
     # taking the keyboard off and on with it.
     "modeHystDeg": 10.0,
+    # Fold rate below which the lid counts as resting. The gyroscope lives in
+    # the base, so folding the lid with the base on the desk reads still --
+    # and without this, every still micro-pass mid-fold applies whatever
+    # transit verdict the sensors happen to hold, tumbling the screen through
+    # orientations on the way. The hinge reports whole degrees and sits at
+    # exactly 0 change at rest, so anything at all is real motion; folding
+    # runs tens of degrees a second.
+    "foldQuietDegSec": 15.0,
     # How long a pose has to hold before the screen is turned. The gyroscope
     # already refuses to act while the machine is being turned, so this is only
     # there to catch a transient -- and it was 1.2 s, which on top of the
@@ -1802,6 +1810,10 @@ class FoldDaemon:
         # landing, but a 1-2 pass tremor dropout is not a landing -- see
         # `step`. 0.0 so the first edge always counts as one.
         self._false_since = 0.0
+        # Last fold angle and when it was seen. The gyroscope lives in the
+        # base, so the lid can travel while it reads still -- see `step`.
+        self._last_fold: float | None = None
+        self._last_fold_at = 0.0
         self.last_applied = 0.0
         self.last_status = ""
         self.last_signature: tuple | None = None
@@ -2162,7 +2174,24 @@ class FoldDaemon:
         )
         best = pose["candidates"][0]
         chosen = best
-        if incumbent is not None and (best["label"], best["sign"]) != held and incumbent["tiltDeg"] - best["tiltDeg"] < float(self.settings["hystDeg"]):
+        # A sign flip on the winning axis is information, not noise: face-up
+        # to face-down (or top-up to top-down) with the axis genuinely winning
+        # is a decisive reading, and freezing it with hysteresis sticks the
+        # screen on the wrong side of a flat hold -- the margin between the
+        # two signs sits near zero by construction, so the band below would
+        # keep the loser forever. Stillness and the settle window below still
+        # apply; only the margin veto is lifted.
+        same_axis_flip = (
+            incumbent is not None
+            and best["label"] == held[0]
+            and best["sign"] != held[1]
+        )
+        if (
+            incumbent is not None
+            and (best["label"], best["sign"]) != held
+            and not same_axis_flip
+            and incumbent["tiltDeg"] - best["tiltDeg"] < float(self.settings["hystDeg"])
+        ):
             chosen = incumbent
 
         orientation = ORIENTATION_FOR[(chosen["label"], chosen["sign"])]
@@ -2437,6 +2466,22 @@ class FoldDaemon:
         else:
             self._false_since = now
         self._was_still = self.still
+        # Whether the lid itself is moving, whatever the gyroscope says. The
+        # gyro lives in the base, so folding the lid with the base on the desk
+        # reads still -- and without this, every still micro-pass mid-fold
+        # applies whatever transit verdict the sensors happen to hold,
+        # tumbling the screen through orientations on the way. The hinge
+        # reports whole degrees and sits at exactly 0 change at rest, so a
+        # pass as fast as this threshold is already a hand on the lid.
+        fold_now = float(pose["fold"])
+        if self._last_fold is None:
+            fold_quiet = True
+        else:
+            fold_elapsed = max(now - self._last_fold_at, 1e-3)
+            fold_quiet = abs(fold_now - self._last_fold) / fold_elapsed < float(
+                self.settings.get("foldQuietDegSec", 15.0)
+            )
+        self._last_fold, self._last_fold_at = fold_now, now
         # Published so the status line cannot disagree with the settings. It was
         # never assigned, so `status` reported the lock as off no matter what
         # the panel and the CLI had agreed on -- which is exactly the kind of
@@ -2460,6 +2505,8 @@ class FoldDaemon:
             messages.append("the hinge sensor is not self-consistent; not turning the screen")
         elif not pose["still"]:
             messages.append("moving; holding the last orientation")
+        elif not fold_quiet:
+            messages.append("folding; holding the last orientation")
         if (
             pose["tilt_residual"] is not None
             and pose["tilt_residual"] > float(self.settings["reportTiltResidualDeg"])

@@ -871,6 +871,41 @@ class Hysteresis(unittest.TestCase):
             )
         self.assertEqual(results, [3, 0])
 
+    def test_a_sign_flip_on_the_winning_axis_is_decisive(self):
+        # Face-down flat beating face-up flat by 2 degrees: the hysteresis
+        # margin sits near zero by construction (same axis, opposite signs),
+        # so the band would keep the loser forever and a flipped-over tablet
+        # would stay upside down. A sign flip on the winning axis is a real
+        # change, not noise.
+        daemon = bare_daemon(hystDeg=12.0, settleSec=0.0)
+        daemon.state.axis, daemon.state.signed = "flat", 1
+        daemon.state.transform = 0
+        candidates = [
+            {"label": "flat", "sign": -1, "tiltDeg": 4.0},
+            {"label": "flat", "sign": 1, "tiltDeg": 6.0},
+            {"label": "right", "sign": 1, "tiltDeg": 80.0},
+        ]
+        pose = {"candidates": sorted(candidates, key=lambda c: c["tiltDeg"])}
+        transform, _ = daemon.desired_transform(pose, "tablet")
+        self.assertEqual(transform, fold.transform_for("inverted", "standard"))
+        self.assertEqual((daemon.state.axis, daemon.state.signed), ("flat", -1))
+
+    def test_a_different_axis_still_needs_the_margin(self):
+        # The guard above is only for same-axis sign flips: a genuinely
+        # different axis with a 2 degree margin still keeps the incumbent.
+        daemon = bare_daemon(hystDeg=12.0, settleSec=0.0)
+        daemon.state.axis, daemon.state.signed = "flat", 1
+        daemon.state.transform = 0
+        candidates = [
+            {"label": "right", "sign": 1, "tiltDeg": 4.0},
+            {"label": "flat", "sign": 1, "tiltDeg": 6.0},
+            {"label": "top", "sign": 1, "tiltDeg": 80.0},
+        ]
+        pose = {"candidates": sorted(candidates, key=lambda c: c["tiltDeg"])}
+        transform, _ = daemon.desired_transform(pose, "tablet")
+        self.assertEqual(transform, fold.transform_for("normal", "standard"))
+        self.assertEqual((daemon.state.axis, daemon.state.signed), ("flat", 1))
+
 
 class SettleTests(unittest.TestCase):
     """The screen must not turn while the machine is moving."""
@@ -1866,6 +1901,8 @@ class FoldDaemonStepTests(unittest.TestCase):
         self.daemon.still = True
         self.daemon._was_still = True
         self.daemon._false_since = 0.0
+        self.daemon._last_fold = None
+        self.daemon._last_fold_at = 0.0
         self.daemon.last_applied = 0
         self.daemon.last_status = ""
         self.daemon.last_signature = None
@@ -2103,6 +2140,36 @@ class FoldDaemonStepTests(unittest.TestCase):
         self.assertIsInstance(result, bool)
         self.daemon.osk.toggle.assert_called_once_with()
         self.assertFalse(self.daemon.state.osk_asked)
+
+    def test_step_folding_holds_rotation(self):
+        # Base on the desk, lid travelling: the gyroscope reads still, so
+        # without this gate every still micro-pass mid-fold applies whatever
+        # transit verdict the sensors happen to hold, tumbling the screen
+        # through orientations on the way. The mode path is untouched.
+        self.daemon.hypr.current_transform.side_effect = lambda panel: (
+            self.daemon.state.transform
+        )
+        self.daemon.step()
+        calls_after_rest = self.daemon.hypr.rotate_transaction.call_count
+        self.daemon.hinge.read_fold.return_value = fold.HingeSample(
+            250.0, 250.0, 359.0, 250.0, 1.0, True
+        )
+        result = self.daemon.step()
+        self.assertIsInstance(result, bool)
+        self.assertEqual(
+            self.daemon.hypr.rotate_transaction.call_count, calls_after_rest
+        )
+        self.assertTrue(
+            any("folding" in message for message in self.daemon.state.messages)
+        )
+
+    def test_step_quiet_fold_clears_the_gate(self):
+        # Same fold two passes running: nothing is travelling, so a pending
+        # rotation may go.
+        self.daemon.step()
+        result = self.daemon.step()
+        self.assertIsInstance(result, bool)
+        self.assertEqual(self.daemon.state.messages, [])
 
     def test_step_tablet_mode_disables_keyboard(self):
         self.daemon.hinge.read_fold.return_value = fold.HingeSample(
@@ -3485,7 +3552,11 @@ class CmdRotateTests(unittest.TestCase):
         self.td.cleanup()
 
     def test_a_book_machine_is_refused_a_hand_turn(self):
-        rc = fold.cmd_rotate(fold.load_settings(), "normal", force=False)
+        # The refusal depends on the fold angle, which is live hardware.
+        # Without pinning it this test passes in book and fails folded --
+        # which is exactly when someone runs the suite mid-verification.
+        with patch.object(fold.FoldDaemon, "read_pose", return_value={"fold": 102.0}):
+            rc = fold.cmd_rotate(fold.load_settings(), "normal", force=False)
         self.assertEqual(rc, 1)
 
     def test_forcing_a_turn_never_touches_the_real_shell_json(self):
