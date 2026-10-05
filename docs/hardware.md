@@ -62,13 +62,13 @@ Two things follow, and one of them is a bug waiting to happen:
    for a pen by name that does not restrict itself to the tablet node returns
    the finger, so the pen silently never gets its transform. This plugin looks
    each up only among the kind it belongs to.
-2. **The finger node has no `ABS_MT_TOUCH_MAJOR`**, only slot, position and
-   tracking id. libinput decides whether a touch is a palm by comparing a
+2. **The finger node has no `ABS_MT_TOUCH_MAJOR`** — and no multitouch
+   position or tracking axes at all (`ABS_MT_POSITION_*` and
+   `ABS_MT_TRACKING_ID` are absent from both nodes; see `docs/digitizer.md`).
+   libinput decides whether a touch is a palm by comparing a
    contact's size against the pen's, so with no size there is nothing to
    compare: **palm rejection is not available on this machine**, and no amount
-   of configuration will produce it. The kernel's own fuzz values for
-   `ABS_MT_POSITION_X/Y` are 4 and are handed to libinput as `LIBINPUT_FUZZ_35`
-   and `LIBINPUT_FUZZ_36`, which is normal and not a problem.
+   of configuration will produce it.
 
 ### libwacom has no entry for 5091
 

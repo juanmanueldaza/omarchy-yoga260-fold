@@ -1,5 +1,13 @@
 # Yoga 260 Fold
 
+> **Lenovo ThinkPad Yoga 260 (20FE) only. It refuses every other machine.**
+> Install: `omarchy plugin add https://github.com/juanmanueldaza/omarchy-yoga260-fold --enable`
+> Remove: `omarchy plugin remove juanmanueldaza.yoga260-fold` plus `omarchy-yoga260-fold libwacom remove`
+> Runs unsandboxed inside omarchy-shell. No root for the daemon; sudo only if you explicitly run `hwdb apply`.
+> Does not ship an on-screen keyboard (optional companion below).
+> A hand turn locks rotation on; restore with `rotate normal` then `lock off`.
+> Installs mutable upstream HEAD, not the marketplace-reviewed commit — see "Marketplace snapshot" below.
+
 Tablet mode and auto-rotation for the **Lenovo ThinkPad Yoga 260 (20FE)** on
 Omarchy, built on the machine's hinge-angle sensor.
 
@@ -125,6 +133,13 @@ the Fold panel's keyboard button only appears when a keyboard plugin is installe
 omarchy plugin add https://github.com/abdxdev/omarchy-onscreen-keyboard --enable
 ```
 
+## Marketplace snapshot
+
+Marketplace verification covers the exact approved commit. `omarchy plugin add`
+and `omarchy plugin update` pull the branch HEAD, which the marketplace shows as
+`Update unverified` until a newer commit is verified — the installed code and
+the reviewed snapshot can differ, so check the listing before trusting an update.
+
 ## What it does
 
 - **Follows the machine, in every pose it can see.** Rotate it and the screen
@@ -232,6 +247,7 @@ $fold keyboard toggle   # the on-screen keyboard
 $fold libwacom status
 $fold hwdb show     # the systemd sensor entry, not applied
 $fold hwdb apply    # and write it, which wants sudo
+$fold hwdb remove   # undo the above: delete the entry, which wants sudo
 $fold record        # every sensor reading to a JSONL file, live
 $fold analyze       # summarise what `record` wrote
 $fold daemon        # the watcher itself; the shell starts this for you
@@ -269,7 +285,7 @@ manifest.json                     the plugin contract
 Service.qml                       mounts the daemon once, owns the state
 Fold.qml                          the bar button and its panel
 bin/omarchy-yoga260-fold          the daemon and CLI, Python 3, no dependencies
-tests/                            311 tests + subtests; the arithmetic is the point
+tests/                            328 tests + 16 subtests; the arithmetic is the point
 docs/hardware.md                  this machine, in the detail it deserves
 docs/calibration.md               how to confirm it by hand
 ```
