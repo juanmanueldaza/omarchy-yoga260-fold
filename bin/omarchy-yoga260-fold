@@ -3179,7 +3179,43 @@ def hwdb_apply(matrix: Sequence[Sequence[float]], *, yes: bool) -> int:
     return 0
 
 
+def hwdb_remove(*, yes: bool) -> int:
+    target = HWDB_LOCAL
+    if not target.exists():
+        print(f"{target} is not present; nothing to remove")
+        return 0
+    if os.geteuid() == 0:
+        target.unlink()
+    elif shutil.which("sudo") and yes:  # pragma: no cover
+        done = subprocess.run(  # pragma: no cover
+            ["sudo", "rm", str(target)], capture_output=True, timeout=30, check=False
+        )
+        if done.returncode != 0:  # pragma: no cover
+            print(done.stderr.decode(), file=sys.stderr)  # pragma: no cover
+            return done.returncode  # pragma: no cover
+    else:
+        print(  # pragma: no cover
+            "This needs root. Remove it yourself:\n"
+            f"\n  sudo rm {target}\n"
+            "  sudo systemd-hwdb update\n"
+            "  sudo udevadm trigger -v -p DEVNAME=/dev/iio:device0\n",
+            file=sys.stderr,
+        )
+        return 2  # pragma: no cover
+    subprocess.run(["systemd-hwdb", "update"], capture_output=True, timeout=120, check=False)
+    subprocess.run(
+        ["udevadm", "trigger", "-v", "-p", "DEVNAME=/dev/iio:device0"],
+        capture_output=True,
+        timeout=60,
+        check=False,
+    )
+    print(f"removed {target} and refreshed the hwdb")
+    return 0
+
+
 def cmd_hwdb(settings: dict[str, Any], action: str, yes: bool) -> int:
+    if action == "remove":
+        return hwdb_remove(yes=yes)
     matrix = settings["mountMatrix"]
     if action == "show":
         print(hwdb_show(matrix))
@@ -3607,7 +3643,7 @@ def build_parser() -> argparse.ArgumentParser:
     lib.add_argument("action", choices=["status", "install", "remove"])
 
     hwdb = sub.add_parser("hwdb", help="the systemd sensor mount matrix")
-    hwdb.add_argument("action", choices=["show", "apply"])
+    hwdb.add_argument("action", choices=["show", "apply", "remove"])
     hwdb.add_argument("--yes", action="store_true", help="allow sudo")
 
     rec = sub.add_parser("record", help="write every sensor reading to a file, live")

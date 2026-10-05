@@ -3010,6 +3010,34 @@ class HwdbTests(unittest.TestCase):
                 os.geteuid = real_geteuid
                 fold.HWDB_LOCAL, fold.subprocess.run = real_local, real_run
 
+    def test_hwdb_remove_root(self):
+        with tempfile.TemporaryDirectory() as td:
+            real_local, real_run = fold.HWDB_LOCAL, fold.subprocess.run
+            fold.HWDB_LOCAL = Path(td) / "61-sensor-local.hwdb"
+            fold.HWDB_LOCAL.write_text("stale entry\n")
+            recorder = MagicMock(return_value=MagicMock(returncode=0))
+            fold.subprocess.run = recorder
+            real_geteuid = os.geteuid
+            os.geteuid = lambda: 0
+            try:
+                self.assertEqual(fold.hwdb_remove(yes=False), 0)
+                self.assertFalse(fold.HWDB_LOCAL.exists())
+                ran = [c.args[0] for c in recorder.call_args_list]
+                self.assertIn(["systemd-hwdb", "update"], ran)
+                self.assertEqual(ran[-1][:2], ["udevadm", "trigger"])
+            finally:
+                os.geteuid = real_geteuid
+                fold.HWDB_LOCAL, fold.subprocess.run = real_local, real_run
+
+    def test_hwdb_remove_absent_is_a_noop(self):
+        with tempfile.TemporaryDirectory() as td:
+            real_local = fold.HWDB_LOCAL
+            fold.HWDB_LOCAL = Path(td) / "61-sensor-local.hwdb"
+            try:
+                self.assertEqual(fold.hwdb_remove(yes=False), 0)
+            finally:
+                fold.HWDB_LOCAL = real_local
+
 
 class Settings(unittest.TestCase):
     def setUp(self):
