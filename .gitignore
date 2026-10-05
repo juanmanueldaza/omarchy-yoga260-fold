@@ -5,6 +5,7 @@ __pycache__/
 .codebase-memory/
 
 # N3RV — NEVER COMMIT (template-controlled)
+constitution.md
 .n3rv/
 .opencode/
 .githooks/
