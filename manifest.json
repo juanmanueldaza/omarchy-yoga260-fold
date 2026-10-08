@@ -4,7 +4,7 @@
   "name": "Yoga 260 Fold",
   "version": "1.0.0",
   "author": "juanmanueldaza",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "description": "Tablet mode and auto-rotation for the Lenovo ThinkPad Yoga 260, driven by the machine's hinge-angle sensor instead of a tablet-mode switch it does not have.",
   "kinds": [
     "service",

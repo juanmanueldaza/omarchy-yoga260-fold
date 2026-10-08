@@ -292,4 +292,4 @@ docs/calibration.md               how to confirm it by hand
 
 ## License
 
-MIT.
+Apache-2.0. See [LICENSE](LICENSE).
