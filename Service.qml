@@ -22,6 +22,9 @@ Item {
   // so the panel hides controls the CLI would refuse anyway.
   property bool manualRotateAllowed: false
   property string mode: "book"
+  // The last failed panel/device write. Status has always carried it; the bar
+  // used to drop it, so a failed turn or key change looked like a success.
+  property string lastError: ""
   property string orientationLabel: "landscape"
   // Flat enough that the accelerometer is blind to rotation in the plane of the
   // screen, so the panel says it cannot tell instead of naming a direction.
@@ -102,6 +105,7 @@ Item {
     root.orientationLabel = state.orientationLabel || ""
     root.flat = state.flat === true
     root.messages = state.messages || []
+    root.lastError = state.lastError || ""
     root.tilt = state.tiltDeg || {}
     root.osk = data.osk && data.osk.installed ? data.osk
       : { installed: [], drivable: false, auto: false, pluginId: "" }

@@ -2081,6 +2081,53 @@ class FingerprintReaderTests(unittest.TestCase):
         self._pam("polkit-1", "auth include system-auth\n")
         self.assertEqual(self._reader().pam_wired(), ["sudo"])
 
+    def test_a_commented_pam_entry_is_not_wired(self):
+        self._pam("sudo", "# auth sufficient pam_fprintd.so\n")
+        self._pam("polkit-1", "  # pam_fprintd.so disabled\n")
+        self.assertEqual(self._reader().pam_wired(), [])
+
+    def test_a_failed_probe_while_inactive_is_not_no_prints(self):
+        reader = self._reader()
+        mapping = self._healthy()
+        mapping[("systemctl", "is-enabled", "fprintd")] = (0, "static\n")
+        mapping[("systemctl", "is-active", "fprintd")] = (0, "inactive\n")
+        mapping[("fprintd-list", fold._current_user())] = (1, "")
+        with patch.object(fold.subprocess, "run", side_effect=self._run(mapping)):
+            report = reader.as_dict(probe=True, force=True)
+        self.assertFalse(report["ok"])
+        self.assertIn("did not answer", report["reason"])
+        self.assertNotIn("no fingerprints enrolled", report["reason"])
+
+    def test_no_prints_still_has_its_own_reason(self):
+        reader = self._reader()
+        mapping = self._healthy()
+        mapping[("fprintd-list", fold._current_user())] = (
+            0,
+            "found 1 devices\nNo fingerprints enrolled\n",
+        )
+        with patch.object(fold.subprocess, "run", side_effect=self._run(mapping)):
+            report = reader.as_dict(probe=True, force=True)
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["reason"], "no fingerprints enrolled")
+
+    def test_a_changed_devnum_is_unstable_transport(self):
+        reader = self._reader()
+        self._usb_device("1-1", "138a", "0090")
+        device = self.root / "usb" / "1-1"
+        (device / "devnum").write_text("004\n")
+        with patch.object(
+            fold.subprocess, "run", side_effect=self._run(self._healthy())
+        ):
+            first = reader.as_dict(force=True)
+            (device / "devnum").write_text("005\n")
+            second = reader.as_dict(force=True)
+        self.assertFalse(first["transport"]["unstable"])
+        self.assertEqual(second["transport"]["enumerations"], 1)
+        self.assertTrue(second["transport"]["unstable"])
+        self.assertIn("re-enumerated", second["reason"])
+        self.assertNotIn("no fingerprints enrolled", second["reason"])
+        self.assertFalse(second["ok"])
+
     def test_enrolled_none_while_masked(self):
         reader = self._reader()
         mapping = {
@@ -4702,6 +4749,77 @@ class ManualRotatePanelTests(unittest.TestCase):
             "root.manualRotateAllowed = state.manualRotateAllowed === true",
             self.service_qml,
         )
+
+
+class KeyboardBacklightTests(unittest.TestCase):
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.addCleanup(self.td.cleanup)
+        self.root = Path(self.td.name)
+
+    def _led(self, level="1", maximum="2"):
+        device = self.root / fold.KEYBOARD_BACKLIGHT_LED
+        device.mkdir(parents=True, exist_ok=True)
+        (device / "brightness").write_text(f"{level}\n")
+        (device / "max_brightness").write_text(f"{maximum}\n")
+
+    def test_reads_the_led_device_read_only(self):
+        self._led()
+        report = fold.keyboard_backlight(self.root)
+        self.assertEqual(report["device"], "tpacpi::kbd_backlight")
+        self.assertEqual(report["level"], 1)
+        self.assertEqual(report["max"], 2)
+        self.assertTrue(report["present"])
+
+    def test_a_missing_led_is_reported_not_raised(self):
+        report = fold.keyboard_backlight(self.root)
+        self.assertFalse(report["present"])
+        self.assertIsNone(report["level"])
+        self.assertIsNone(report["max"])
+
+    def test_bindings_are_filtered_to_the_backlight_keys(self):
+        hypr = MagicMock()
+        hypr.json.return_value = [
+            {"key": "XF86KbdBrightnessUp", "dispatcher": "__lua", "arg": "22"},
+            {"key": "XF86KbdLightOnOff", "dispatcher": "__lua", "arg": "26"},
+            {"key": "XF86KbdBrightnessDown", "dispatcher": "__lua", "arg": "24"},
+            {"key": "XF86AudioRaiseVolume", "dispatcher": "exec", "arg": "x"},
+        ]
+        result = fold.keyboard_backlight_bindings(hypr)
+        self.assertEqual(len(result), 3)
+        self.assertEqual(
+            {entry["key"] for entry in result},
+            {"XF86KbdBrightnessUp", "XF86KbdLightOnOff", "XF86KbdBrightnessDown"},
+        )
+        hypr.json.assert_called_once_with(["binds"])
+
+    def test_bindings_are_empty_when_hypr_is_unreachable(self):
+        hypr = MagicMock()
+        hypr.json.return_value = None
+        self.assertEqual(fold.keyboard_backlight_bindings(hypr), [])
+
+
+class DiagnosticPanelTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        root = SCRIPT.parent.parent
+        cls.service_qml = (root / "Service.qml").read_text()
+        cls.fold_qml = (root / "Fold.qml").read_text()
+        cls.script = SCRIPT.read_text()
+
+    def test_service_reads_last_error(self):
+        self.assertIn("property string lastError", self.service_qml)
+        self.assertIn("root.lastError = state.lastError", self.service_qml)
+
+    def test_fold_renders_last_error(self):
+        self.assertIn("readonly property string lastError", self.fold_qml)
+        self.assertIn("if (lastError) return lastError", self.fold_qml)
+        self.assertIn("text: root.lastError", self.fold_qml)
+
+    def test_backlight_is_published_in_status_and_doctor(self):
+        self.assertIn('"keyboardBacklight": keyboard_backlight()', self.script)
+        self.assertIn('"bindings": keyboard_backlight_bindings(hypr)', self.script)
+        self.assertNotIn("bindings", self.service_qml)
 
 
 class ReadTextTests(unittest.TestCase):

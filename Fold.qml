@@ -44,6 +44,7 @@ Panel {
   readonly property bool lockPointers: setting("lockPointers", true)
   readonly property bool oskAuto: setting("oskAuto", false)
   readonly property var messages: service ? service.messages : []
+  readonly property string lastError: service ? service.lastError : ""
   readonly property var tilt: service ? service.tilt : ({})
   readonly property var osk: service && service.osk ? service.osk
     : { installed: [], drivable: false, auto: false, pluginId: "" }
@@ -81,6 +82,7 @@ Panel {
     if (!supported) return blockedBy || "Not this model"
     if (daemonQuiet) return "The fold daemon has gone quiet"
     if (messages && messages.length > 0) return messages[0]
+    if (lastError) return lastError
     if (locked) return "Rotation locked"
     if (!hingeOk) return "Hinge sensor unsettled"
     if (flat) return "Flat · cannot tell which way it is turned"
@@ -338,6 +340,21 @@ Panel {
           textFormat: Text.PlainText
           wrapMode: Text.WordWrap
           text: root.messages.length > 0 ? root.messages[0] : ""
+          color: root.bar.foreground
+          opacity: 0.8
+          font.family: root.bar.fontFamily
+          font.pixelSize: Style.font.bodySmall
+        }
+
+        // A failed write is worth more than a silent success: the panel is
+        // where a person looks after a turn or a key toggle did not take.
+        Text {
+          visible: root.supported && root.lastError
+            && !(root.messages && root.messages.length > 0)
+          width: parent.width
+          textFormat: Text.PlainText
+          wrapMode: Text.WordWrap
+          text: root.lastError
           color: root.bar.foreground
           opacity: 0.8
           font.family: root.bar.fontFamily

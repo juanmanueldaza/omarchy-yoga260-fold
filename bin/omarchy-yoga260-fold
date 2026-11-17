@@ -56,6 +56,10 @@ SHELL_JSON = Path.home() / ".config" / "omarchy" / "shell.json"
 LIBWACOM_LOCAL = Path.home() / ".config" / "libwacom"
 LIBWACOM_ENTRY = LIBWACOM_LOCAL / "wacom-isdv4-5091.tablet"
 HWDB_LOCAL = Path("/etc/udev/hwdb.d/61-sensor-local.hwdb")
+# Read-only diagnostic. The fold plugin never controls the keyboard backlight:
+# the machine's Fn path and Omarchy's XF86Kbd bindings own that, and the link
+# between them is still unresolved.
+KEYBOARD_BACKLIGHT_LED = "tpacpi::kbd_backlight"
 
 # The settings that live in the plugin's inline shell.json entry, so the panel,
 # the keybindings and this daemon all read and write one place. SETTING_SPEC is
@@ -1905,6 +1909,37 @@ def _current_user() -> str | None:
         return None
 
 
+def keyboard_backlight(root: Path = Path("/sys/class/leds")) -> dict[str, Any]:
+    """The keyboard backlight's level, read from the LED class device only."""
+    device = root / KEYBOARD_BACKLIGHT_LED
+    level = read_int(device / "brightness")
+    maximum = read_int(device / "max_brightness")
+    return {
+        "device": KEYBOARD_BACKLIGHT_LED,
+        "level": level,
+        "max": maximum,
+        "present": level is not None and maximum is not None,
+    }
+
+
+def keyboard_backlight_bindings(hypr: Hyprland) -> list[dict[str, Any]]:
+    """The compositor bindings for the keyboard-backlight keys, read-only.
+
+    Doctor-only: this is a hyprctl round trip and has no place in the daemon's
+    streamed status pass. The keys are reported with their dispatcher and arg
+    so a missing or wrong binding can be told from a missing LED device.
+    """
+    data = hypr.json(["binds"])
+    if not isinstance(data, list):
+        return []
+    wanted = ("XF86KbdLightOnOff", "XF86KbdBrightnessUp", "XF86KbdBrightnessDown")
+    return [
+        {"key": entry.get("key"), "dispatcher": entry.get("dispatcher"), "arg": entry.get("arg")}
+        for entry in data
+        if isinstance(entry, dict) and entry.get("key") in wanted
+    ]
+
+
 class FingerprintReader:
     """Reports the Validity fingerprint stack, read-only.
 
@@ -1932,18 +1967,41 @@ class FingerprintReader:
         self.pam_root = Path("/etc/pam.d")
         self._cached: dict[str, Any] | None = None
         self._cached_at = 0.0
+        self._last_devnum: str | None = None
+        self._enumerations = 0
 
-    def sensor_present(self) -> bool:
+    def sensor_device(self) -> Path | None:
         try:
             devices = sorted(self.sysfs_root.iterdir())
         except OSError:
-            return False
+            return None
         for device in devices:
             if read_text(device / "idVendor") != FINGERPRINT_USB_VENDOR:
                 continue
             if read_text(device / "idProduct") == FINGERPRINT_USB_PRODUCT:
-                return True
-        return False
+                return device
+        return None
+
+    def sensor_present(self) -> bool:
+        return self.sensor_device() is not None
+
+    def _observe_transport(self, device: Path | None) -> tuple[str | None, str | None]:
+        """Count USB re-enumerations since this reader was created.
+
+        A reset gives the sensor a new devnum. There is no reset counter in
+        sysfs, so a changed devnum between observations is the whole signal;
+        the first reading only establishes the baseline.
+        """
+        if device is None:
+            return None, None
+        devnum = read_text(device / "devnum")
+        if devnum is None:
+            return str(device), None
+        devnum = devnum.strip()
+        if self._last_devnum is not None and devnum != self._last_devnum:
+            self._enumerations += 1
+        self._last_devnum = devnum
+        return str(device), devnum
 
     def _systemctl(self, *args: str) -> tuple[int, str]:
         try:
@@ -1967,7 +2025,12 @@ class FingerprintReader:
         wired = []
         for name in FINGERPRINT_PAM_FILES:
             text = read_text(self.pam_root / name)
-            if text is not None and "pam_fprintd.so" in text:
+            if text is None:
+                continue
+            active = [
+                line for line in text.splitlines() if not line.lstrip().startswith("#")
+            ]
+            if any("pam_fprintd.so" in line for line in active):
                 wired.append(name)
         return wired
 
@@ -2010,7 +2073,15 @@ class FingerprintReader:
             and now - self._cached_at < FINGERPRINT_CACHE_TTL
         ):
             return self._cached
-        present = self.sensor_present()
+        device = self.sensor_device()
+        present = device is not None
+        path, devnum = self._observe_transport(device)
+        transport: dict[str, Any] = {
+            "path": path,
+            "devnum": devnum,
+            "enumerations": self._enumerations,
+            "unstable": self._enumerations > 0,
+        }
         enabled_state, active_state = self.unit_states()
         pam = self.pam_wired()
         startable = enabled_state in ("enabled", "static")
@@ -2023,8 +2094,14 @@ class FingerprintReader:
             reason = f"fprintd unit is {enabled_state}"
         elif not pam:
             reason = "pam_fprintd is not wired into sudo, polkit or the lock screen"
+        elif transport["unstable"]:
+            reason = (
+                f"fingerprint sensor re-enumerated {self._enumerations} times on USB; "
+                "transport is unstable"
+            )
         report: dict[str, Any] = {
             "sensor": {"present": present, "usbId": FINGERPRINT_USB_ID},
+            "transport": transport,
             "service": {
                 "enabled": startable,
                 "active": active_state == "active",
@@ -2046,8 +2123,14 @@ class FingerprintReader:
             if not reason:
                 if fingers == 0:
                     reason = "no fingerprints enrolled"
-                elif fingers is None and active_state == "active":
-                    reason = "fprintd did not answer the enrollment probe"
+                elif fingers is None:
+                    # A static, inactive unit can fail the probe without ever
+                    # becoming active. That is a failed activation, not an
+                    # empty fingerprint database -- and ok used to stay true.
+                    reason = (
+                        "fprintd did not answer the enrollment probe"
+                        f" (unit {active_state})"
+                    )
                 report["ok"] = not reason
                 report["reason"] = reason
         else:
@@ -2855,6 +2938,7 @@ class FoldDaemon:
             # teardown resets the fingerprint USB device, so enrollment is
             # probed by `doctor` / `fingerprint`, never by this loop (#11).
             "fingerprint": self.fingerprint.as_dict(),
+            "keyboardBacklight": keyboard_backlight(),
             "mapping": {"options": list(MAPPINGS), "current": self.settings["mapping"]},
             "icons": ICONS,
             "orientationLabels": ORIENTATION_LABEL,
@@ -4204,6 +4288,10 @@ def cmd_doctor(settings: dict[str, Any]) -> int:
         "sensors": daemon.status()["sensor"],
         "libwacom": libwacom_status(),
         "fingerprint": daemon.fingerprint.as_dict(probe=True, force=True),
+        "keyboardBacklight": {
+            **keyboard_backlight(),
+            "bindings": keyboard_backlight_bindings(hypr),
+        },
         "blockedBy": daemon.blocking_reason(),
         "settings": load_settings()["mapping"],
         "shell": {"path": str(SHELL_JSON), "readable": shell_json_document() is not None,
