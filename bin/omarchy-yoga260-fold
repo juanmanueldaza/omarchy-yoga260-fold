@@ -78,6 +78,8 @@ SETTING_SPEC: dict[str, dict[str, Any]] = {
     "lockPointers": {"kind": "bool"},
     "oskAuto": {"kind": "bool"},
     "oskPlugin": {"kind": "str"},
+    "oskShowCommand": {"kind": "str"},
+    "oskHideCommand": {"kind": "str"},
     # The flat-case turn settings, so the one value that has to be confirmed by
     # hand on the machine -- which way a turn reads -- can be set from the command
     # line or the panel without editing this file.
@@ -1716,39 +1718,94 @@ class OnScreenKeyboard:
                 return entry  # pragma: no cover
         return self.installed()[0] if self.installed() else None
 
-    def toggle(self) -> dict[str, Any]:
+    def _run(self, command: str, plugin_id: str | None = None) -> dict[str, Any]:
+        """Run one OSK command, turning every expected failure into a result.
+
+        This is the single subprocess boundary for the keyboard. A missing
+        executable, a hanging command, a broken pipe and a command with
+        unbalanced quotes are all ordinary outcomes here, not exceptions that
+        may escape into the daemon loop or the CLI. Every failure carries a
+        reason so the caller can publish it rather than silently doing nothing.
+        """
+        # Parsed into argv rather than handed to a shell: the command comes
+        # from a manifest or from `oskCommand`, and running either through
+        # `shell=True` would mean manifest text gets shell interpretation.
+        try:
+            argv = shlex.split(command)
+        except ValueError as exc:  # unbalanced quotes
+            return {
+                "ok": False,
+                "reason": f"cannot parse command: {exc}",
+                "pluginId": plugin_id,
+            }
+        if not argv:
+            # Whitespace-only text is a valid free-form str setting, but it
+            # splits to no arguments and `subprocess.run([])` raises IndexError
+            # from inside Popen -- not an OSError or a SubprocessError, so it
+            # used to escape the daemon loop and the CLI.
+            return {
+                "ok": False,
+                "reason": "empty command",
+                "pluginId": plugin_id,
+            }
+        try:
+            run = subprocess.run(
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, ValueError, IndexError, subprocess.SubprocessError) as exc:
+            # A NUL byte in a command makes subprocess.run raise ValueError;
+            # neither it nor IndexError is a SubprocessError. Both are ordinary
+            # bad-input outcomes here, never exceptions for a caller to catch.
+            return {
+                "ok": False,
+                "reason": str(exc),
+                "pluginId": plugin_id,
+            }
+        return {
+            "ok": run.returncode == 0,
+            "pluginId": plugin_id,
+            "output": (run.stdout + run.stderr).strip()[:400],
+        }
+
+    def _command_for(self, entry: dict[str, Any], action: str) -> str | None:
+        """Pick the command for one action, falling back to the plugin toggle.
+
+        A dedicated show/hide setting wins when it is configured. When it is
+        empty, the plugin's single toggle command is used so a default install
+        keeps working: an explicit show or hide is better than nothing even if
+        the plugin can only toggle.
+        """
+        if action == "show":
+            return self.settings.get("oskShowCommand") or entry.get("command")
+        if action == "hide":
+            return self.settings.get("oskHideCommand") or entry.get("command")
+        return entry.get("command")
+
+    def _act(self, action: str) -> dict[str, Any]:
         entry = self.target()
         if entry is None:
             return {"ok": False, "reason": "no on-screen keyboard plugin found"}
-        if not entry.get("command"):  # pragma: no cover
+        command = self._command_for(entry, action)
+        if not command:  # pragma: no cover
             return {  # pragma: no cover
                 "ok": False,
                 "reason": f"{entry['id']} has no known show/hide command",
                 "pluginId": entry["id"],
             }
-        # Parsed into argv rather than handed to a shell: the command comes
-        # from a manifest or from `oskCommand`, and running either through
-        # `shell=True` would mean manifest text gets shell interpretation.
-        try:  # pragma: no cover
-            argv = shlex.split(entry["command"])  # pragma: no cover
-        except ValueError as exc:  # unbalanced quotes  # pragma: no cover
-            return {  # pragma: no cover
-                "ok": False,
-                "reason": f"cannot parse command: {exc}",
-                "pluginId": entry["id"],
-            }
-        run = subprocess.run(  # pragma: no cover
-            argv,
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-        return {  # pragma: no cover
-            "ok": run.returncode == 0,
-            "pluginId": entry["id"],
-            "output": (run.stdout + run.stderr).strip()[:400],
-        }
+        return self._run(command, entry["id"])
+
+    def show(self) -> dict[str, Any]:
+        return self._act("show")
+
+    def hide(self) -> dict[str, Any]:
+        return self._act("hide")
+
+    def toggle(self) -> dict[str, Any]:
+        return self._act("toggle")
 
     def is_shown(self) -> bool | None:
         """Whether the preferred keyboard is currently visible.
@@ -1769,7 +1826,11 @@ class OnScreenKeyboard:
                 timeout=10,
                 check=False,
             )
-        except (OSError, ValueError):
+        except (OSError, ValueError, subprocess.SubprocessError):
+            # A hanging `omarchy-shell osk state` raises TimeoutExpired, which
+            # is a SubprocessError, not a ValueError. Unknown visibility is a
+            # valid answer here -- the unfold path hides blind on None -- so a
+            # timeout must not take the whole daemon down.
             return None
         if run.returncode != 0:
             return None
@@ -2788,6 +2849,21 @@ class FoldDaemon:
 
     # -- main loop --------------------------------------------------------
 
+    @staticmethod
+    def _osk_error(result: dict[str, Any]) -> str:
+        """The human-readable reason from a structured OSK result.
+
+        A structured failure carries `reason`; a command that ran and exited
+        nonzero carries `output` instead. Either is worth showing, and a result
+        with neither still gets a non-empty message rather than clearing a real
+        error with an empty string.
+        """
+        return str(
+            result.get("reason")
+            or result.get("output")
+            or "on-screen keyboard command failed"
+        )
+
     def step(self, pose: dict[str, Any] | None = None) -> bool:
         """One pass. Returns True when the reported status changed."""
         # Read the settings first, every pass. A tap in the panel and a turn
@@ -2945,20 +3021,38 @@ class FoldDaemon:
 
         if fold_trusted:
             if mode == "tablet" and self.settings.get("oskAuto") and not self.state.osk_asked:
-                self.state.osk_asked = True
-                self.osk.toggle()
+                # The latch means "a show was actually asked for and happened".
+                # Setting it before the call made a failed show look successful:
+                # no retry on the next tablet pass, and a blind hide on unfold
+                # that could summon a board the user never saw. Only a success
+                # latches; a failure is published and the next pass tries again.
+                result = self.osk.show()
+                if result.get("ok"):
+                    self.state.osk_asked = True
+                else:
+                    self.state.last_error = self._osk_error(result)
             elif mode != "tablet":
                 shown = self.osk.is_shown()
                 if self.state.osk_asked and shown is not False:
                     # Unfolding hides what auto-show summoned. When visibility is
-                    # known hidden the toggle is skipped; when it is unknown (a
-                    # board with no state query) the toggle fires blind -- correct
+                    # known hidden the hide is skipped; when it is unknown (a
+                    # board with no state query) the hide fires blind -- correct
                     # for the common flow (unfold with the board still up), wrong
                     # in the rare one (dismissed by hand, then unfolded, so it
                     # comes back). There is no signal to tell them apart; the
                     # common flow wins, and the bar icon dismisses the mistake.
-                    self.osk.toggle()
-                self.state.osk_asked = False
+                    result = self.osk.hide()
+                    if result.get("ok"):
+                        self.state.osk_asked = False
+                    else:
+                        # Keep the latch so a later pass can try the hide again.
+                        # The loop gate keeps this from hammering a dead command
+                        # ten times a second on a machine that is not moving.
+                        self.state.last_error = self._osk_error(result)
+                elif self.state.osk_asked:
+                    # Known hidden: there is nothing to hide, but the show did
+                    # succeed, so the latch is finished either way.
+                    self.state.osk_asked = False
 
         # The pass has now consumed these. A key that this pass could not
         # satisfy (a failed device write, an incomplete rotation) was never in
@@ -4384,8 +4478,14 @@ def cmd_keyboard(settings: dict[str, Any], action: str) -> int:
             file=sys.stderr,
         )
         return 1
-    print(json.dumps(osk.toggle()))  # pragma: no cover
-    return 0  # pragma: no cover
+    actions = {"show": osk.show, "hide": osk.hide, "toggle": osk.toggle}
+    run = actions.get(action)
+    if run is None:
+        print(f"Unknown on-screen keyboard action: {action}", file=sys.stderr)
+        return 1
+    result = run()
+    print(json.dumps(result))
+    return 0 if result.get("ok") else 1
 
 
 def cmd_setting(settings: dict[str, Any], name: str, value: str | None) -> int:
