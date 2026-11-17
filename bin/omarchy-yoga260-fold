@@ -3597,7 +3597,11 @@ def calibrate(args: argparse.Namespace) -> int:
         if not is_rotation(matrix):  # pragma: no cover
             print("   That matrix is not a rotation; refusing to write it.", file=sys.stderr)  # pragma: no cover
             return 1  # pragma: no cover
-        write_shell_entry({"mountMatrix": matrix})  # pragma: no cover
+        if not write_shell_entry({"mountMatrix": matrix}):  # pragma: no cover
+            print(  # pragma: no cover
+                f"   Could not write mountMatrix into {SHELL_JSON}.", file=sys.stderr
+            )
+            return 1  # pragma: no cover
         print(f"   wrote mountMatrix {matrix} into {SHELL_JSON}")  # pragma: no cover
     else:
         print(f"   current mount matrix: {[list(r) for r in accel.matrix]}")  # pragma: no cover
