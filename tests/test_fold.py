@@ -3819,13 +3819,44 @@ class LibwacomTests(unittest.TestCase):
 
 
 class HwdbTests(unittest.TestCase):
+    MATRIX: ClassVar[list[list[float]]] = [
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+    ]
+
+    @staticmethod
+    def _accel(number: int = 1) -> Path:
+        return Path(f"/sys/bus/iio/devices/iio:device{number}")
+
+    @staticmethod
+    def _enter_root(td):
+        saved = (fold.HWDB_LOCAL, fold.subprocess.run, os.geteuid)
+        fold.HWDB_LOCAL = Path(td) / "61-sensor-local.hwdb"
+        os.geteuid = lambda: 0
+        return saved
+
+    @staticmethod
+    def _restore(saved):
+        fold.HWDB_LOCAL, fold.subprocess.run, os.geteuid = saved
+
     def test_hwdb_body(self):
-        body = fold.hwdb_body([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+        body = fold.hwdb_body(self.MATRIX)
         self.assertIn("ACCEL_MOUNT_MATRIX", body)
 
     def test_hwdb_show(self):
-        s = fold.hwdb_show([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+        s = fold.hwdb_show(self.MATRIX)
         self.assertIn("ACCEL_MOUNT_MATRIX", s)
+
+    def test_hwdb_show_uses_the_discovered_accelerometer(self):
+        s = fold.hwdb_show(self.MATRIX, self._accel(1))
+        self.assertIn("DEVNAME=/dev/iio:device1", s)
+        self.assertNotIn("/dev/iio:device0", s)
+
+    def test_hwdb_show_without_an_accelerometer_never_guesses(self):
+        s = fold.hwdb_show(self.MATRIX, None)
+        self.assertIn("deviceN", s)
+        self.assertNotIn("/dev/iio:device0", s)
 
     def test_hwdb_apply_root(self):
         # This used to fake `os.geteuid() == 0` and let the real thing run, so it
@@ -3834,43 +3865,36 @@ class HwdbTests(unittest.TestCase):
         # machine runs the suite. The write goes to a temporary path and the two
         # commands are recorded instead of executed.
         with tempfile.TemporaryDirectory() as td:
-            real_local, real_run = fold.HWDB_LOCAL, fold.subprocess.run
-            fold.HWDB_LOCAL = Path(td) / "61-sensor-local.hwdb"
+            saved = self._enter_root(td)
             recorder = MagicMock(return_value=MagicMock(returncode=0))
             fold.subprocess.run = recorder
-            real_geteuid = os.geteuid
-            os.geteuid = lambda: 0
             try:
-                rc = fold.hwdb_apply(
-                    [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], yes=False
-                )
+                rc = fold.hwdb_apply(self.MATRIX, yes=False, accel=self._accel())
                 self.assertEqual(rc, 0)
                 self.assertIn("ACCEL_MOUNT_MATRIX", fold.HWDB_LOCAL.read_text())
                 ran = [c.args[0] for c in recorder.call_args_list]
                 self.assertIn(["systemd-hwdb", "update"], ran)
                 self.assertEqual(ran[-1][:2], ["udevadm", "trigger"])
+                self.assertIn("DEVNAME=/dev/iio:device1", ran[-1])
+                self.assertNotIn("device0", " ".join(" ".join(argv) for argv in ran))
             finally:
-                os.geteuid = real_geteuid
-                fold.HWDB_LOCAL, fold.subprocess.run = real_local, real_run
+                self._restore(saved)
 
     def test_hwdb_remove_root(self):
         with tempfile.TemporaryDirectory() as td:
-            real_local, real_run = fold.HWDB_LOCAL, fold.subprocess.run
-            fold.HWDB_LOCAL = Path(td) / "61-sensor-local.hwdb"
+            saved = self._enter_root(td)
             fold.HWDB_LOCAL.write_text("stale entry\n")
             recorder = MagicMock(return_value=MagicMock(returncode=0))
             fold.subprocess.run = recorder
-            real_geteuid = os.geteuid
-            os.geteuid = lambda: 0
             try:
-                self.assertEqual(fold.hwdb_remove(yes=False), 0)
+                self.assertEqual(fold.hwdb_remove(yes=False, accel=self._accel()), 0)
                 self.assertFalse(fold.HWDB_LOCAL.exists())
                 ran = [c.args[0] for c in recorder.call_args_list]
                 self.assertIn(["systemd-hwdb", "update"], ran)
                 self.assertEqual(ran[-1][:2], ["udevadm", "trigger"])
+                self.assertIn("DEVNAME=/dev/iio:device1", ran[-1])
             finally:
-                os.geteuid = real_geteuid
-                fold.HWDB_LOCAL, fold.subprocess.run = real_local, real_run
+                self._restore(saved)
 
     def test_hwdb_remove_absent_is_a_noop(self):
         with tempfile.TemporaryDirectory() as td:
@@ -3880,6 +3904,94 @@ class HwdbTests(unittest.TestCase):
                 self.assertEqual(fold.hwdb_remove(yes=False), 0)
             finally:
                 fold.HWDB_LOCAL = real_local
+
+    def test_hwdb_refresh_reports_a_failing_hwdb_update(self):
+        calls: list[list[str]] = []
+
+        def run(argv, **_kwargs):
+            calls.append(list(argv))
+            return MagicMock(returncode=3 if argv[0] == "systemd-hwdb" else 0)
+
+        with (
+            patch.object(fold.subprocess, "run", side_effect=run),
+            contextlib.redirect_stderr(io.StringIO()) as err,
+        ):
+            self.assertFalse(fold.hwdb_refresh(self._accel()))
+        self.assertEqual(len(calls), 2, "a failed update must not suppress the trigger")
+        self.assertIn("systemd-hwdb failed with exit 3", err.getvalue())
+
+    def test_hwdb_refresh_reports_a_failing_trigger(self):
+        def run(argv, **_kwargs):
+            return MagicMock(returncode=4 if argv[0] == "udevadm" else 0)
+
+        with (
+            patch.object(fold.subprocess, "run", side_effect=run),
+            contextlib.redirect_stderr(io.StringIO()) as err,
+        ):
+            self.assertFalse(fold.hwdb_refresh(self._accel()))
+        self.assertIn("udevadm failed with exit 4", err.getvalue())
+
+    def test_hwdb_refresh_without_an_accelerometer_skips_the_trigger(self):
+        calls: list[list[str]] = []
+
+        def run(argv, **_kwargs):
+            calls.append(list(argv))
+            return MagicMock(returncode=0)
+
+        with (
+            patch.object(fold.subprocess, "run", side_effect=run),
+            contextlib.redirect_stderr(io.StringIO()) as err,
+        ):
+            self.assertTrue(fold.hwdb_refresh(None))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0], ["systemd-hwdb", "update"])
+        self.assertIn("no accelerometer", err.getvalue())
+
+    def test_hwdb_refresh_reports_an_exception_as_a_failure(self):
+        with (
+            patch.object(fold.subprocess, "run", side_effect=OSError("boom")),
+            contextlib.redirect_stderr(io.StringIO()) as err,
+        ):
+            self.assertFalse(fold.hwdb_refresh(self._accel()))
+        self.assertIn("systemd-hwdb failed: boom", err.getvalue())
+
+    def test_hwdb_apply_returns_nonzero_when_refresh_fails(self):
+        with tempfile.TemporaryDirectory() as td:
+            saved = self._enter_root(td)
+            recorder = MagicMock(return_value=MagicMock(returncode=3))
+            fold.subprocess.run = recorder
+            try:
+                with (
+                    contextlib.redirect_stderr(io.StringIO()) as err,
+                    contextlib.redirect_stdout(io.StringIO()) as out,
+                ):
+                    rc = fold.hwdb_apply(self.MATRIX, yes=False, accel=self._accel())
+                self.assertNotEqual(rc, 0)
+                self.assertIn("systemd-hwdb failed", err.getvalue())
+                self.assertNotIn("refreshed the hwdb", out.getvalue())
+            finally:
+                self._restore(saved)
+
+    def test_hwdb_remove_returns_nonzero_when_trigger_fails(self):
+        with tempfile.TemporaryDirectory() as td:
+            saved = self._enter_root(td)
+            fold.HWDB_LOCAL.write_text("stale entry\n")
+            codes = iter([0, 4])
+            recorder = MagicMock(
+                side_effect=lambda *_a, **_k: MagicMock(returncode=next(codes))
+            )
+            fold.subprocess.run = recorder
+            try:
+                with (
+                    contextlib.redirect_stderr(io.StringIO()) as err,
+                    contextlib.redirect_stdout(io.StringIO()) as out,
+                ):
+                    rc = fold.hwdb_remove(yes=False, accel=self._accel())
+                self.assertNotEqual(rc, 0)
+                self.assertIn("udevadm failed with exit 4", err.getvalue())
+                self.assertNotIn("refreshed the hwdb", out.getvalue())
+            finally:
+                self._restore(saved)
 
 
 class Settings(unittest.TestCase):
@@ -4384,9 +4496,117 @@ class SensorRateTests(unittest.TestCase):
 
 
 class FindIioDeviceTests(unittest.TestCase):
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.real_root = fold.IIO_ROOT
+        self.backing = Path(self.td.name) / "devices"
+        self.backing.mkdir()
+        fold.IIO_ROOT = Path(self.td.name) / "by-path"
+        fold.IIO_ROOT.mkdir()
+
+    def tearDown(self):
+        fold.IIO_ROOT = self.real_root
+        self.td.cleanup()
+
+    def _device(self, number: int, name: str, collection: str | None = "4") -> Path:
+        # Mirror sysfs: the entry under /sys/bus/iio/devices is a symlink into
+        # the HID hub, and the collection is part of the resolved target path.
+        parent = self.backing
+        if collection is not None:
+            parent = parent / f"HID-SENSOR-200076.{collection}.auto"
+        target = parent / f"iio:device{number}"
+        target.mkdir(parents=True)
+        (target / "name").write_text(f"{name}\n")
+        entry = fold.IIO_ROOT / f"iio:device{number}"
+        entry.symlink_to(target, target_is_directory=True)
+        return entry
+
     def test_find_iio_device_none(self):
         result = fold.find_iio_device("nonexistent_device_xyz")
         self.assertIsNone(result)
+
+    def test_without_collection_the_first_numbered_match_still_wins(self):
+        first = self._device(4, "gyro_3d", "4")
+        self._device(5, "gyro_3d", "8")
+        self.assertEqual(fold.find_iio_device("gyro_3d"), first)
+
+    def test_collection_wins_when_it_sorts_after_the_other_gyro(self):
+        self._device(4, "gyro_3d", "8")
+        wanted = self._device(5, "gyro_3d", "4")
+        self.assertEqual(fold.find_iio_device("gyro_3d", "4"), wanted)
+
+    def test_collection_wins_when_it_sorts_before_the_other_gyro(self):
+        wanted = self._device(4, "gyro_3d", "4")
+        self._device(5, "gyro_3d", "8")
+        self.assertEqual(fold.find_iio_device("gyro_3d", "4"), wanted)
+
+    def test_an_integer_collection_is_accepted(self):
+        self._device(4, "gyro_3d", "8")
+        wanted = self._device(5, "gyro_3d", "4")
+        self.assertEqual(fold.find_iio_device("gyro_3d", 4), wanted)
+
+    def test_a_lone_candidate_is_used_even_when_its_collection_differs(self):
+        only = self._device(4, "gyro_3d", "8")
+        self.assertEqual(fold.find_iio_device("gyro_3d", "4"), only)
+
+    def test_an_unmatched_collection_among_several_candidates_refuses(self):
+        self._device(4, "gyro_3d", "4")
+        self._device(5, "gyro_3d", "8")
+        self.assertIsNone(fold.find_iio_device("gyro_3d", "9"))
+
+    def test_a_missing_or_unparsable_collection_never_raises(self):
+        # One resolved path with no HID-SENSOR token, and one entry that is a
+        # plain directory rather than the sysfs symlink. Both are "no collection".
+        self._device(4, "gyro_3d", None)
+        plain = self.backing / "iio:device5"
+        plain.mkdir()
+        (plain / "name").write_text("gyro_3d\n")
+        (fold.IIO_ROOT / "iio:device5").symlink_to(plain, target_is_directory=True)
+        self.assertIsNone(fold.find_iio_device("gyro_3d", "4"))
+
+    def test_the_calibrated_collection_is_visible_from_a_real_symlink(self):
+        entry = self._device(4, "gyro_3d", "4")
+        self.assertEqual(fold.iio_collection(entry), "4")
+
+
+class GyroSelectionTests(unittest.TestCase):
+    def test_the_daemon_requests_the_calibrated_collection(self):
+        seen: list[tuple[str, object]] = []
+
+        def fake(name, collection=None):
+            seen.append((name, collection))
+
+        settings = fold.load_settings()
+        hypr = MagicMock()
+        hypr.device_names.return_value = {
+            key: [] for key in ("touch", "pen", "pointer", "keyboard", "touchpad")
+        }
+        with (
+            patch.object(fold, "Machine"),
+            patch.object(fold, "Hyprland", return_value=hypr),
+            patch.object(fold, "OnScreenKeyboard"),
+            patch.object(fold, "FingerprintReader"),
+            patch.object(fold, "find_iio_device", side_effect=fake),
+        ):
+            fold.FoldDaemon(settings)
+        self.assertIn((settings["gyroName"], "4"), seen)
+
+    def test_a_settings_dict_without_the_key_still_builds_a_daemon(self):
+        settings = fold.load_settings()
+        settings.pop("gyroCollection", None)
+        hypr = MagicMock()
+        hypr.device_names.return_value = {
+            key: [] for key in ("touch", "pen", "pointer", "keyboard", "touchpad")
+        }
+        with (
+            patch.object(fold, "Machine"),
+            patch.object(fold, "Hyprland", return_value=hypr),
+            patch.object(fold, "OnScreenKeyboard"),
+            patch.object(fold, "FingerprintReader"),
+            patch.object(fold, "find_iio_device", return_value=None),
+        ):
+            daemon = fold.FoldDaemon(settings)
+        self.assertFalse(daemon.motion.available)
 
 
 class ReadTextTests(unittest.TestCase):

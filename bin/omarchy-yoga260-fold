@@ -125,6 +125,10 @@ DEFAULTS = {
     "accelName": "accel_3d",
     "hingeName": "hinge",
     "gyroName": "gyro_3d",
+    # Two `gyro_3d` nodes exist on this chassis: HID collection .4 and .8.
+    # Only .4 was calibrated against the 9 deg/s stillness gate; picking by
+    # device number would flip between them with probe order.
+    "gyroCollection": "4",
     # Fold angle in degrees, from the official Lenovo Yoga 260 user guide:
     #
     #   notebook  0° – 190°   laptop mode, keyboard on
@@ -548,20 +552,48 @@ IIO_ROOT = Path("/sys/bus/iio/devices")
 # cheerfully label itself with a threshold that had never run.
 COHERENT_BAND = (0.75, 1.30)
 
-def find_iio_device(name: str) -> Path | None:
-    """Locate an IIO device by its `name` file rather than by device number.
+def iio_collection(entry: Path) -> str | None:
+    """The HID collection id of an IIO device, e.g. '4' for HID-SENSOR-200076.4.
+
+    Two sensors on this machine share the name `gyro_3d`, and their device
+    numbers follow probe order. `/sys/bus/iio/devices/iio:deviceN` is a symlink
+    into the HID hub, and the resolved path carries the collection, e.g.
+    `.../HID-SENSOR-200076.4.auto/iio:device4`. There is no `device` child link
+    on these nodes and `modalias` is empty, so resolving the entry itself is the
+    only stable way to tell the two apart.
+    """
+    try:
+        target = str(entry.resolve())
+    except (OSError, RuntimeError):
+        return None
+    match = re.search(r"HID-SENSOR-[0-9A-Fa-f]+\.(\d+)", target)
+    return match.group(1) if match else None
+
+
+def find_iio_device(name: str, collection: str | int | None = None) -> Path | None:
+    """Locate an IIO device by its `name` file, optionally by HID collection.
 
     Probe order is not stable across boots, so a hardcoded iio:device3 is a
-    latent bug even when it works today.
+    latent bug even when it works today. A name match alone is not enough on a
+    machine with two `gyro_3d` nodes, so an exact collection match wins; a lone
+    candidate with no match is still usable, and ambiguity refuses to guess.
     """
     try:
         entries = sorted(IIO_ROOT.glob("iio:device*"))
     except OSError:  # pragma: no cover
         return None  # pragma: no cover
-    for entry in entries:
-        if (entry / "name").exists() and read_text(entry / "name") == name:
-            return entry
-    return None
+    candidates = [
+        entry
+        for entry in entries
+        if (entry / "name").exists() and read_text(entry / "name") == name
+    ]
+    if collection is None:
+        return candidates[0] if candidates else None
+    wanted = str(collection)
+    for candidate in candidates:
+        if iio_collection(candidate) == wanted:
+            return candidate
+    return candidates[0] if len(candidates) == 1 else None
 
 
 @dataclass
@@ -2133,7 +2165,7 @@ class FoldDaemon:
         # back to the identity and `vertical_rate` dotted a vector in the chip's
         # frame against a gravity vector in the base's.
         self.motion = Motion(
-            find_iio_device(settings["gyroName"]),
+            find_iio_device(settings["gyroName"], settings.get("gyroCollection")),
             settings["stillRotDeg"],
             settings["mountMatrix"],
         )
@@ -3539,26 +3571,75 @@ def hwdb_body(matrix: Sequence[Sequence[float]]) -> str:
     )
 
 
-def hwdb_show(matrix: Sequence[Sequence[float]]) -> str:
+def iio_devnode(device: Path | None) -> str | None:
+    """The char device that belongs to an IIO device directory, e.g. /dev/iio:device1."""
+    if device is None:
+        return None
+    match = re.fullmatch(r"iio:device(\d+)", device.name)
+    return f"/dev/iio:device{match.group(1)}" if match else None
+
+
+def hwdb_trigger_argv(accel: Path | None) -> list[str] | None:
+    """A target-specific udevadm trigger, or None when no accelerometer was found."""
+    devnode = iio_devnode(accel)
+    if devnode is None:
+        return None
+    return ["udevadm", "trigger", "-v", "-p", f"DEVNAME={devnode}"]
+
+
+def _hwdb_command(argv: list[str], *, timeout: int) -> bool:
+    """Run one refresh command and report its failure; never raise."""
+    name = argv[0]
+    try:
+        done = subprocess.run(argv, capture_output=True, timeout=timeout, check=False)
+    except (OSError, subprocess.SubprocessError) as error:
+        print(f"{name} failed: {error}", file=sys.stderr)
+        return False
+    if done.returncode != 0:
+        detail = (done.stderr or b"").decode(errors="replace").strip()
+        suffix = f": {detail}" if detail else ""
+        print(f"{name} failed with exit {done.returncode}{suffix}", file=sys.stderr)
+        return False
+    return True
+
+
+def hwdb_refresh(accel: Path | None) -> bool:
+    """Rebuild the hwdb and re-probe the accelerometer that was actually found."""
+    updated = _hwdb_command(["systemd-hwdb", "update"], timeout=120)
+    argv = hwdb_trigger_argv(accel)
+    if argv is None:
+        print(
+            "warning: no accelerometer found; skipped the udevadm trigger "
+            "(set DEVNAME to your IIO device by hand if needed)",
+            file=sys.stderr,
+        )
+        return updated
+    triggered = _hwdb_command(argv, timeout=60)
+    return updated and triggered
+
+
+def hwdb_show(matrix: Sequence[Sequence[float]], accel: Path | None = None) -> str:
+    argv = hwdb_trigger_argv(accel)
+    trigger = (
+        f"#   sudo {' '.join(argv)}"
+        if argv is not None
+        else "#   sudo udevadm trigger -v -p DEVNAME=/dev/iio:deviceN  # N = your accelerometer"
+    )
     return (
         f"# write to {HWDB_LOCAL}, then:\n"
         f"#   sudo systemd-hwdb update\n"
-        f"#   sudo udevadm trigger -v -p DEVNAME=/dev/iio:device0\n"
+        f"{trigger}\n"
         f"\n"
         f"{hwdb_body(matrix)}"
     )
 
 
-def hwdb_apply(matrix: Sequence[Sequence[float]], *, yes: bool) -> int:
-    if os.geteuid() == 0:
+def hwdb_apply(matrix: Sequence[Sequence[float]], *, yes: bool, accel: Path | None = None) -> int:
+    if os.geteuid() == 0 or (shutil.which("sudo") and yes):  # pragma: no cover
         target = HWDB_LOCAL
-        run = [str(target)]
-    elif shutil.which("sudo") and yes:  # pragma: no cover
-        target = HWDB_LOCAL  # pragma: no cover
-        run = ["sudo", "tee", str(target)]  # pragma: no cover
     else:
         print(  # pragma: no cover
-            f"This needs root. Review the entry and apply it yourself:\n\n{hwdb_show(matrix)}",
+            f"This needs root. Review the entry and apply it yourself:\n\n{hwdb_show(matrix, accel)}",
             file=sys.stderr,
         )
         return 2  # pragma: no cover
@@ -3572,22 +3653,19 @@ def hwdb_apply(matrix: Sequence[Sequence[float]], *, yes: bool) -> int:
         # it was reading, and it fed on its own output: 17.7 MB in three seconds
         # in a reproduction, running as root into /etc. `tee` already writes stdin
         # to every file it is given, which is the whole job.
-        done = subprocess.run(run, input=body, capture_output=True, timeout=30, check=False)  # pragma: no cover
+        done = subprocess.run(  # pragma: no cover
+            ["sudo", "tee", str(target)], input=body, capture_output=True, timeout=30, check=False
+        )
         if done.returncode != 0:  # pragma: no cover
             print(done.stderr.decode(), file=sys.stderr)  # pragma: no cover
             return done.returncode  # pragma: no cover
-    subprocess.run(["systemd-hwdb", "update"], capture_output=True, timeout=120, check=False)
-    subprocess.run(
-        ["udevadm", "trigger", "-v", "-p", "DEVNAME=/dev/iio:device0"],
-        capture_output=True,
-        timeout=60,
-        check=False,
-    )
+    if not hwdb_refresh(accel):
+        return 1
     print(f"wrote {target} and refreshed the hwdb")
     return 0
 
 
-def hwdb_remove(*, yes: bool) -> int:
+def hwdb_remove(*, yes: bool, accel: Path | None = None) -> int:
     target = HWDB_LOCAL
     if not target.exists():
         print(f"{target} is not present; nothing to remove")
@@ -3602,33 +3680,30 @@ def hwdb_remove(*, yes: bool) -> int:
             print(done.stderr.decode(), file=sys.stderr)  # pragma: no cover
             return done.returncode  # pragma: no cover
     else:
+        devnode = iio_devnode(accel) or "/dev/iio:deviceN"
         print(  # pragma: no cover
             "This needs root. Remove it yourself:\n"
             f"\n  sudo rm {target}\n"
             "  sudo systemd-hwdb update\n"
-            "  sudo udevadm trigger -v -p DEVNAME=/dev/iio:device0\n",
+            f"  sudo udevadm trigger -v -p DEVNAME={devnode}\n",
             file=sys.stderr,
         )
         return 2  # pragma: no cover
-    subprocess.run(["systemd-hwdb", "update"], capture_output=True, timeout=120, check=False)
-    subprocess.run(
-        ["udevadm", "trigger", "-v", "-p", "DEVNAME=/dev/iio:device0"],
-        capture_output=True,
-        timeout=60,
-        check=False,
-    )
+    if not hwdb_refresh(accel):
+        return 1
     print(f"removed {target} and refreshed the hwdb")
     return 0
 
 
 def cmd_hwdb(settings: dict[str, Any], action: str, yes: bool) -> int:
+    accel = find_iio_device(settings["accelName"])
     if action == "remove":
-        return hwdb_remove(yes=yes)
+        return hwdb_remove(yes=yes, accel=accel)
     matrix = settings["mountMatrix"]
     if action == "show":
-        print(hwdb_show(matrix))
+        print(hwdb_show(matrix, accel))
         return 0
-    return hwdb_apply(matrix, yes=yes)  # pragma: no cover
+    return hwdb_apply(matrix, yes=yes, accel=accel)  # pragma: no cover
 
 
 # --------------------------------------------------------------------------
