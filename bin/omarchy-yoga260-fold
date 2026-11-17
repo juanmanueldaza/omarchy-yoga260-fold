@@ -3059,7 +3059,7 @@ class FoldDaemon:
                         # re-disable them if the machine is still folded.
                         self.resolve_devices()
                         self.restore_devices()
-                        self.step()
+                        self.pending.add(PENDING_RESUME)
                     if self.poll_lock_state():
                         # A lock transition changes what `set_devices` must do,
                         # so it gets a full pass instead of waiting for the next
