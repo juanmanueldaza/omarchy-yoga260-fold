@@ -58,15 +58,36 @@ LIBWACOM_ENTRY = LIBWACOM_LOCAL / "wacom-isdv4-5091.tablet"
 HWDB_LOCAL = Path("/etc/udev/hwdb.d/61-sensor-local.hwdb")
 
 # The settings that live in the plugin's inline shell.json entry, so the panel,
-# the keybindings and this daemon all read and write one place.
-SETTING_KEYS = (
-    "mapping", "locked", "lockKeyboard", "lockPointers", "oskAuto", "oskPlugin",
-    "modeHystDeg",
+# the keybindings and this daemon all read and write one place. SETTING_SPEC is
+# the single source of truth: it names every writable key, its type and the
+# limits a value has to stay within. Both the CLI write (`cmd_setting`) and the
+# file read (`load_settings`) go through `validate_setting`, which reads this
+# table -- a panel or a hand-edited shell.json cannot smuggle a bad value past
+# one boundary and have it crash the next pass.
+MAPPINGS = ("standard", "portrait-swapped", "landscape-swapped", "rotated-180")
+
+# Wide by design: these are degrees and seconds a person might reasonably type,
+# not a tight band around the defaults. Only garbage, non-finite numbers and
+# absurd values are refused.
+_FLOAT_LIMITS: dict[str, Any] = {"kind": "float", "low": -1e6, "high": 1e6}
+
+SETTING_SPEC: dict[str, dict[str, Any]] = {
+    "mapping": {"kind": "enum", "choices": MAPPINGS},
+    "locked": {"kind": "bool"},
+    "lockKeyboard": {"kind": "bool"},
+    "lockPointers": {"kind": "bool"},
+    "oskAuto": {"kind": "bool"},
+    "oskPlugin": {"kind": "str"},
     # The flat-case turn settings, so the one value that has to be confirmed by
     # hand on the machine -- which way a turn reads -- can be set from the command
     # line or the panel without editing this file.
-    "yawSign", "yawDeadbandDeg", "yawQuarterDeg", "flatToleranceDeg",
-)
+    "modeHystDeg": dict(_FLOAT_LIMITS),
+    "yawSign": {"kind": "choice_int", "choices": (-1, 1)},
+    "yawDeadbandDeg": dict(_FLOAT_LIMITS),
+    "yawQuarterDeg": dict(_FLOAT_LIMITS),
+    "flatToleranceDeg": dict(_FLOAT_LIMITS),
+}
+SETTING_KEYS = tuple(SETTING_SPEC)
 
 
 # --------------------------------------------------------------------------
@@ -234,8 +255,6 @@ DEFAULTS = {
     "libwacomEntry": True,
 }
 
-MAPPINGS = ("standard", "portrait-swapped", "landscape-swapped", "rotated-180")
-
 # Work that cannot wait for the sensors to move. One set, with named keys, is
 # what opens the loop's gate on an otherwise idle machine -- six independent
 # booleans would be six more things that can silently drift out of sync.
@@ -296,6 +315,69 @@ def wrap180(degrees: float) -> float:
 def wrap360(degrees: float) -> float:
     wrapped = math.fmod(degrees, 360.0)
     return wrapped + 360.0 if wrapped < 0.0 else wrapped
+
+
+def validate_setting(name: str, value: Any) -> tuple[bool, Any, str]:
+    """Coerce a raw setting value to its declared type, without doing any I/O.
+
+    Returns `(ok, typed_value, error)`. On failure `typed_value` is None and
+    `error` is a sentence that names the key and what it expects, suitable for
+    printing verbatim at the CLI. The function never raises: every coercion is
+    guarded, because its inputs are a hand-edited JSON file and a typed string
+    at a shell prompt, and neither is trustworthy.
+    """
+    spec = SETTING_SPEC.get(name)
+    if spec is None:
+        return False, None, f"{name} is not a writable setting"
+
+    kind = spec["kind"]
+    choices = spec.get("choices", ())
+    try:
+        if kind == "bool":
+            if isinstance(value, bool):
+                return True, value, ""
+            if isinstance(value, int) and value in (0, 1):
+                return True, bool(value), ""
+            if isinstance(value, str):
+                token = value.strip().lower()
+                if token in ("1", "true", "on", "yes"):
+                    return True, True, ""
+                if token in ("0", "false", "off", "no"):
+                    return True, False, ""
+            return False, None, f"{name} must be true/false/1/0/on/off/yes/no"
+
+        if kind == "float":
+            number = float(value)
+            if not math.isfinite(number):
+                return False, None, f"{name} must be a finite number"
+            low, high = spec["low"], spec["high"]
+            if not low <= number <= high:
+                return False, None, f"{name} must be between {low} and {high}"
+            return True, number, ""
+
+        if kind == "choice_int":
+            # A float with a fraction is not an integer choice even though
+            # int() would happily truncate it.
+            if isinstance(value, float) and not value.is_integer():
+                return False, None, f"{name} must be one of {', '.join(map(str, choices))}"
+            number = int(value)
+            if number not in choices:
+                return False, None, f"{name} must be one of {', '.join(map(str, choices))}"
+            return True, number, ""
+
+        if kind == "enum":
+            if isinstance(value, str) and value in choices:
+                return True, value, ""
+            return False, None, f"{name} must be one of {', '.join(choices)}"
+
+        if kind == "str":
+            if isinstance(value, str):
+                return True, value, ""
+            return False, None, f"{name} must be a string"
+    except (TypeError, ValueError, OverflowError) as exc:
+        return False, None, f"{name} has an invalid value ({exc})"
+
+    return False, None, f"{name} has an unknown setting kind ({kind})"
 
 
 def dot(a: Sequence[float], b: Sequence[float]) -> float:
@@ -1541,7 +1623,13 @@ def load_settings(
         return result
     for key in SETTING_KEYS:
         if key in entry:
-            settings[key] = entry[key]
+            # shell.json is hand-editable and the panel writes straight into
+            # it, bypassing `cmd_setting`. Validate here too: a bare "false"
+            # from the file would be truthy in Python, and a garbage number
+            # would raise ValueError on the next pass that casts it with
+            # float(). Keep the default when the stored value cannot be used.
+            ok, typed, _ = validate_setting(key, entry[key])
+            settings[key] = typed if ok else DEFAULTS[key]
     # `mountMatrix` is not in SETTING_KEYS on purpose -- the `setting` command
     # takes strings and this is nine floats -- but `calibrate --write` writes
     # it here, so it has to be read back or the write is a no-op. Validated the
@@ -4266,9 +4354,10 @@ def cmd_setting(settings: dict[str, Any], name: str, value: str | None) -> int:
     if value is None:
         print(json.dumps({"name": name, "value": load_settings().get(name)}))
         return 0
-    parsed: Any = value
-    if isinstance(load_settings().get(name), bool):
-        parsed = value.lower() in ("1", "true", "on", "yes")  # pragma: no cover
+    ok, parsed, error = validate_setting(name, value)
+    if not ok:
+        print(f"Invalid setting: {error}", file=sys.stderr)
+        return 1
     if not write_shell_entry({name: parsed}):
         print("Could not write the setting; see `lock` for why.", file=sys.stderr)
         return 1
