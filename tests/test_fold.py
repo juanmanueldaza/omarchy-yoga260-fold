@@ -4822,6 +4822,119 @@ class DiagnosticPanelTests(unittest.TestCase):
         self.assertNotIn("bindings", self.service_qml)
 
 
+class CaptureToolTests(unittest.TestCase):
+    """The recorder's readers, with a fake sysfs tree and no hardware."""
+
+    @classmethod
+    def setUpClass(cls):
+        script = SCRIPT.parent.parent / "tools" / "capture-digitizer.py"
+        spec = importlib.util.spec_from_loader(
+            "capture", importlib.machinery.SourceFileLoader("capture", str(script))
+        )
+        cls.capture = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.capture)
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.addCleanup(self.td.cleanup)
+        self.root = Path(self.td.name)
+        self.real_root = self.capture.IIO_ROOT
+        self.capture.IIO_ROOT = self.root
+        self.addCleanup(self._restore_root)
+
+    def _restore_root(self):
+        self.capture.IIO_ROOT = self.real_root
+
+    def _device(self, number, name):
+        device = self.root / f"iio:device{number}"
+        device.mkdir()
+        (device / "name").write_text(f"{name}\n")
+        return device
+
+    def test_iio_device_is_found_by_name_not_number(self):
+        self._device(4, "gyro_3d")
+        wanted = self._device(9, "hinge")
+        self.assertEqual(self.capture.iio_device("hinge"), wanted)
+        self.assertIsNone(self.capture.iio_device("accel_3d"))
+
+    def test_axis_triplet_applies_the_scale(self):
+        device = self._device(1, "accel_3d")
+        for axis, raw in zip("xyz", (1, 2, 3)):
+            (device / f"in_accel_{axis}_raw").write_text(f"{raw}\n")
+        (device / "in_accel_scale").write_text("0.5\n")
+        report = self.capture.read_axis_triplet(device, "in_accel", "in_accel_scale")
+        self.assertEqual(report["raw"], [1.0, 2.0, 3.0])
+        self.assertEqual(report["value"], [0.5, 1.0, 1.5])
+
+    def test_a_missing_axis_or_device_is_none(self):
+        device = self._device(1, "accel_3d")
+        self.assertIsNone(
+            self.capture.read_axis_triplet(device, "in_accel", "in_accel_scale")
+        )
+        self.assertIsNone(
+            self.capture.read_axis_triplet(None, "in_accel", "in_accel_scale")
+        )
+
+    def test_read_hinge_reads_all_three_channels(self):
+        device = self._device(5, "hinge")
+        for index, value in enumerate((104, 103, 359)):
+            (device / f"in_angl{index}_raw").write_text(f"{value}\n")
+        report = self.capture.read_hinge(device)
+        self.assertEqual(report["channels"], [104.0, 103.0, 359.0])
+        self.assertEqual(report["device"], device.name)
+        self.assertIsNone(self.capture.read_hinge(None))
+
+    def test_parse_args_defaults_and_overrides(self):
+        defaults = self.capture.parse_args([])
+        self.assertEqual(
+            (defaults.seconds, defaults.hz, defaults.out), (120.0, 10.0, "-")
+        )
+        args = self.capture.parse_args(
+            ["--seconds", "5", "--hz", "20", "--out", "/tmp/x", "--panel", "eDP-1"]
+        )
+        self.assertEqual(
+            (args.seconds, args.hz, args.out, args.panel),
+            (5.0, 20.0, "/tmp/x", "eDP-1"),
+        )
+
+
+class DocumentationAccuracyTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        root = SCRIPT.parent.parent
+        cls.digitizer = (root / "docs" / "digitizer.md").read_text()
+        cls.windows = (root / "docs" / "windows.md").read_text()
+        cls.hardware = (root / "docs" / "hardware.md").read_text()
+        cls.readme = (root / "README.md").read_text()
+
+    def test_the_libinput_property_and_sources_are_correct(self):
+        for text in (self.digitizer, self.windows):
+            self.assertNotIn("`LIBINPUT_CALIBRATION`", text)
+            self.assertIn("LIBINPUT_CALIBRATION_MATRIX", text)
+            self.assertIn(
+                "https://wayland.freedesktop.org/libinput/doc/latest/device-configuration-via-udev.html",
+                text,
+            )
+            self.assertIn("https://github.com/hyprwm/Hyprland/discussions/16692", text)
+
+    def test_the_angle_band_is_no_longer_called_exact(self):
+        self.assertNotIn("boundaries gate no input", self.hardware)
+        self.assertIn("modeHystDeg", self.hardware)
+
+    def test_the_environment_snapshot_is_current(self):
+        self.assertIn("7.2.15-1-omarchy", self.hardware)
+        self.assertIn("3.15.0", self.hardware)
+        self.assertNotIn("| Python | 3.14 |", self.hardware)
+
+    def test_the_tent_keyboard_divergence_is_explicit(self):
+        self.assertIn("stand, tablet **and tent**", self.windows)
+        self.assertIn("set_devices` only", self.windows)
+
+    def test_the_readme_count_is_current(self):
+        self.assertIn("447 tests + 96 subtests", self.readme)
+        self.assertNotIn("354 tests + 16 subtests", self.readme)
+
+
 class ReadTextTests(unittest.TestCase):
     def test_read_text_none(self):
         self.assertIsNone(fold.read_text(Path("/nonexistent/file")))

@@ -190,10 +190,16 @@ will tell you your pen is broken when it is not.
 ## The route that would work, and why it is not wired up
 
 A libinput calibration matrix can be applied outside the compositor, by udev,
-with the `LIBINPUT_CALIBRATION` hwdb property. It is a 9-element affine matrix
-on the raw absolute axes. That is the only mechanism left.
+with the `LIBINPUT_CALIBRATION_MATRIX` property. It takes **six** floats — the
+first two rows of a 3×3 affine matrix, not nine — as documented in
+[libinput's static device configuration via udev](https://wayland.freedesktop.org/libinput/doc/latest/device-configuration-via-udev.html).
+That is the only mechanism left, and on this machine it is blocked twice over.
+Since Hyprland 0.55.0 `input:touchdevice:transform` defaults to `0` and is
+applied unconditionally, overriding any udev calibration; see
+[Hyprland discussion #16692](https://github.com/hyprwm/Hyprland/discussions/16692).
+The earlier claim that udev calibration is a working fallback was wrong.
 
-It has not been done here, for two reasons that are about correctness rather
+It has not been done here, for three reasons that are about correctness rather
 than effort:
 
 - **The matrix has to be in raw axis units, and the declared range is 0..0.** The
@@ -204,6 +210,8 @@ than effort:
 - **It needs root and it re-opens the device.** `systemd-hwdb update` plus
   `udevadm trigger` on the two nodes drops input briefly and needs Hyprland to
   re-acquire them.
+- **Hyprland would discard it anyway** unless `input:touchdevice:transform` is
+  unset, which its default no longer is on v0.55.0 and later.
 
 `hwdb show` and `hwdb apply` in this plugin write a udev entry for the IIO
 *mount matrix*, which is a different property (`ACCEL_MOUNT_MATRIX` and
@@ -237,5 +245,5 @@ the same corner before and after the turn either shows the axes following the
 panel — the `hardware.md` reading — or shows them unchanged and answering about
 the machine's native landscape frame. The observed minima and maxima also give
 the native range that a calibration matrix would need, which is the input
-[`hwdb`'s `LIBINPUT_CALIBRATION` route](#the-route-that-would-work-and-why-it-is-not-wired-up)
+[`hwdb`'s `LIBINPUT_CALIBRATION_MATRIX` route](#the-route-that-would-work-and-why-it-is-not-wired-up)
 is still missing.

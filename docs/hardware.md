@@ -72,7 +72,7 @@ Two things follow, and one of them is a bug waiting to happen:
 
 ### libwacom has no entry for 5091
 
-libwacom 2.19.1 ships `wacom-isdv4-5090.tablet`, whose own comment reads:
+libwacom ships `wacom-isdv4-5090.tablet`, whose own comment reads:
 
 > this is for the Wacom pen + touchscreen as found in some versions of the
 > Lenovo Yoga 260
@@ -85,7 +85,7 @@ missing twin to `~/.config/libwacom/`, which libwacom reads *before* the system
 directory, so it needs no root and is a one-line undo.
 
 The `@isdv4-aes;` stylus layout that the 5090 entry references has no `.svg` in
-Arch's libwacom 2.19.1 data directory either, so referencing it locally is as
+Arch's libwacom data directory either, so referencing it locally is as
 harmless as it is in the packaged file.
 
 ## Sensors
@@ -215,9 +215,14 @@ The 190 crossing carries a release threshold below it, `bookReleaseDeg`
 engages partway through the band with hysteresis of its own. Dell's convertible
 documentation puts the default keyboard cut-out near 225 for the same reason.
 So a lid resting at 189/191 keeps whatever mode it already had instead of taking
-the keyboard off and on. The 270 and 340 boundaries gate no input, so they stay
-exact. See `docs/windows.md` for why this, and for the rest of what Windows did
-that this plugin does not and cannot.
+the keyboard off and on. The 270 and 340 boundaries were first left exact on
+the reasoning that they only change a label; that was wrong about 340, which
+decides tablet and therefore the keyboard. All four edges now have a band:
+entry stays on the Lenovo angles, and an engaged mode rides `modeHystDeg`
+(default 10°) past its edge so a tent flexing under hand load cannot flutter
+the keys. See `docs/windows.md` for why this, for the recorded divergence over
+tent input, and for the rest of what Windows did that this plugin does not and
+cannot.
 
 ## No tablet-mode switch
 
@@ -267,11 +272,14 @@ reason this one is written against one model.
 
 ## Environment
 
+Snapshot taken 2026-11-17 on the live machine; these versions move with the
+distribution, so re-check before treating a number as a hardware fact.
+
 | | |
 |---|---|
-| Kernel | 7.2.5-3-omarchy |
+| Kernel | 7.2.15-1-omarchy |
 | Hyprland | 0.56.2 |
-| libinput | 1.31.3 |
-| libwacom | 2.19.1 |
-| Omarchy | 4.0.x, Lua Hyprland config |
-| Python | 3.14 |
+| libinput | 1.32.0 |
+| libwacom | 2.20.0 |
+| Omarchy | 4.0.0.alpha, Lua Hyprland config |
+| Python | 3.15.0 |

@@ -304,7 +304,7 @@ Service.qml                       mounts the daemon once, owns the state
 Fold.qml                          the bar button and its panel
 bin/omarchy-yoga260-fold          the daemon and CLI, Python 3, no dependencies
 tools/check                       every gate that can block a push, in one command
-tests/                            354 tests + 16 subtests; the arithmetic is the point
+tests/                            447 tests + 96 subtests; the arithmetic is the point
 docs/hardware.md                  this machine, in the detail it deserves
 docs/calibration.md               how to confirm it by hand
 ```

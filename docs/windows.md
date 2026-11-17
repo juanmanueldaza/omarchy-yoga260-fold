@@ -27,6 +27,21 @@ cut at 190 is the only one that matters for input: past it the keys must go
 dead. This plugin's `bookExitDeg=190`, `tentEnterDeg=270`, `tentExitDeg=340`
 are those ranges, not tuned values.
 
+### The tent keyboard divergence, stated explicitly
+
+The 2026-11-17 audit records the Lenovo guide as disabling the keyboard,
+trackpad and TrackPoint in stand, tablet **and tent**. The table above, written
+from an earlier reading of the same guide, says tent keeps the keyboard on —
+and the plugin follows that earlier reading: `step` calls `set_devices` only
+when the mode is `tablet` (stand is treated as tablet), so in tent the keyboard,
+trackpad and TrackPoint all stay enabled. See
+[`hardware.md`](hardware.md#fold-angles-measured-on-this-machine) for the mode
+logic and the angle bands.
+
+The guide PDF is not in this repository, so the contradiction is recorded
+rather than silently resolved. Changing tent input behavior would be a hardware
+safety change and needs the guide checked first, not a guess.
+
 The physical part is the "lift-and-lock" keyboard: folding past ~190 sinks
 the keys into the deck so they cannot be pressed. The EC then also disables
 them electrically. On Windows both happened together, so there was no window
@@ -373,9 +388,14 @@ It is documented as a starting point for whoever wants it, not recommended.
    as "accepted and dropped", on the evidence that `hyprctl -j devices` reported
    `transform = None` after `ok`; that field is never emitted for tablets, so the
    evidence was of an absent key. See [`digitizer.md`](digitizer.md). The udev
-   `LIBINPUT_CALIBRATION` hwdb route is the only remaining mechanism, and it
-   needs observed raw ranges (the declared range is 0..0), root, and a device
-   reopen. Do not ship a guessed matrix.
+   `LIBINPUT_CALIBRATION_MATRIX` route takes six floats (the first two rows of
+   the matrix), not nine; see
+   [libinput's udev documentation](https://wayland.freedesktop.org/libinput/doc/latest/device-configuration-via-udev.html).
+   It needs observed raw ranges (the declared range is 0..0), root, and a device
+   reopen, and on Hyprland 0.55.0 and later the default
+   `input:touchdevice:transform=0` overrides it
+   ([discussion #16692](https://github.com/hyprwm/Hyprland/discussions/16692)).
+   It is not a working fallback here. Do not ship a guessed matrix.
 
 
 ## Sources
@@ -392,5 +412,11 @@ It is documented as a starting point for whoever wants it, not recommended.
 - kernel docs: `hid/intel-ish-hid` — ISHTP transport, IIO ABI unchanged
 - Dell KB `000132403` — tablet mode past 225, rotation lock requires
   tablet mode + ISH driver
+- libinput 1.32, "Static device configuration via udev" —
+  `LIBINPUT_CALIBRATION_MATRIX` is six floats, the first two rows:
+  https://wayland.freedesktop.org/libinput/doc/latest/device-configuration-via-udev.html
+- Hyprland discussion #16692 — `input:touchdevice:transform` defaulting to 0
+  since v0.55.0 overrides udev calibration:
+  https://github.com/hyprwm/Hyprland/discussions/16692
 - Notebookcheck / LaptopMag / Windows Central Yoga 260 reviews —
   lift-and-lock keyboard, 360 hinge, pen (ThinkPad Pen Pro, Wacom AES)

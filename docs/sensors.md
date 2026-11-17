@@ -226,7 +226,7 @@ reports as a `Tablets` entry and a `Touch` entry:
 Neither node has `ABS_MT_POSITION_X/Y`, neither has a pressure axis, and the
 finger has no `ABS_MT_TRACKING_ID`. See `docs/digitizer.md`.
 
-**libwacom 2.19.1 has no entry for 5091.** It ships `wacom-isdv4-5090.tablet`,
+**libwacom has no entry for 5091.** It ships `wacom-isdv4-5090.tablet`,
 whose own comment reads *"this is for the Wacom pen + touchscreen as found in
 some versions of the Lenovo Yoga 260"* — that is the 5090 half of the same
 hardware pair, and this machine is the 5091 half. `libwacom install` writes the
