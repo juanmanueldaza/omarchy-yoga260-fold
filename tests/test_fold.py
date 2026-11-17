@@ -2320,6 +2320,73 @@ class FoldDaemonStepTests(unittest.TestCase):
         # driver itself flags as inconsistent must never reach the panel.
         self.daemon.hypr.rotate_transaction.assert_not_called()
 
+    def test_step_bad_hinge_holds_tablet_mode_and_input(self):
+        # The audit repro: tablet mode with input off, then one untrusted fold.
+        # Substituting 0 for the reading used to name "book" and re-enable the
+        # keyboard on a folded machine.
+        self.daemon.state.mode = "tablet"
+        self.daemon.state.folded = True
+        self.daemon.state.keyboard_disabled = True
+        self.daemon.state.pointers_disabled = True
+        self.daemon.hinge.read_fold.return_value = fold.HingeSample(
+            None, None, None, None, None, False
+        )
+        self.daemon.step()
+        self.assertEqual(self.daemon.state.mode, "tablet")
+        self.assertTrue(self.daemon.state.folded)
+        self.assertTrue(self.daemon.state.keyboard_disabled)
+        self.assertTrue(self.daemon.state.pointers_disabled)
+        self.daemon.hypr.set_device_enabled.assert_not_called()
+        self.daemon.hypr.rotate_transaction.assert_not_called()
+
+    def test_step_inconsistent_hinge_with_a_fold_value_holds_input(self):
+        # A present but self-inconsistent fold is no more trustworthy than a
+        # missing one. `foldValid` is decided by `ok`, not by the number.
+        self.daemon.state.mode = "tablet"
+        self.daemon.state.keyboard_disabled = True
+        self.daemon.hinge.read_fold.return_value = fold.HingeSample(
+            102.0, 50.0, 359.0, None, None, False
+        )
+        self.daemon.step()
+        self.assertEqual(self.daemon.state.mode, "tablet")
+        self.assertTrue(self.daemon.state.keyboard_disabled)
+        self.daemon.hypr.set_device_enabled.assert_not_called()
+
+    def test_step_book_restores_input_when_digitizer_is_missing(self):
+        # A missing pen/touch makes `blocking_reason` fail and the pass return
+        # early. Unfolding must still bring the keyboard back.
+        self.daemon.state.mode = "book"
+        self.daemon.state.keyboard_disabled = True
+        self.daemon.state.pointers_disabled = True
+        self.daemon.state.touch = None
+        self.daemon.step()
+        enabled = [
+            call.args for call in self.daemon.hypr.set_device_enabled.call_args_list
+        ]
+        self.assertIn(("at-translated-set-2-keyboard", True), enabled)
+        self.assertFalse(self.daemon.state.keyboard_disabled)
+        self.assertFalse(self.daemon.state.pointers_disabled)
+
+    def test_restore_devices_enables_everything_regardless_of_flags(self):
+        self.daemon.state.keyboard_disabled = True
+        self.daemon.state.pointers_disabled = True
+        self.assertTrue(self.daemon.restore_devices())
+        enabled = [
+            call.args for call in self.daemon.hypr.set_device_enabled.call_args_list
+        ]
+        self.assertIn(("at-translated-set-2-keyboard", True), enabled)
+        self.assertIn(("etps/2-elantech-trackpoint", True), enabled)
+        self.assertIn(("etps/2-elantech-touchpad", True), enabled)
+        self.assertFalse(self.daemon.state.keyboard_disabled)
+        self.assertFalse(self.daemon.state.pointers_disabled)
+
+    def test_restore_devices_reports_failure_and_keeps_the_flags(self):
+        self.daemon.hypr.set_device_enabled.return_value = (False, "hyprctl failed")
+        self.daemon.state.keyboard_disabled = True
+        self.assertFalse(self.daemon.restore_devices())
+        self.assertIn("hyprctl failed", self.daemon.state.last_error)
+        self.assertTrue(self.daemon.state.keyboard_disabled)
+
     def test_step_moving(self):
         self.daemon.motion.is_still.return_value = False
         result = self.daemon.step()
@@ -2894,6 +2961,16 @@ class CLITests(unittest.TestCase):
         # them, so an empty dict raised KeyError on 'accelName' and the report it
         # exists to print was never produced by any test.
         self.assertIn(fold.main(["doctor"]), (0, 1))
+
+    def test_cmd_devices_restore_calls_the_daemon_restore(self):
+        fake = MagicMock()
+        fake.hypr.available = True
+        fake.restore_devices.return_value = True
+        fake.state.last_error = ""
+        with patch.object(fold, "FoldDaemon", return_value=fake):
+            rc = fold.main(["devices", "restore"])
+        self.assertEqual(rc, 0)
+        fake.restore_devices.assert_called_once_with()
 
     def test_cmd_fingerprint_probes_once_and_reports_health(self):
         out = io.StringIO()
@@ -4106,6 +4183,10 @@ class FoldDaemonRunTests(unittest.TestCase):
         daemon.poll_lock_state = MagicMock(return_value=False)
         daemon.reload_settings = MagicMock()
         daemon.announce = MagicMock()
+        # `run` now asserts input state at both ends of the loop, and watches
+        # the wall clock for resume. Neither is what these loop tests exercise.
+        daemon.restore_devices = MagicMock(return_value=True)
+        daemon.check_resume = MagicMock(return_value=False)
         return daemon
 
     def test_run_executes_step_when_changed(self):
@@ -4143,6 +4224,21 @@ class FoldDaemonRunTests(unittest.TestCase):
         daemon = self._looping_daemon(changed=False, settling=False)
         self.assertEqual(daemon.run(), 0)
         daemon.step.assert_not_called()
+
+    def test_run_restores_devices_at_startup_and_at_shutdown(self):
+        daemon = self._looping_daemon(changed=False)
+        self.assertEqual(daemon.run(), 0)
+        # One on the way in for a SIGKILLed predecessor, one on the way out for
+        # this process. Never just one: either end alone leaves a lockout.
+        self.assertEqual(daemon.restore_devices.call_count, 2)
+
+    def test_run_reconciles_devices_after_resume_without_a_sensor_change(self):
+        daemon = self._looping_daemon(changed=False, passes=3)
+        daemon.check_resume.side_effect = [True, False, False]
+        self.assertEqual(daemon.run(), 0)
+        daemon.restore_devices.assert_called()
+        # With unchanged sensors nothing else would call `step` at all.
+        daemon.step.assert_called()
 
     def test_run_announces_once_the_outcome_changes(self):
         daemon = self._looping_daemon(changed=True)

@@ -166,6 +166,19 @@ Item {
     onExited: root.refresh()
   }
 
+  Process {
+    id: restoreProc
+    command: [root.cli, "devices", "restore"]
+    stderr: StdioCollector { waitForEnd: true }
+  }
+
+  Component.onDestruction: {
+    // The daemon restores input in its own SIGTERM path; this is the backup
+    // for a teardown that kills it before the loop can reach that path.
+    daemonProc.running = false
+    restoreProc.running = true
+  }
+
   // One shot: armed by a process starting, rearmed by the next one. A healthy
   // call never lets it fire, and one that does fire finds only hung processes
   // to release (or none, and stops there).

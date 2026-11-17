@@ -2080,9 +2080,14 @@ class FoldDaemon:
             time.monotonic(), float(self.settings.get("telemetrySec", 1.0))
         )
         rate, gyro_ok = self.motion.read()
+        # The 0 stands in only for the geometry below, which needs an angle to
+        # build a lid vector. It is not a reading and must never reach a mode or
+        # input decision: `foldValid` carries that distinction to `step`.
+        fold_valid = bool(hinge.ok and hinge.fold_deg is not None)
         pose: dict[str, Any] = {
             "accel": accel,
             "hinge": hinge,
+            "foldValid": fold_valid,
             "fold": hinge.fold_deg if hinge.fold_deg is not None else 0.0,
             "base_up": base_frame_gravity(accel),
             "rotationRate": rate,
@@ -2421,6 +2426,36 @@ class FoldDaemon:
             # it back rather than waiting for a tilt that may never come.
             self.apply(self.state.transform)
 
+    def restore_devices(self) -> bool:
+        """Assert that every internal input device is enabled.
+
+        The cached flags say what this process last did, not what the
+        compositor currently holds. A previous daemon can be killed while the
+        keyboard is off, a resume rebuilds every input device, and a plugin
+        removal can leave the desktop with them disabled. In all three cases
+        the only honest move is to issue the enable calls and let the flags
+        follow the result instead of trusting them.
+        """
+        failed: list[str] = []
+        for name in self.keyboards:
+            ok, message = self.hypr.set_device_enabled(name, True)
+            if not ok:
+                failed.append(f"keyboard {name}: {message}")
+        for name in self.pointers + self.touchpads:
+            ok, message = self.hypr.set_device_enabled(name, True)
+            if not ok:
+                failed.append(f"pointer {name}: {message}")
+        if failed:
+            # Leave the flags alone: a failed enable means the device may still
+            # be off, and a later pass has to retry rather than believe the lie.
+            self.state.last_error = "; ".join(failed)
+            return False
+        self.state.keyboard_disabled = False
+        self.state.pointers_disabled = False
+        self.state.lock_safe = ""
+        self.state.last_error = ""
+        return True
+
     def set_devices(self, keyboard: bool, pointers: bool) -> None:
         """Switch the unusable-when-folded devices off, but only when they are
         not already in the state being asked for.
@@ -2601,7 +2636,13 @@ class FoldDaemon:
             pose = self.read_pose()
         reason = self.blocking_reason()
 
-        if pose["still"]:
+        # A hinge sample the driver flags as inconsistent, or one with no fold
+        # reading at all, is not evidence of any pose. Substituting 0 for a
+        # missing fold is fine for the lid geometry below but would say "book"
+        # here, which used to switch a folded machine's keyboard back on. Hold
+        # the last trusted mode and input state until a real reading returns.
+        fold_trusted = bool(pose.get("foldValid", pose["hinge"].ok))
+        if pose["still"] and fold_trusted:
             # The hinge channel reports nonsense while the lid is in motion --
             # a recording caught it reading 356 and then 101 degrees of the same
             # physical pose a fifth of a second apart -- so the pose is only
@@ -2612,6 +2653,7 @@ class FoldDaemon:
             self.state.folded = folded
         else:
             mode = self.state.mode
+            folded = self.state.folded
         self.state.mode = mode
         self.still = bool(pose["still"])
         self.state.still = self.still
@@ -2669,6 +2711,12 @@ class FoldDaemon:
         if pose["tilt_residual"] is not None:
             self.state.tilt_residual_deg = pose["tilt_residual"]
 
+        # Input follows the fold, not sensor availability. A trusted book pose
+        # owes an input restore even when a missing digitizer blocks the rest of
+        # the pass -- otherwise unfolding with the pen unplugged leaves the
+        # keyboard off. An untrusted fold owes nothing: no enable, no disable.
+        if fold_trusted and mode != "tablet":
+            self.set_devices(False, False)
         if reason is not None:
             self.state.messages = [reason]
             self.state.verified = False
@@ -2722,29 +2770,28 @@ class FoldDaemon:
         self.state.reason = why
         self.state.messages = messages
 
-        if mode == "tablet":
+        if fold_trusted and mode == "tablet":
             self.set_devices(
                 bool(self.settings.get("lockKeyboard")),
                 bool(self.settings.get("lockPointers")),
             )
-        else:
-            self.set_devices(False, False)
 
-        if mode == "tablet" and self.settings.get("oskAuto") and not self.state.osk_asked:
-            self.state.osk_asked = True
-            self.osk.toggle()
-        elif mode != "tablet":
-            shown = self.osk.is_shown()
-            if self.state.osk_asked and shown is not False:
-                # Unfolding hides what auto-show summoned. When visibility is
-                # known hidden the toggle is skipped; when it is unknown (a
-                # board with no state query) the toggle fires blind -- correct
-                # for the common flow (unfold with the board still up), wrong
-                # in the rare one (dismissed by hand, then unfolded, so it
-                # comes back). There is no signal to tell them apart; the
-                # common flow wins, and the bar icon dismisses the mistake.
+        if fold_trusted:
+            if mode == "tablet" and self.settings.get("oskAuto") and not self.state.osk_asked:
+                self.state.osk_asked = True
                 self.osk.toggle()
-            self.state.osk_asked = False
+            elif mode != "tablet":
+                shown = self.osk.is_shown()
+                if self.state.osk_asked and shown is not False:
+                    # Unfolding hides what auto-show summoned. When visibility is
+                    # known hidden the toggle is skipped; when it is unknown (a
+                    # board with no state query) the toggle fires blind -- correct
+                    # for the common flow (unfold with the board still up), wrong
+                    # in the rare one (dismissed by hand, then unfolded, so it
+                    # comes back). There is no signal to tell them apart; the
+                    # common flow wins, and the bar icon dismisses the mistake.
+                    self.osk.toggle()
+                self.state.osk_asked = False
 
         self.verify()
         return self._publish()
@@ -2901,54 +2948,72 @@ class FoldDaemon:
         next_verify = 0.0
         next_settings = 0.0
         announced: tuple | None = None
-        while not self.stop:
-            # One sample per pass, taken once and used both to decide whether
-            # anything has moved and, if it has, to decide what to do about it.
-            # Reading it separately for those two questions is what put twelve
-            # reads and two possible poses on every pass.
-            pose = self.read_pose()
-            if self.changed(pose) or self.settling():
-                self.step(pose)
-                after = (self.state.mode, self.state.transform, self.state.orientation)
-                if after != announced and not self.state.messages:
-                    announced = after
-                    self.announce()
-            now = time.monotonic()
-            if now >= next_settings:
-                # Checked far more often than the re-assert, because a tap in the
-                # panel has to feel instant while a reload is a slow self-repair.
-                self.reload_settings()
-                next_settings = now + 0.5
-            if now >= next_verify:
-                if self.blocking_reason() is not None:
-                    # `verify` re-asserts a transform, which means it rotates
-                    # the panel. Only `step` used to consult the hardware check,
-                    # so on a machine this plugin is not for, the 5 s timer would
-                    # still turn a panel while every other path refused to.
+        try:
+            # A previous instance may have been SIGKILLed while the keyboard was
+            # off. The flags in a fresh State say "enabled", but say nothing
+            # about the compositor; assert the safe state before watching.
+            self.restore_devices()
+            while not self.stop:
+                # One sample per pass, taken once and used both to decide whether
+                # anything has moved and, if it has, to decide what to do about it.
+                # Reading it separately for those two questions is what put twelve
+                # reads and two possible poses on every pass.
+                pose = self.read_pose()
+                if self.changed(pose) or self.settling():
+                    self.step(pose)
+                    after = (self.state.mode, self.state.transform, self.state.orientation)
+                    if after != announced and not self.state.messages:
+                        announced = after
+                        self.announce()
+                now = time.monotonic()
+                if now >= next_settings:
+                    # Checked far more often than the re-assert, because a tap in the
+                    # panel has to feel instant while a reload is a slow self-repair.
+                    self.reload_settings()
+                    next_settings = now + 0.5
+                if now >= next_verify:
+                    resumed = self.check_resume()
+                    if self.blocking_reason() is not None:
+                        # `verify` re-asserts a transform, which means it rotates
+                        # the panel. Only `step` used to consult the hardware check,
+                        # so on a machine this plugin is not for, the 5 s timer would
+                        # still turn a panel while every other path refused to.
+                        next_verify = now + verify
+                        time.sleep(poll)
+                        continue
+                    if resumed:
+                        # Suspend rebuilds every input device, so the cached
+                        # flags describe devices that no longer exist. Re-resolve
+                        # their names, re-assert enable, then let a full pass
+                        # re-disable them if the machine is still folded.
+                        self.resolve_devices()
+                        self.restore_devices()
+                        self.step()
+                    if self.poll_lock_state():
+                        # A lock transition changes what `set_devices` must do,
+                        # so it gets a full pass instead of waiting for the next
+                        # fold or turn. Rare by construction: transitions, not
+                        # passes.
+                        self.step()
+                    # A `hyprctl reload` rebuilds the monitor rules from the config
+                    # files and straightens a turned panel. Re-asserting on a timer
+                    # is how that heals, with no cooperation from the compositor.
+                    self.verify()
+                    self.resolve_devices()
                     next_verify = now + verify
-                    time.sleep(poll)
-                    continue
-                if self.poll_lock_state():
-                    # A lock transition changes what `set_devices` must do,
-                    # so it gets a full pass instead of waiting for the next
-                    # fold or turn. Rare by construction: transitions, not
-                    # passes.
-                    self.step()
-                # A `hyprctl reload` rebuilds the monitor rules from the config
-                # files and straightens a turned panel. Re-asserting on a timer
-                # is how that heals, with no cooperation from the compositor.
-                self.verify()
-                self.resolve_devices()
-                next_verify = now + verify
-            # Keep to a schedule rather than sleeping a flat interval after the
-            # work. The sensor reads block -- they are synchronous round trips
-            # into the driver -- so `sleep(poll)` on top of them made the real
-            # period longer than the published budget claimed, and the number
-            # the panel shows was optimistic by the entire cost of reading the
-            # hardware. How much that is depends on how many channels the pass
-            # touches; see `Hinge.read_fold` for the per-attribute cost.
-            spent = time.monotonic() - now
-            time.sleep(max(0.0, poll - spent))
+                # Keep to a schedule rather than sleeping a flat interval after the
+                # work. The sensor reads block -- they are synchronous round trips
+                # into the driver -- so `sleep(poll)` on top of them made the real
+                # period longer than the published budget claimed, and the number
+                # the panel shows was optimistic by the entire cost of reading the
+                # hardware. How much that is depends on how many channels the pass
+                # touches; see `Hinge.read_fold` for the per-attribute cost.
+                spent = time.monotonic() - now
+                time.sleep(max(0.0, poll - spent))
+        finally:
+            # SIGTERM and SIGINT only set `stop`. Without this, stopping a daemon
+            # on a folded machine leaves the keyboard off at the password prompt.
+            self.restore_devices()
         return 0
 
 
@@ -3661,6 +3726,9 @@ def build_parser() -> argparse.ArgumentParser:
         "action", choices=["show", "hide", "toggle"]
     )
 
+    devices = sub.add_parser("devices", help="restore internal input devices")
+    devices.add_argument("action", choices=["restore"])
+
     lib = sub.add_parser("libwacom", help="the missing 5091 digitizer entry")
     lib.add_argument("action", choices=["status", "install", "remove"])
 
@@ -3731,6 +3799,23 @@ def cmd_doctor(settings: dict[str, Any]) -> int:
     }
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0 if report["blockedBy"] is None else 1
+
+
+def cmd_devices(settings: dict[str, Any]) -> int:
+    """Re-enable the internal keyboard and pointers, whatever the cache says.
+
+    The daemon does this on shutdown and startup, but a SIGKILL, a plugin
+    removal or a compositor restart can leave it undone. This is the explicit
+    way out of a machine that will not type.
+    """
+    daemon = FoldDaemon(settings)
+    if not daemon.hypr.available:
+        print("hyprctl is not reachable from this process", file=sys.stderr)
+        return 1
+    ok = daemon.restore_devices()
+    if daemon.state.last_error:
+        print(daemon.state.last_error, file=sys.stderr)
+    return 0 if ok else 1
 
 
 def cmd_fingerprint() -> int:
@@ -4098,6 +4183,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return cmd_mapping(settings, args.value)  # pragma: no cover
     if args.command == "keyboard":
         return cmd_keyboard(settings, args.action)  # pragma: no cover
+    if args.command == "devices":
+        return cmd_devices(settings)  # pragma: no cover
     if args.command == "libwacom":
         return cmd_libwacom(args.action)
     if args.command == "hwdb":

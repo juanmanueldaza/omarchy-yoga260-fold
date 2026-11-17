@@ -2,7 +2,7 @@
 
 > **Lenovo ThinkPad Yoga 260 (20FE) only. It refuses every other machine.**
 > Install: `omarchy plugin add https://github.com/juanmanueldaza/omarchy-yoga260-fold --enable`
-> Remove: `omarchy plugin remove juanmanueldaza.yoga260-fold` plus `omarchy-yoga260-fold libwacom remove`
+> Remove: `omarchy-yoga260-fold devices restore`, then `omarchy plugin remove juanmanueldaza.yoga260-fold` and `omarchy-yoga260-fold libwacom remove`
 > Runs unsandboxed inside omarchy-shell. No root for the daemon; sudo only if you explicitly run `hwdb apply`.
 > Does not ship an on-screen keyboard (optional companion below).
 > A hand turn locks rotation on; restore with `rotate normal` then `lock off`.
@@ -123,8 +123,18 @@ Then give the pen its proper libwacom entry, which this machine is missing:
 ~/.config/omarchy/plugins/juanmanueldaza.yoga260-fold/bin/omarchy-yoga260-fold libwacom install
 ```
 
-Remove the whole thing with `omarchy plugin remove juanmanueldaza.yoga260-fold` and
-`omarchy-yoga260-fold libwacom remove`.
+Remove the whole thing by restoring input first, then removing the plugin and
+the libwacom entry:
+
+```bash
+~/.config/omarchy/plugins/juanmanueldaza.yoga260-fold/bin/omarchy-yoga260-fold devices restore
+omarchy plugin remove juanmanueldaza.yoga260-fold
+~/.config/omarchy/plugins/juanmanueldaza.yoga260-fold/bin/omarchy-yoga260-fold libwacom remove
+```
+
+The restore step matters if the machine is folded or was folded when the daemon
+last ran: tablet mode switches the keyboard and pointers off, and a killed
+daemon cannot switch them back on.
 
 Optional: an on-screen keyboard. This plugin drives one, it does not ship one —
 the Fold panel's keyboard button only appears when a keyboard plugin is installed:
@@ -245,6 +255,7 @@ $fold rotate next   # turn it by hand (not in book mode; --force overrides)
 $fold lock toggle
 $fold mapping standard
 $fold keyboard toggle   # the on-screen keyboard
+$fold devices restore   # re-enable the internal keyboard and pointers
 $fold libwacom status
 $fold hwdb show     # the systemd sensor entry, not applied
 $fold hwdb apply    # and write it, which wants sudo
