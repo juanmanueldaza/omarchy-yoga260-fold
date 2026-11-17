@@ -18,6 +18,9 @@ Item {
   property string blockedBy: ""
   property bool hingeOk: false
   property bool folded: false
+  // Published by the daemon with the exact no-force test `cmd_rotate` applies,
+  // so the panel hides controls the CLI would refuse anyway.
+  property bool manualRotateAllowed: false
   property string mode: "book"
   property string orientationLabel: "landscape"
   // Flat enough that the accelerometer is blind to rotation in the plane of the
@@ -94,6 +97,7 @@ Item {
     }
     const state = data.state || {}
     root.folded = state.folded === true
+    root.manualRotateAllowed = state.manualRotateAllowed === true
     root.mode = state.mode || "book"
     root.orientationLabel = state.orientationLabel || ""
     root.flat = state.flat === true

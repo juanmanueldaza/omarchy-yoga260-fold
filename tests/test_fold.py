@@ -4609,6 +4609,101 @@ class GyroSelectionTests(unittest.TestCase):
         self.assertFalse(daemon.motion.available)
 
 
+class ManualRotateGateTests(unittest.TestCase):
+    """The panel's enabled state must be the CLI's own no-force decision."""
+
+    def setUp(self):
+        self.daemon = fold.FoldDaemon.__new__(fold.FoldDaemon)
+        self.daemon.settings = fold.load_settings()
+
+    def test_the_gate_follows_the_book_boundary(self):
+        cases = (
+            (160.0, False),
+            (170.0, False),
+            (180.0, False),
+            (190.0, True),
+            (280.0, True),
+        )
+        for angle, expected in cases:
+            with self.subTest(fold=angle):
+                self.assertEqual(fold.hand_turn_allowed(self.daemon, angle), expected)
+
+    def test_the_gate_ignores_the_held_hysteresis_mode(self):
+        # At 180 with an engaged tablet the daemon's published mode stays
+        # "tablet", but cmd_rotate re-derives the mode fresh and still refuses.
+        self.assertEqual(self.daemon.mode_for(180.0, "tablet")[0], "tablet")
+        self.assertFalse(fold.hand_turn_allowed(self.daemon, 180.0))
+
+    def test_the_decision_is_published_to_the_panel(self):
+        state = fold.State()
+        state.manual_rotate_allowed = True
+        self.assertTrue(state.as_dict()["manualRotateAllowed"])
+        state.manual_rotate_allowed = False
+        self.assertFalse(state.as_dict()["manualRotateAllowed"])
+
+    def test_publish_emits_when_only_the_gate_changes(self):
+        daemon = self.daemon
+        payload = {
+            "state": {
+                "transform": 0,
+                "orientation": "normal",
+                "mode": "book",
+                "manualRotateAllowed": False,
+                "verified": False,
+                "lastError": "",
+                "messages": [],
+            },
+            "settings": {"locked": False, "mapping": "standard"},
+        }
+        daemon.status = MagicMock(return_value=payload)
+        daemon.write_state = MagicMock()
+        daemon.emit = MagicMock()
+        daemon.last_signature = None
+        daemon.last_publish = 0.0
+        self.assertTrue(daemon._publish())
+        changed = json.loads(json.dumps(payload))
+        changed["state"]["manualRotateAllowed"] = True
+        daemon.status.return_value = changed
+        self.assertTrue(daemon._publish())
+        self.assertEqual(daemon.emit.call_count, 2)
+
+
+class ManualRotatePanelTests(unittest.TestCase):
+    """Static checks on the two QML files; there is no QML test harness."""
+
+    @classmethod
+    def setUpClass(cls):
+        root = SCRIPT.parent.parent
+        cls.fold_qml = (root / "Fold.qml").read_text()
+        cls.service_qml = (root / "Service.qml").read_text()
+
+    def test_the_screen_row_is_composed_from_the_gate(self):
+        self.assertIn("screenActions: root.canManualRotate ?", self.fold_qml)
+        self.assertIn("] : [lockAction]", self.fold_qml)
+        self.assertIn("cells: root.screenActions.length", self.fold_qml)
+        self.assertIn("root.screenActions.length", self.fold_qml)
+
+    def test_every_rotate_path_is_gated(self):
+        self.assertIn("root.canManualRotate && root.service", self.fold_qml)
+        marker = "if (b === Qt.MiddleButton) {"
+        start = self.fold_qml.index(marker)
+        self.assertIn("root.canManualRotate", self.fold_qml[start : start + 140])
+
+    def test_the_panel_explains_the_missing_controls(self):
+        self.assertIn("Manual turn is unavailable", self.fold_qml)
+
+    def test_the_ui_never_uses_force(self):
+        self.assertNotIn("--force", self.service_qml)
+        self.assertNotIn("--force", self.fold_qml)
+
+    def test_the_service_reads_the_published_decision(self):
+        self.assertIn("property bool manualRotateAllowed: false", self.service_qml)
+        self.assertIn(
+            "root.manualRotateAllowed = state.manualRotateAllowed === true",
+            self.service_qml,
+        )
+
+
 class ReadTextTests(unittest.TestCase):
     def test_read_text_none(self):
         self.assertIsNone(fold.read_text(Path("/nonexistent/file")))

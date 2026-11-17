@@ -2096,6 +2096,11 @@ class State:
     # transaction cannot say whether the pen followed the panel, and Hyprland
     # reports no transform for tablets afterwards, so this is the record.
     rotation_legs: dict[str, bool] = field(default_factory=dict)
+    # The panel only offers a hand turn where `cmd_rotate` would accept one.
+    # Published rather than derived in QML from `mode`: the daemon's mode has
+    # hysteresis and can say tablet in the 170-190 band where the CLI, which
+    # re-derives the mode fresh, still refuses.
+    manual_rotate_allowed: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -2104,6 +2109,7 @@ class State:
             "orientationLabel": ORIENTATION_LABEL.get(self.orientation, self.orientation),
             "mode": self.mode,
             "folded": self.folded,
+            "manualRotateAllowed": self.manual_rotate_allowed,
             "locked": self.locked,
             "keyboardDisabled": self.keyboard_disabled,
             "lockSafe": self.lock_safe,
@@ -2929,6 +2935,10 @@ class FoldDaemon:
             mode = self.state.mode
             folded = self.state.folded
         self.state.mode = mode
+        # This is the exact test `cmd_rotate` applies to a no-force hand turn:
+        # a fresh mode_for, not the hysteresis-held mode above. Publishing it
+        # lets the panel hide controls the CLI would refuse anyway.
+        self.state.manual_rotate_allowed = hand_turn_allowed(self, pose["fold"])
         self.still = bool(pose["still"])
         self.state.still = self.still
         now = time.monotonic()
@@ -3101,6 +3111,7 @@ class FoldDaemon:
             payload["state"]["transform"],
             payload["state"]["orientation"],
             payload["state"]["mode"],
+            payload["state"]["manualRotateAllowed"],
             payload["state"]["verified"],
             payload["state"]["lastError"],
             tuple(payload["state"]["messages"]),
@@ -4359,6 +4370,16 @@ def daemon_state_messages(daemon: FoldDaemon, pose: dict[str, Any]) -> list[str]
     return []
 
 
+def hand_turn_allowed(daemon: FoldDaemon, fold: float) -> bool:
+    """The no-force gate for a hand turn, shared by the daemon and the CLI.
+
+    Both sides call this on a fresh mode: the daemon publishes the answer so the
+    panel can hide controls the CLI would refuse, and the CLI applies the same
+    test when the button is eventually pressed.
+    """
+    return daemon.mode_for(fold)[0] != "book"
+
+
 def cmd_rotate(settings: dict[str, Any], position: str, force: bool = False) -> int:
     """Turn the screen by hand, and keep it there.
 
@@ -4396,8 +4417,7 @@ def cmd_rotate(settings: dict[str, Any], position: str, force: bool = False) -> 
     if not force:
         daemon = FoldDaemon(settings)
         pose = daemon.read_pose()
-        mode, _ = daemon.mode_for(pose["fold"])
-        if mode == "book":
+        if not hand_turn_allowed(daemon, pose["fold"]):
             note = (
                 f"Laptop · open at {pose['fold']:.0f}°, so this is a hand turn "
                 "rather than a pose the screen can see. Re-run with --force, or "

@@ -30,6 +30,10 @@ Panel {
   readonly property bool hingeOk: service ? service.hingeOk : false
   readonly property bool folded: service ? service.folded : false
   readonly property string mode: service ? service.mode : "book"
+  // Whether a hand turn would be accepted without an explicit override. The daemon
+  // publishes this with the same fresh-mode test cmd_rotate uses; deriving it
+  // from `mode` here would be wrong in the 170-190 hysteresis band.
+  readonly property bool canManualRotate: service ? service.manualRotateAllowed === true : false
   readonly property string orientationLabel: service ? service.orientationLabel : ""
   // The machine is flat enough that the accelerometer cannot see which way it is
   // turned in its own plane. Gravity points the same way however the machine is
@@ -91,7 +95,8 @@ Panel {
   readonly property var rows: {
     const list = []
     if (root.osk.installed.length > 0) list.push({ id: "keyboard", cells: 1 })
-    list.push({ id: "screen", cells: 3 }, { id: "devices", cells: 2 }, { id: "settings", cells: 1 })
+    list.push({ id: "screen", cells: root.screenActions.length },
+      { id: "devices", cells: 2 }, { id: "settings", cells: 1 })
     if (settingsShown) {
       list.push({ id: "mapping", cells: mappingOptions.length })
     }
@@ -180,14 +185,23 @@ Panel {
 
   // ------------------------------------------------------------------ choices
 
+  // Lock is always available; the two hand-turn controls exist only where the
+  // CLI would accept a no-force turn. Composing the model (rather than leaving
+  // dead buttons visible) keeps the row, its widths and the cursor in step.
+  readonly property var lockAction: ({
+    label: root.locked ? "Unlock" : "Lock",
+    icon: root.locked ? "󰒁" : "󰌋",
+    isLock: true,
+    run: function() { if (root.service) root.service.toggleLock() }
+  })
+
   // A Hyprland transform counts quarter turns counter-clockwise, so "next"
   // turns the picture left.
-  readonly property var screenActions: [
+  readonly property var screenActions: root.canManualRotate ? [
     { label: "Left", icon: "󰑅", run: function() { if (root.service) root.service.rotate("prev") } },
-    { label: root.locked ? "Unlock" : "Lock", icon: root.locked ? "󰒁" : "󰌋",
-      run: function() { if (root.service) root.service.toggleLock() } },
+    lockAction,
     { label: "Right", icon: "󰑇", run: function() { if (root.service) root.service.rotate("next") } }
-  ]
+  ] : [lockAction]
 
   readonly property var deviceActions: [
     { label: root.lockKeyboard ? "Keys stay off" : "Keys off when folded",
@@ -218,7 +232,9 @@ Panel {
     // A tap opens the panel. With a mouse, the middle button still turns the
     // screen without opening anything.
     onPressed: function(b) {
-      if (b === Qt.MiddleButton) { if (root.service) root.service.rotate("next") }
+      if (b === Qt.MiddleButton) {
+        if (root.canManualRotate && root.service) root.service.rotate("next")
+      }
       else root.toggle()
     }
   }
@@ -358,7 +374,8 @@ Panel {
             Button {
               required property var modelData
               required property int index
-              width: (screenRow.width - screenRow.spacing * 2) / 3
+              width: (screenRow.width
+                - screenRow.spacing * (root.screenActions.length - 1)) / root.screenActions.length
               iconText: modelData.icon
               iconSize: Style.font.iconLarge
               text: modelData.label
@@ -367,12 +384,27 @@ Panel {
               fontFamily: root.bar.fontFamily
               verticalPadding: Style.space(12)
               bordered: true
-              active: index === 1 && root.locked
+              active: modelData.isLock === true && root.locked
               hasCursor: root.cursorOn("screen", index)
               onClicked: modelData.run()
               onHovered: function(h) { if (h) root.point("screen", index) }
             }
           }
+        }
+
+        // Why the two hand-turn buttons are not there in this pose. Keeping the
+        // reason next to the row beats leaving two buttons that only refuse.
+        Text {
+          visible: root.supported && !root.canManualRotate
+          width: parent.width
+          textFormat: Text.PlainText
+          wrapMode: Text.WordWrap
+          text: "Manual turn is unavailable in laptop mode — the screen follows "
+            + "the hinge. Fold it past a tent to turn it by hand."
+          color: root.bar.foreground
+          opacity: 0.8
+          font.family: root.bar.fontFamily
+          font.pixelSize: Style.font.bodySmall
         }
 
         // ---------- Folded behaviour ----------
