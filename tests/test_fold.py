@@ -2641,6 +2641,26 @@ class FoldDaemonStepTests(unittest.TestCase):
         self.daemon.accel.matrix = [[2.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
         self.assertIsNotNone(self.daemon.blocking_reason())
 
+    def test_blocking_reason_nan_matrix(self):
+        # The runtime gate used to check only the determinant. A single NaN
+        # cell makes `abs(det - 1) > 1e-6` false, so the daemon considered a
+        # poisoned matrix healthy and kept rotating on it.
+        self.daemon.state.panel = "eDP-1"
+        self.daemon.state.touch = "touch"
+        self.daemon.state.pen = "pen"
+        nan = float("nan")
+        self.daemon.accel.matrix = [[nan, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+        self.assertIsNotNone(self.daemon.blocking_reason())
+
+    def test_blocking_reason_shear_matrix(self):
+        # determinant +1 but the rows are not orthonormal: the old det-only
+        # runtime check let this through even though is_rotation refuses it.
+        self.daemon.state.panel = "eDP-1"
+        self.daemon.state.touch = "touch"
+        self.daemon.state.pen = "pen"
+        self.daemon.accel.matrix = [[1.0, 1.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+        self.assertIsNotNone(self.daemon.blocking_reason())
+
     def test_desired_transform_locked(self):
         self.daemon.settings["locked"] = True
         self.daemon.hypr.current_transform.return_value = 2
@@ -2863,6 +2883,72 @@ class FoldDaemonStepTests(unittest.TestCase):
             self.daemon.reload_settings()
             self.assertEqual(self.daemon.settings["oskPlugin"], "plugin-two")
             fold.SHELL_JSON = real
+
+    def test_reload_settings_matrix_only_reaches_both_sensors(self):
+        # `calibrate --write` changes mountMatrix and nothing else. The loader
+        # used to compare only SETTING_KEYS, so the new matrix never reached the
+        # live settings or the two sensors that cached it at construction.
+        with tempfile.TemporaryDirectory() as td:
+            real = fold.SHELL_JSON
+            fold.SHELL_JSON = Path(td) / "shell.json"
+            identity = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+            fold.SHELL_JSON.write_text(self._shell_with({"mountMatrix": identity}))
+            # Align the fixture's SETTING_KEYS with what a load must produce, so
+            # this is genuinely a matrix-only change and not the missing keys
+            # in the hand-built daemon settings forcing a settings change too.
+            for key in fold.SETTING_KEYS:
+                self.daemon.settings[key] = fold.DEFAULTS[key]
+            old_matrix = [list(row) for row in fold.DEFAULT_MOUNT_MATRIX]
+            self.daemon.settings["mountMatrix"] = [list(row) for row in old_matrix]
+            self.daemon.accel.matrix = [list(row) for row in old_matrix]
+            self.daemon.motion.matrix = [list(row) for row in old_matrix]
+            self.daemon.pending = set()
+            old_osk = self.daemon.osk
+            self.daemon._settings_stamp = None
+
+            with patch.object(fold, "OnScreenKeyboard") as osk_ctor:
+                self.daemon.reload_settings()
+
+            # Settings and both cached matrices are updated in place...
+            self.assertEqual(self.daemon.settings["mountMatrix"], identity)
+            # The sensors cache rows as tuples, the JSON holds lists.
+            expected = [tuple(row) for row in identity]
+            self.assertEqual(self.daemon.accel.matrix, expected)
+            self.assertEqual(self.daemon.motion.matrix, expected)
+            # ...without the SETTING_KEYS churn or a needless OSK rebuild.
+            osk_ctor.assert_not_called()
+            self.assertIs(self.daemon.osk, old_osk)
+            self.assertNotIn(fold.PENDING_SETTINGS, self.daemon.pending)
+            self.assertEqual(self.daemon.settings["locked"], fold.DEFAULTS["locked"])
+            fold.SHELL_JSON = real
+
+    def test_rebuilding_matrices_touches_nothing_else_on_the_sensors(self):
+        accel_reader = self.daemon.accel.reader
+        accel_scale = self.daemon.accel.scale
+        motion_scale = self.daemon.motion.scale
+        motion_still = self.daemon.motion.still_deg
+        identity = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+
+        self.daemon._rebuild_matrices(identity)
+
+        expected = [tuple(row) for row in identity]
+        self.assertEqual(self.daemon.accel.matrix, expected)
+        self.assertEqual(self.daemon.motion.matrix, expected)
+        # Separate lists, so a later edit to one cannot silently change the
+        # other half of the calibration.
+        self.assertIsNot(self.daemon.accel.matrix, self.daemon.motion.matrix)
+        self.assertIs(self.daemon.accel.reader, accel_reader)
+        self.assertEqual(self.daemon.accel.scale, accel_scale)
+        self.assertEqual(self.daemon.motion.scale, motion_scale)
+        self.assertEqual(self.daemon.motion.still_deg, motion_still)
+
+    def test_rebuilding_matrices_refuses_a_non_rotation(self):
+        before_accel = self.daemon.accel.matrix
+        before_motion = self.daemon.motion.matrix
+        shear = [[1.0, 1.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+        self.daemon._rebuild_matrices(shear)
+        self.assertEqual(self.daemon.accel.matrix, before_accel)
+        self.assertEqual(self.daemon.motion.matrix, before_motion)
 
     @staticmethod
     def _shell_with(entry_values):
@@ -3275,6 +3361,53 @@ class CLITests(unittest.TestCase):
         self.assertNotEqual(caught.exception.code, 0)
 
 
+class CmdSettingValidationTests(unittest.TestCase):
+    """The CLI writes only typed, validated values and never writes a bad one."""
+
+    def test_invalid_values_are_refused_without_writing(self):
+        cases = (
+            ("modeHystDeg", "garbage"),
+            ("modeHystDeg", "nan"),
+            ("modeHystDeg", "inf"),
+            ("modeHystDeg", "1e9"),
+            ("locked", "maybe"),
+            ("locked", "2"),
+            ("mapping", "sideways"),
+            ("yawSign", "2"),
+        )
+        for name, value in cases:
+            with self.subTest(name=name, value=value):
+                with (
+                    patch.object(fold, "write_shell_entry") as write,
+                    contextlib.redirect_stderr(io.StringIO()) as err,
+                ):
+                    rc = fold.cmd_setting({}, name, value)
+                self.assertEqual(rc, 1)
+                write.assert_not_called()
+                self.assertIn(name, err.getvalue())
+                self.assertIn("Invalid setting", err.getvalue())
+
+    def test_valid_values_are_written_as_typed_values(self):
+        cases = (
+            ("modeHystDeg", "12.5", {"modeHystDeg": 12.5}),
+            ("locked", "false", {"locked": False}),
+            ("locked", "on", {"locked": True}),
+            ("yawSign", "-1", {"yawSign": -1}),
+            ("mapping", "rotated-180", {"mapping": "rotated-180"}),
+            ("oskPlugin", "my.osk", {"oskPlugin": "my.osk"}),
+        )
+        for name, value, expected in cases:
+            with self.subTest(name=name, value=value):
+                with (
+                    patch.object(fold, "write_shell_entry", return_value=True) as write,
+                    contextlib.redirect_stdout(io.StringIO()) as out,
+                ):
+                    rc = fold.cmd_setting({}, name, value)
+                self.assertEqual(rc, 0)
+                write.assert_called_once_with(expected)
+                self.assertIn(name, out.getvalue())
+
+
 class WriteShellEntryTests(unittest.TestCase):
     def setUp(self):
         self._real_shell = fold.SHELL_JSON
@@ -3529,6 +3662,153 @@ class Settings(unittest.TestCase):
             [list(r) for r in fold.DEFAULT_MOUNT_MATRIX],
         )
 
+    def test_a_non_finite_stored_matrix_falls_back(self):
+        # A NaN cell makes every `abs(...) > tolerance` check in is_rotation
+        # false, so an unhardened validator would accept it and poison every
+        # angle derived from it. The stored value is written as strings to
+        # mirror a hand edit; is_rotation coerces them before the finiteness
+        # check, which is where the trap used to be.
+        self._write_entry(
+            {"mountMatrix": [["nan", "0", "0"], ["0", "1", "0"], ["0", "0", "1"]]}
+        )
+        self.assertEqual(
+            fold.load_settings()["mountMatrix"],
+            [list(r) for r in fold.DEFAULT_MOUNT_MATRIX],
+        )
+
+    def test_an_unrepresentable_stored_matrix_falls_back(self):
+        # A 400-digit int parses fine as JSON but cannot be made a float. If
+        # is_rotation lets OverflowError escape, load_settings -- and with it
+        # the daemon at startup -- dies on a hand-edited file.
+        self._write_entry(
+            {
+                "mountMatrix": [
+                    [10**400, 0, 0],
+                    [0, 1, 0],
+                    [0, 0, 1],
+                ]
+            }
+        )
+        self.assertEqual(
+            fold.load_settings()["mountMatrix"],
+            [list(r) for r in fold.DEFAULT_MOUNT_MATRIX],
+        )
+
+    def test_garbage_numeric_setting_falls_back_to_its_default(self):
+        # The panel writes straight to shell.json, so this is the only defence
+        # against a bad value reaching a float() cast on the next daemon pass.
+        self._write_entry({"modeHystDeg": "garbage"})
+        self.assertEqual(
+            fold.load_settings()["modeHystDeg"], fold.DEFAULTS["modeHystDeg"]
+        )
+
+    def test_non_finite_numeric_setting_falls_back_to_its_default(self):
+        self._write_entry({"yawDeadbandDeg": "inf"})
+        self.assertEqual(
+            fold.load_settings()["yawDeadbandDeg"],
+            fold.DEFAULTS["yawDeadbandDeg"],
+        )
+
+    def test_a_hand_edited_false_string_is_boolean_false(self):
+        # The old loader copied the raw string. "false" is truthy in Python, so
+        # a person turning the lock off by hand in shell.json left the screen
+        # locked and never saw a rotation.
+        self._write_entry({"locked": "false"})
+        self.assertIs(fold.load_settings()["locked"], False)
+
+    def test_a_case_insensitive_true_token_is_boolean_true(self):
+        self._write_entry({"oskAuto": "YES"})
+        self.assertIs(fold.load_settings()["oskAuto"], True)
+
+    def test_a_valid_numeric_string_is_coerced_to_a_float(self):
+        self._write_entry({"flatToleranceDeg": "25.5"})
+        value = fold.load_settings()["flatToleranceDeg"]
+        self.assertIsInstance(value, float)
+        self.assertEqual(value, 25.5)
+
+
+class SettingValidationTests(unittest.TestCase):
+    """The typed spec both input boundaries share.
+
+    `cmd_setting` and `load_settings` must agree on what a value means: the CLI
+    turns a string into a typed value before writing, and the loader turns the
+    typed or hand-edited value from the file back into the same type. These
+    tests pin the shared contract, including that it never raises.
+    """
+
+    def test_setting_keys_are_derived_from_the_spec(self):
+        self.assertEqual(fold.SETTING_KEYS, tuple(fold.SETTING_SPEC))
+        self.assertEqual(len(fold.SETTING_KEYS), 11)
+        self.assertNotIn("mountMatrix", fold.SETTING_KEYS)
+
+    def test_every_default_validates_to_itself(self):
+        for key in fold.SETTING_KEYS:
+            with self.subTest(key=key):
+                ok, typed, error = fold.validate_setting(key, fold.DEFAULTS[key])
+                self.assertTrue(ok, error)
+                self.assertEqual(typed, fold.DEFAULTS[key])
+                self.assertIs(type(typed), type(fold.DEFAULTS[key]))
+
+    def test_valid_values_are_accepted_with_the_right_type(self):
+        cases = (
+            ("locked", "TRUE", True),
+            ("locked", "off", False),
+            ("locked", "yes", True),
+            ("locked", "No", False),
+            ("locked", 1, True),
+            ("locked", False, False),
+            ("modeHystDeg", "12.5", 12.5),
+            ("modeHystDeg", -1e6, -1e6),
+            ("modeHystDeg", 1e6, 1e6),
+            ("yawSign", "-1", -1),
+            ("yawSign", 1, 1),
+            ("mapping", "portrait-swapped", "portrait-swapped"),
+            ("oskPlugin", "any.plugin.id", "any.plugin.id"),
+        )
+        for key, raw, expected in cases:
+            with self.subTest(key=key, raw=raw):
+                ok, typed, error = fold.validate_setting(key, raw)
+                self.assertTrue(ok, error)
+                self.assertEqual(typed, expected)
+                self.assertIs(type(typed), type(expected))
+
+    def test_invalid_values_are_rejected_with_a_named_error(self):
+        cases = (
+            ("modeHystDeg", "garbage"),
+            ("modeHystDeg", "nan"),
+            ("modeHystDeg", float("nan")),
+            ("modeHystDeg", "inf"),
+            ("modeHystDeg", float("-inf")),
+            ("modeHystDeg", "1e9"),
+            ("modeHystDeg", None),
+            ("locked", "maybe"),
+            ("locked", "2"),
+            ("yawSign", "0"),
+            ("yawSign", "2"),
+            ("yawSign", "1.5"),
+            ("mapping", "sideways"),
+            ("mapping", 1),
+            ("oskPlugin", 42),
+            ("unknownKey", "x"),
+        )
+        for key, raw in cases:
+            with self.subTest(key=key, raw=raw):
+                ok, typed, error = fold.validate_setting(key, raw)
+                self.assertFalse(ok)
+                self.assertIsNone(typed)
+                self.assertIn(key, error)
+                self.assertIsInstance(error, str)
+
+    def test_it_never_raises_on_unexpected_input(self):
+        for raw in (object(), [1, 2], {"a": 1}, complex(1, 2), float("nan")):
+            with self.subTest(raw=type(raw).__name__):
+                for key in ("modeHystDeg", "locked", "yawSign", "oskPlugin"):
+                    ok, typed, error = fold.validate_setting(key, raw)
+                    self.assertIsInstance(ok, bool)
+                    self.assertIsInstance(error, str)
+                    if not ok:
+                        self.assertIsNone(typed)
+
 
 class IsRotationTests(unittest.TestCase):
     """The one check standing between a stored matrix and the screen.
@@ -3594,6 +3874,32 @@ class IsRotationTests(unittest.TestCase):
         for matrix in (None, "identity", 42, {"rows": 3}, [1.0, 0.0, 0.0]):
             with self.subTest(matrix=matrix):
                 self.assertFalse(fold.is_rotation(matrix))
+
+    def test_non_finite_cells_are_not_a_rotation(self):
+        # The determinant and orthonormality checks are all `abs(x) > 1e-6`
+        # comparisons. NaN makes each of them false, so without an explicit
+        # finiteness pass a matrix like these would be accepted as a rotation.
+        nan, inf = float("nan"), float("inf")
+        cases = (
+            ("one nan cell", [[nan, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]),
+            ("all nan cells", [[nan, nan, nan], [nan, nan, nan], [nan, nan, nan]]),
+            ("one +inf cell", [[inf, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]),
+            ("one -inf cell", [[-inf, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]),
+            ("string nan cell", [["nan", "0", "0"], ["0", "1", "0"], ["0", "0", "1"]]),
+        )
+        for label, matrix in cases:
+            with self.subTest(label=label):
+                self.assertFalse(fold.is_rotation(matrix))
+
+    def test_an_unrepresentable_integer_cell_is_not_a_rotation(self):
+        # JSON parses a 400-digit number as a Python int, and float(10**400)
+        # raises OverflowError. The coercion catch has to include it or a
+        # hand-edited shell.json crashes daemon startup instead of falling
+        # back to the shipped matrix.
+        huge = 10**400
+        self.assertFalse(
+            fold.is_rotation([[huge, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+        )
 
     def test_a_matrix_of_strings_that_parse_is_a_rotation(self):
         # `calibrate --write` takes floats from argparse, but the value read
@@ -3935,6 +4241,62 @@ class CalibrateTests(unittest.TestCase):
         parser = fold.build_parser()
         args = parser.parse_args(["calibrate"])
         self.assertIsNone(args.write)
+
+    def _write_calibration_args(self, write):
+        return type("Args", (), {"write": write})()
+
+    def _run_calibrate_write(self, write_result):
+        """Drive `calibrate --write` past the interactive part with stubs."""
+        identity = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+        accel = MagicMock()
+        accel.available = True
+        accel.read.return_value = fold.AccelSample(
+            (0.0, 0.0, 9.8), (0.0, 0.0, 1.0), 9.8, True
+        )
+        hinge = MagicMock()
+        hinge.available = True
+        hinge.read.return_value = fold.HingeSample(102.0, 101.0, 0.0, 102.0, 0.0, True)
+        hypr = MagicMock()
+        hypr.internal_monitor.return_value = "eDP-1"
+        hypr.match_device.return_value = "a-device"
+        machine = fold.Machine(
+            "LENOVO", "20FE", "ThinkPad Yoga 260", "31", "20FES04T1M", "N1GETA9W"
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            real = fold.SHELL_JSON
+            fold.SHELL_JSON = Path(td) / "shell.json"
+            fold.SHELL_JSON.write_text(json.dumps({}))
+            try:
+                with (
+                    patch.object(fold.Machine, "detect", return_value=machine),
+                    patch.object(fold, "Hyprland", return_value=hypr),
+                    patch.object(fold, "open_sensors", return_value=(accel, hinge)),
+                    patch("builtins.input", side_effect=["", "y"]),
+                    patch.object(
+                        fold, "write_shell_entry", return_value=write_result
+                    ) as write,
+                    contextlib.redirect_stdout(io.StringIO()) as out,
+                    contextlib.redirect_stderr(io.StringIO()) as err,
+                ):
+                    rc = fold.calibrate(self._write_calibration_args(identity))
+                return rc, out.getvalue(), err.getvalue(), write, fold.SHELL_JSON
+            finally:
+                fold.SHELL_JSON = real
+
+    def test_calibrate_write_failure_is_reported(self):
+        rc, _, err, write, shell_json = self._run_calibrate_write(False)
+        self.assertEqual(rc, 1)
+        write.assert_called_once()
+        self.assertIn("Could not write mountMatrix", err)
+        self.assertIn(str(shell_json), err)
+
+    def test_calibrate_write_success_is_reported(self):
+        rc, out, err, write, _ = self._run_calibrate_write(True)
+        self.assertEqual(rc, 0)
+        write.assert_called_once()
+        self.assertIn("wrote mountMatrix", out)
+        self.assertEqual(err, "")
 
 
 class CmdAnalyzeTests(unittest.TestCase):
