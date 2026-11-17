@@ -236,6 +236,21 @@ DEFAULTS = {
 
 MAPPINGS = ("standard", "portrait-swapped", "landscape-swapped", "rotated-180")
 
+# Work that cannot wait for the sensors to move. One set, with named keys, is
+# what opens the loop's gate on an otherwise idle machine -- six independent
+# booleans would be six more things that can silently drift out of sync.
+PENDING_SETTINGS = "settings"
+PENDING_YAW = "yaw"
+PENDING_DEVICE = "device"
+PENDING_RESUME = "resume"
+PENDING_DIGITIZER = "digitizer"
+# A dead hyprctl must not be called ten times a second because a retry is
+# pending; one attempt a second is still far inside the response budget.
+DEVICE_RETRY_COOLDOWN = 1.0
+# Called only when no step ran. `_publish` dedupes identical payloads and caps
+# writes at one a second, so this keeps the panel honest without a hot loop.
+PUBLISH_HEARTBEAT_SEC = 0.5
+
 # Nerd Font glyphs, so the panel and the bar button can say what they mean.
 ICONS = {
     "tablet": "󰓆",  # nf-md-tablet
@@ -1965,6 +1980,9 @@ class FoldDaemon:
         self.osk = OnScreenKeyboard(settings)
         self.fingerprint = FingerprintReader()
         self.stop = False
+        self.pending: set[str] = set()
+        self.next_device_retry = 0.0
+        self.next_heartbeat = 0.0
         self.decision: int | None = None
         self.decision_since = time.monotonic()
         self.still = True
@@ -2104,6 +2122,17 @@ class FoldDaemon:
         # see. Published whether or not the machine is flat, so `debug` can show
         # it, but only acted on when `flat` says the accelerometer is blind.
         pose["verticalRate"] = self.motion.vertical_rate(pose["base_up"])
+        # A flat in-plane turn changes neither the fold nor the accelerometer,
+        # so `changed()` cannot see it. Mark the work here, from the same sample
+        # the decision will use, instead of waiting for a sensor jitter that may
+        # never come.
+        rate = pose["verticalRate"]
+        if (
+            pose["flat"]
+            and isinstance(rate, (int, float))
+            and abs(rate) >= float(self.settings.get("yawDeadbandDeg", 15.0))
+        ):
+            self.pending.add(PENDING_YAW)
 
         # Two independent estimates of how each half sits against gravity: one
         # from the accelerometer, one from the hinge hub's own tilt channels.
@@ -2249,7 +2278,11 @@ class FoldDaemon:
         if abs(rate) < float(self.settings["yawDeadbandDeg"]):
             # Not turning. The total is left exactly as it stands rather than
             # decayed towards zero, because a turn that has happened has
-            # happened; only the "still mid-turn" flag is cleared.
+            # happened; only the "still mid-turn" flag is cleared. The turn just
+            # ending needs one more pass so the banked quarter becomes a panel
+            # transform even if the sensors never move again.
+            if self.yaw_turning:
+                self.pending.add(PENDING_YAW)
             self.yaw_turning = False
             return
         if not self.yaw_turning:
@@ -2417,6 +2450,11 @@ class FoldDaemon:
         self.last_applied = time.monotonic()
 
     def verify(self) -> None:
+        if PENDING_SETTINGS in self.pending or PENDING_DIGITIZER in self.pending:
+            # Re-asserting the current transform over a settings change or an
+            # incomplete rotation would put back the very state the pending
+            # pass is trying to replace. Let that pass run first.
+            return
         current = self.hypr.current_transform(self.state.panel)
         if current is None:
             return  # pragma: no cover
@@ -2425,6 +2463,10 @@ class FoldDaemon:
             # reload, a monitor re-creation, a monitor rule being rebuilt. Put
             # it back rather than waiting for a tilt that may never come.
             self.apply(self.state.transform)
+            if self.state.last_error:
+                self.pending.add(PENDING_DIGITIZER)
+            else:
+                self.pending.discard(PENDING_DIGITIZER)
 
     def restore_devices(self) -> bool:
         """Assert that every internal input device is enabled.
@@ -2504,10 +2546,17 @@ class FoldDaemon:
             # recovers without a hand on hyprctl -- which is how a laptop
             # mode ended up with a dead keyboard and a clean status.
             self.state.last_error = "; ".join(failed)
+            # The flags are left alone on purpose, but that used to promise a
+            # retry on "the next pass" -- and a stationary machine has no next
+            # pass. Mark the work and rate-limit it so a dead hyprctl is not
+            # called at the sensor rate.
+            self.pending.add(PENDING_DEVICE)
+            self.next_device_retry = time.monotonic() + DEVICE_RETRY_COOLDOWN
             return
         self.state.last_error = ""
         self.state.keyboard_disabled = keyboard
         self.state.pointers_disabled = pointers
+        self.pending.discard(PENDING_DEVICE)
 
 
     # -- reporting --------------------------------------------------------
@@ -2934,7 +2983,10 @@ class FoldDaemon:
         if any(fresh.get(key) != self.settings.get(key) for key in SETTING_KEYS):
             self.settings = fresh
             # A new mapping or a changed lock has to be able to move the screen
-            # on the very next pass, so make sure the loop looks again.
+            # on the very next pass, so make sure the loop looks again. Updating
+            # the dictionary alone changed the truth the panel saw without ever
+            # opening the gate; a panel tap could wait forever for sensor jitter.
+            self.pending.add(PENDING_SETTINGS)
             self.osk = OnScreenKeyboard(self.settings)
 
     def run(self) -> int:

@@ -466,6 +466,9 @@ class FlatTurnTracking(unittest.TestCase):
 
     def _daemon(self, anchor=0):
         daemon = fold.FoldDaemon.__new__(fold.FoldDaemon)
+        daemon.pending = set()
+        daemon.next_device_retry = 0.0
+        daemon.next_heartbeat = 0.0
         daemon.settings = fold.load_settings()
         daemon.state = fold.State()
         daemon.yaw_deg = 0.0
@@ -699,6 +702,9 @@ class Mode(unittest.TestCase):
 
     def setUp(self):
         self.daemon = fold.FoldDaemon.__new__(fold.FoldDaemon)
+        self.daemon.pending = set()
+        self.daemon.next_device_retry = 0.0
+        self.daemon.next_heartbeat = 0.0
         self.daemon.settings = {
             "bookExitDeg": 190.0,
             "tentEnterDeg": 270.0,
@@ -742,6 +748,9 @@ class BookMode(unittest.TestCase):
 
     def test_a_locked_screen_adopts_the_panel(self):
         daemon = fold.FoldDaemon.__new__(fold.FoldDaemon)
+        daemon.pending = set()
+        daemon.next_device_retry = 0.0
+        daemon.next_heartbeat = 0.0
         daemon.settings = {"locked": True}
         daemon.hypr = self.StubHypr(2)
         daemon.state = fold.State()
@@ -752,6 +761,9 @@ class BookMode(unittest.TestCase):
 
     def test_a_locked_screen_does_not_fight_a_hand_turn(self):
         daemon = fold.FoldDaemon.__new__(fold.FoldDaemon)
+        daemon.pending = set()
+        daemon.next_device_retry = 0.0
+        daemon.next_heartbeat = 0.0
         daemon.settings = {"locked": True}
         daemon.hypr = self.StubHypr(3)
         daemon.state = fold.State()
@@ -772,6 +784,9 @@ def bare_daemon(**settings):
     had ever checked a decision.
     """
     daemon = fold.FoldDaemon.__new__(fold.FoldDaemon)
+    daemon.pending = set()
+    daemon.next_device_retry = 0.0
+    daemon.next_heartbeat = 0.0
     daemon.settings = {
         "mapping": "standard",
         "locked": False,
@@ -1118,6 +1133,9 @@ class HingeTelemetryCadenceTests(unittest.TestCase):
         fold.SHELL_JSON.write_text(json.dumps({"bar": {"layout": {"right": []}}}))
 
         daemon = fold.FoldDaemon.__new__(fold.FoldDaemon)
+        daemon.pending = set()
+        daemon.next_device_retry = 0.0
+        daemon.next_heartbeat = 0.0
         daemon.settings = fold.load_settings()
         daemon.state = fold.State()
         daemon.machine = fold.Machine(
@@ -1535,6 +1553,9 @@ class ModeBandTests(unittest.TestCase):
 
     def _daemon(self, release=170.0):
         daemon = fold.FoldDaemon.__new__(fold.FoldDaemon)
+        daemon.pending = set()
+        daemon.next_device_retry = 0.0
+        daemon.next_heartbeat = 0.0
         daemon.settings = {
             "bookExitDeg": 190.0,
             "bookReleaseDeg": release,
@@ -2117,6 +2138,9 @@ class FoldDaemonStepTests(unittest.TestCase):
         )
         self.addCleanup(self._restore_shell)
         self.daemon = fold.FoldDaemon.__new__(fold.FoldDaemon)
+        self.daemon.pending = set()
+        self.daemon.next_device_retry = 0.0
+        self.daemon.next_heartbeat = 0.0
         self.daemon.settings = {
             "bookExitDeg": 190.0,
             "tentEnterDeg": 270.0,
@@ -4155,6 +4179,9 @@ class FoldDaemonRunTests(unittest.TestCase):
         other tests in the process, which is not a thing a unit test may do.
         """
         daemon = fold.FoldDaemon.__new__(fold.FoldDaemon)
+        daemon.pending = set()
+        daemon.next_device_retry = 0.0
+        daemon.next_heartbeat = 0.0
         daemon.settings = {"pollSec": 0.001, "verifySec": 0.001}
         daemon.state = fold.State()
         daemon.stop = False
@@ -4301,6 +4328,9 @@ class PollLockStateTests(unittest.TestCase):
 
     def _daemon(self, *locked):
         daemon = fold.FoldDaemon.__new__(fold.FoldDaemon)
+        daemon.pending = set()
+        daemon.next_device_retry = 0.0
+        daemon.next_heartbeat = 0.0
         daemon.state = fold.State()
         script = {"values": list(locked)}
 
@@ -4349,6 +4379,9 @@ class PollLockStateTests(unittest.TestCase):
 class AnnounceTests(unittest.TestCase):
     def setUp(self):
         self.daemon = fold.FoldDaemon.__new__(fold.FoldDaemon)
+        self.daemon.pending = set()
+        self.daemon.next_device_retry = 0.0
+        self.daemon.next_heartbeat = 0.0
         self.daemon.state = fold.State()
         self.daemon.state.folded = False
         self.daemon.state.mode = "book"
@@ -4385,6 +4418,9 @@ class AnnounceTests(unittest.TestCase):
 class VerifyTests(unittest.TestCase):
     def setUp(self):
         self.daemon = fold.FoldDaemon.__new__(fold.FoldDaemon)
+        self.daemon.pending = set()
+        self.daemon.next_device_retry = 0.0
+        self.daemon.next_heartbeat = 0.0
         self.daemon.state = fold.State()
         self.daemon.state.panel = "eDP-1"
         self.daemon.state.transform = 0
@@ -4413,6 +4449,9 @@ class VerifyTests(unittest.TestCase):
 class ResolveDevicesTests(unittest.TestCase):
     def setUp(self):
         self.daemon = fold.FoldDaemon.__new__(fold.FoldDaemon)
+        self.daemon.pending = set()
+        self.daemon.next_device_retry = 0.0
+        self.daemon.next_heartbeat = 0.0
         self.daemon.state = fold.State()
         self.daemon.settings = {
             "touchPattern": "wacom.*finger",
