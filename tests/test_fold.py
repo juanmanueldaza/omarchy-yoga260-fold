@@ -2971,6 +2971,161 @@ class FoldDaemonStepTests(unittest.TestCase):
         self.assertIn("etps/2-elantech-touchpad", disabled)
         self.assertIn("etps/2-elantech-trackpoint", disabled)
 
+    def _drive_loop(
+        self, passes, *, poll=0.0, pose_patch=None, on_pose=None, sleep=None
+    ):
+        """Run the real run() decision path for a bounded number of passes.
+
+        `changed`, `step` and `_publish` are deliberately NOT mocked: the whole
+        point is to exercise the gate these tests used to bypass. The pass
+        count is enforced by wrapping read_pose, which also gives each test a
+        hook to inject a posture or expire a timer.
+        """
+        self.daemon.settings["pollSec"] = poll
+        self.daemon.stop = False
+        self.daemon._last_lock_state = False
+        for name, value in (
+            ("_last_yaw_at", None),
+            ("yaw_deg", 0.0),
+            ("yaw_anchor", "normal"),
+            ("yaw_turning", False),
+        ):
+            if not hasattr(self.daemon, name):
+                setattr(self.daemon, name, value)
+        self.daemon.hypr.session_locked.return_value = False
+        real_read = self.daemon.read_pose
+        observed = []
+
+        def counted():
+            pose = real_read()
+            if pose_patch is not None:
+                pose_patch(pose)
+            observed.append(pose)
+            if on_pose is not None:
+                on_pose(len(observed), pose)
+            if len(observed) > passes:
+                self.daemon.stop = True
+            return pose
+
+        self.daemon.read_pose = counted
+        recorded = sleep if sleep is not None else MagicMock()
+        with (
+            patch.object(fold.time, "sleep", recorded),
+            patch.object(fold.FoldDaemon, "write_state", MagicMock()),
+            patch.object(fold, "_osd", MagicMock()),
+        ):
+            rc = self.daemon.run()
+        self.assertEqual(rc, 0)
+        return observed, recorded
+
+    def test_real_loop_flat_turn_reaches_track_yaw_with_unchanged_sensors(self):
+        self.daemon.accel.read.return_value = fold.AccelSample(
+            (0, -9.22, -1.29), (0.0, 0.0, 1.0), 9.8, True
+        )
+        self.daemon.motion.vertical_rate.return_value = 100.0
+        marked = []
+
+        def patch_pose(pose):
+            pose["still"] = True
+            marked.append(fold.PENDING_YAW in self.daemon.pending)
+
+        with patch.object(
+            fold.FoldDaemon, "track_yaw", wraps=self.daemon.track_yaw
+        ) as track:
+            observed, _ = self._drive_loop(3, pose_patch=patch_pose)
+        self.assertGreaterEqual(track.call_count, 1)
+        self.assertTrue(any(marked), "a flat in-plane turn was never marked as work")
+        key = lambda pose: (
+            round(pose["fold"]),
+            tuple(round(value, 2) for value in pose["accel"].vector),
+        )
+        self.assertEqual(len({key(pose) for pose in observed}), 1)
+
+    def test_real_loop_banked_yaw_applies_the_transform_on_stillness(self):
+        self.daemon.accel.read.return_value = fold.AccelSample(
+            (0, -9.22, -1.29), (0.0, 0.0, 1.0), 9.8, True
+        )
+        self.daemon.settings["yawSign"] = 1
+        self.daemon.settings["yawQuarterDeg"] = 45.0
+        self.daemon.yaw_deg = -64.7
+        self.daemon.yaw_anchor = "normal"
+        self.daemon.yaw_turning = False
+        self.daemon._last_yaw_at = None
+        self.daemon.motion.vertical_rate.return_value = 0.2
+
+        def patch_pose(pose):
+            pose["still"] = True
+
+        self._drive_loop(2, pose_patch=patch_pose)
+        self.daemon.hypr.rotate_transaction.assert_called_with(
+            "eDP-1",
+            3,
+            [
+                "wacom-pen-and-multitouch-sensor-finger",
+                "wacom-pen-and-multitouch-sensor-pen",
+            ],
+        )
+        self.assertEqual(self.daemon.state.transform, 3)
+
+    def test_real_loop_settings_revision_forces_a_pass_without_sensor_jitter(self):
+        document = json.loads(fold.SHELL_JSON.read_text())
+        document["bar"]["layout"]["right"][0]["locked"] = True
+        fold.SHELL_JSON.write_text(json.dumps(document))
+        with patch.object(fold.FoldDaemon, "step", wraps=self.daemon.step) as step:
+            observed, _ = self._drive_loop(3)
+        self.assertGreaterEqual(step.call_count, 1)
+        self.assertTrue(self.daemon.settings["locked"])
+        key = lambda pose: (
+            round(pose["fold"]),
+            tuple(round(value, 2) for value in pose["accel"].vector),
+        )
+        self.assertEqual(len({key(pose) for pose in observed}), 1)
+
+    def test_real_loop_failed_device_write_retries_without_a_sensor_change(self):
+        self.daemon.state.keyboard_disabled = True
+        self.daemon.state.pointers_disabled = True
+        failed_once = [False]
+
+        def enable(name, enabled):
+            if not failed_once[0]:
+                failed_once[0] = True
+                return False, "hyprctl refused"
+            return True, ""
+
+        self.daemon.hypr.set_device_enabled.side_effect = enable
+
+        def expire_cooldown(number, pose):
+            # The retry is rate-limited; the test advances its timer rather
+            # than sleeping a real second.
+            if number >= 2:
+                self.daemon.next_device_retry = 0.0
+
+        with patch.object(self.daemon, "restore_devices", return_value=True):
+            self._drive_loop(4, on_pose=expire_cooldown)
+        self.assertFalse(self.daemon.state.keyboard_disabled)
+        self.assertNotIn(fold.PENDING_DEVICE, self.daemon.pending)
+
+    def test_real_loop_heartbeat_keeps_idle_status_fresh(self):
+        self.daemon.emit = MagicMock()
+
+        def expire_heartbeat(number, pose):
+            self.daemon.next_heartbeat = 0.0
+
+        with patch.object(
+            fold.FoldDaemon, "_publish", wraps=self.daemon._publish
+        ) as publish:
+            self._drive_loop(5, on_pose=expire_heartbeat)
+        self.assertGreaterEqual(publish.call_count, 4)
+
+    def test_real_loop_poll_sleep_subtracts_the_work_done(self):
+        sleeps = MagicMock()
+        _, recorded = self._drive_loop(3, poll=0.1, sleep=sleeps)
+        self.assertGreater(len(recorded.call_args_list), 0)
+        for call in recorded.call_args_list:
+            slept = call.args[0]
+            self.assertGreater(slept, 0.0)
+            self.assertLess(slept, 0.1)
+
 
 class CLITests(unittest.TestCase):
     def setUp(self):
