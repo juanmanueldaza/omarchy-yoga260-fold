@@ -3030,8 +3030,10 @@ class FoldDaemon:
                 # Reading it separately for those two questions is what put twelve
                 # reads and two possible poses on every pass.
                 pose = self.read_pose()
+                stepped = False
                 if self.changed(pose) or self.settling() or self.due_pending(time.monotonic()):
                     self.step(pose)
+                    stepped = True
                     after = (self.state.mode, self.state.transform, self.state.orientation)
                     if after != announced and not self.state.messages:
                         announced = after
@@ -3072,6 +3074,13 @@ class FoldDaemon:
                     self.verify()
                     self.resolve_devices()
                     next_verify = now + verify
+                if not stepped and now >= self.next_heartbeat:
+                    # `_publish` is otherwise reached only from `step`, so a
+                    # daemon sitting still let its state file grow stale and the
+                    # panel declared it dead. The signature dedupe in `_publish`
+                    # keeps this at one write a second at most.
+                    self._publish()
+                    self.next_heartbeat = now + PUBLISH_HEARTBEAT_SEC
                 # Keep to a schedule rather than sleeping a flat interval after the
                 # work. The sensor reads block -- they are synchronous round trips
                 # into the driver -- so `sleep(poll)` on top of them made the real
