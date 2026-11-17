@@ -3025,6 +3025,7 @@ class FoldDaemon:
             # about the compositor; assert the safe state before watching.
             self.restore_devices()
             while not self.stop:
+                start = time.monotonic()
                 # One sample per pass, taken once and used both to decide whether
                 # anything has moved and, if it has, to decide what to do about it.
                 # Reading it separately for those two questions is what put twelve
@@ -3088,7 +3089,7 @@ class FoldDaemon:
                 # the panel shows was optimistic by the entire cost of reading the
                 # hardware. How much that is depends on how many channels the pass
                 # touches; see `Hinge.read_fold` for the per-attribute cost.
-                spent = time.monotonic() - now
+                spent = time.monotonic() - start
                 time.sleep(max(0.0, poll - spent))
         finally:
             # SIGTERM and SIGINT only set `stop`. Without this, stopping a daemon
