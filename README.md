@@ -236,6 +236,7 @@ the thing that has to feel instant.
 fold=~/.config/omarchy/plugins/juanmanueldaza.yoga260-fold/bin/omarchy-yoga260-fold
 
 $fold doctor        # what this machine actually has, read-only
+$fold fingerprint   # probe fingerprint health once (wakes fprintd)
 $fold status        # the state the bar shows, as JSON
 $fold debug         # live raw and derived values, while you fold it
 $fold self-test     # the arithmetic, with no hardware involved
@@ -256,6 +257,12 @@ $fold daemon        # the watcher itself; the shell starts this for you
 `doctor` and `self-test` are the two worth running first. `self-test` checks the
 matrix, the hinge rotation and the pose classification in closed form, so it is
 also the check to run on a machine that is *not* a Yoga 260.
+
+`status` reports only fingerprint facts that need no service activation — USB
+presence, the fprintd unit state and the PAM wiring. Enrollment is probed only by
+`doctor` and the explicit `fingerprint` command: `fprintd-list` wakes a static
+fprintd, and that unit's teardown resets the fingerprint USB device, so polling
+it from the daemon was a hardware disturbance rather than a health check.
 
 ## Calibration
 
@@ -285,7 +292,7 @@ manifest.json                     the plugin contract
 Service.qml                       mounts the daemon once, owns the state
 Fold.qml                          the bar button and its panel
 bin/omarchy-yoga260-fold          the daemon and CLI, Python 3, no dependencies
-tests/                            328 tests + 16 subtests; the arithmetic is the point
+tests/                            335 tests + 16 subtests; the arithmetic is the point
 docs/hardware.md                  this machine, in the detail it deserves
 docs/calibration.md               how to confirm it by hand
 ```

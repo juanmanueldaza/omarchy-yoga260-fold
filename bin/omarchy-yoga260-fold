@@ -1715,9 +1715,14 @@ class FingerprintReader:
 
     Everything here is readable by the invoking user: sysfs for the USB id,
     `systemctl is-enabled/is-active` for the unit, the PAM files themselves,
-    and `fprintd-list` for the caller's own prints. Nothing here writes, and
-    the enrollment probe is only skipped while the unit is masked, where
-    activation can never succeed and the attempt is pure noise.
+    and `fprintd-list` for the caller's own prints. Nothing here writes.
+
+    The enrollment probe is opt-in and never runs from the daemon's status
+    path. `fprintd-list` wakes a static fprintd over D-Bus, and that unit's
+    teardown resets the Validity USB device about a second later -- a probe
+    every 30 s is a hardware disturbance, not a health check. `status`
+    therefore publishes only the static facts (USB presence, unit state, PAM
+    wiring); `doctor` and the explicit `fingerprint` command pass `probe=True`.
     """
 
     def __init__(self) -> None:
@@ -1787,10 +1792,18 @@ class FingerprintReader:
             1 for line in done.stdout.splitlines() if re.match(r"\s*-\s+#\d+:", line)
         )
 
-    def as_dict(self, *, force: bool = False) -> dict[str, Any]:
+    def as_dict(self, *, probe: bool = False, force: bool = False) -> dict[str, Any]:
+        """Report the stack; run `fprintd-list` only when explicitly asked.
+
+        `status` publishes this from the daemon's loop, so the default is the
+        safe path: no subprocess that can activate fprintd. The static facts
+        are cheap (sysfs, `systemctl`, PAM files) and cached for the usual TTL;
+        a probe result is never cached, so it cannot leak into streamed status.
+        """
         now = time.monotonic()
         if (
-            not force
+            not probe
+            and not force
             and self._cached is not None
             and now - self._cached_at < FINGERPRINT_CACHE_TTL
         ):
@@ -1798,12 +1811,8 @@ class FingerprintReader:
         present = self.sensor_present()
         enabled_state, active_state = self.unit_states()
         pam = self.pam_wired()
-        # A healthy fprintd is `static`: no [Install] section, started on
-        # demand over dbus. `is-enabled` says "static" for it, and the list
-        # probe below is what wakes it. Only a masked unit is skipped, because
-        # activation can never succeed and the attempt is pure noise.
-        fingers = self.enrolled() if enabled_state != "masked" else None
         startable = enabled_state in ("enabled", "static")
+        reason = ""
         if not present:
             reason = f"no {FINGERPRINT_USB_ID} fingerprint sensor on USB"
         elif enabled_state == "masked":
@@ -1812,13 +1821,7 @@ class FingerprintReader:
             reason = f"fprintd unit is {enabled_state}"
         elif not pam:
             reason = "pam_fprintd is not wired into sudo, polkit or the lock screen"
-        elif fingers == 0:
-            reason = "no fingerprints enrolled"
-        elif active_state == "active" and fingers is None:
-            reason = "fprintd did not answer the enrollment probe"
-        else:
-            reason = ""
-        report = {
+        report: dict[str, Any] = {
             "sensor": {"present": present, "usbId": FINGERPRINT_USB_ID},
             "service": {
                 "enabled": startable,
@@ -1827,12 +1830,27 @@ class FingerprintReader:
                 "activeState": active_state,
             },
             "pam": pam,
-            "enrolled": fingers,
+            "enrolled": None,
+            "enrolledProbed": False,
             "ok": not reason,
             "reason": reason,
         }
-        self._cached = report
-        self._cached_at = now
+        if probe:
+            # The only call to `enrolled()`, and therefore the only call to
+            # `fprintd-list`. A masked unit can never answer, so do not wake it.
+            fingers = self.enrolled() if enabled_state != "masked" else None
+            report["enrolled"] = fingers
+            report["enrolledProbed"] = True
+            if not reason:
+                if fingers == 0:
+                    reason = "no fingerprints enrolled"
+                elif fingers is None and active_state == "active":
+                    reason = "fprintd did not answer the enrollment probe"
+                report["ok"] = not reason
+                report["reason"] = reason
+        else:
+            self._cached = report
+            self._cached_at = now
         return report
 
 
@@ -2533,6 +2551,9 @@ class FoldDaemon:
                 ),
             },
             "osk": self.osk.as_dict(),
+            # Static facts only. `fprintd-list` wakes a static fprintd and its
+            # teardown resets the fingerprint USB device, so enrollment is
+            # probed by `doctor` / `fingerprint`, never by this loop (#11).
             "fingerprint": self.fingerprint.as_dict(),
             "mapping": {"options": list(MAPPINGS), "current": self.settings["mapping"]},
             "icons": ICONS,
@@ -3622,6 +3643,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("daemon", help="run the watcher (the shell starts this)")
     sub.add_parser("status", help="print the current state as JSON")
     sub.add_parser("doctor", help="report what this machine actually has")
+    sub.add_parser("fingerprint", help="probe fingerprint health once (wakes fprintd)")
     sub.add_parser("debug", help="stream raw and derived values")
     sub.add_parser("self-test", help="check the arithmetic without touching hardware")
 
@@ -3701,7 +3723,7 @@ def cmd_doctor(settings: dict[str, Any]) -> int:
         # `docs/sensors.md` could not honestly name both.
         "sensors": daemon.status()["sensor"],
         "libwacom": libwacom_status(),
-        "fingerprint": daemon.fingerprint.as_dict(force=True),
+        "fingerprint": daemon.fingerprint.as_dict(probe=True, force=True),
         "blockedBy": daemon.blocking_reason(),
         "settings": load_settings()["mapping"],
         "shell": {"path": str(SHELL_JSON), "readable": shell_json_document() is not None,
@@ -3709,6 +3731,19 @@ def cmd_doctor(settings: dict[str, Any]) -> int:
     }
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0 if report["blockedBy"] is None else 1
+
+
+def cmd_fingerprint() -> int:
+    """Probe the fingerprint stack once, on demand.
+
+    The daemon's streamed status deliberately does not do this: `fprintd-list`
+    activates a static fprintd, whose teardown resets the fingerprint USB
+    device. An explicit command is the right place for a probe with a side
+    effect. Exits nonzero when the stack is not healthy, like `doctor`.
+    """
+    report = FingerprintReader().as_dict(probe=True, force=True)
+    print(json.dumps(report, indent=2, sort_keys=True))
+    return 0 if report["ok"] else 1
 
 
 def cmd_self_test() -> int:
@@ -4051,6 +4086,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return cmd_self_test()
     if args.command == "doctor":
         return cmd_doctor(settings)
+    if args.command == "fingerprint":
+        return cmd_fingerprint()
     if args.command == "debug":
         return cmd_debug(settings)  # pragma: no cover
     if args.command == "rotate":

@@ -1264,6 +1264,42 @@ class ProductionWiringTests(unittest.TestCase):
         daemon = self._build()
         self.assertIsInstance(daemon.fingerprint, fold.FingerprintReader)
 
+    def test_publish_cycle_never_probes_enrollment(self):
+        # `_publish` calls `status()` on every pass, and that used to reach
+        # `fprintd-list` on a 30 s TTL -- for the whole life of the daemon
+        # (#11). Expire the reader's cache between cycles so three cycles cover
+        # three TTL expiries without sleeping.
+        daemon = self._build()
+        # `blocking_reason` takes a determinant; a MagicMock matrix cannot be
+        # compared to a float, and this test is about the publish path, not the
+        # sensor stub.
+        daemon.accel.matrix = [list(row) for row in fold.DEFAULT_MOUNT_MATRIX]
+        daemon.write_state = MagicMock()
+        daemon.emit = MagicMock()
+        mapping = {
+            ("systemctl", "is-enabled", "fprintd"): (0, "static\n"),
+            ("systemctl", "is-active", "fprintd"): (0, "inactive\n"),
+        }
+
+        def fake_run(cmd, **_kwargs):
+            key = tuple(cmd)
+            if key in mapping:
+                return MagicMock(returncode=mapping[key][0], stdout=mapping[key][1])
+            if cmd[0] == "fprintd-list":
+                raise AssertionError("a publish cycle probed enrollment")
+            return MagicMock(returncode=1, stdout="")
+
+        with patch.object(fold.subprocess, "run", side_effect=fake_run) as run:
+            for _ in range(3):
+                daemon._publish()
+                daemon.fingerprint._cached_at = 0.0
+        self.assertFalse(
+            any(call.args[0][:1] == ["fprintd-list"] for call in run.call_args_list)
+        )
+        published = daemon.emit.call_args_list[0].args[0]
+        self.assertIsNone(published["fingerprint"]["enrolled"])
+        self.assertFalse(published["fingerprint"]["enrolledProbed"])
+
 
 class HyprlandTests(unittest.TestCase):
     def setUp(self):
@@ -1917,7 +1953,8 @@ class FingerprintReaderTests(unittest.TestCase):
 
     def test_enrolled_wakes_an_idle_but_startable_daemon(self):
         # fprintd is dbus-activated: `static` and at rest is its normal state,
-        # and the list probe is what wakes it. Only `masked` is skipped.
+        # and the list probe is what wakes it. That is why `enrolled()` is only
+        # called from the explicit `probe=True` path, never from `status`.
         reader = self._reader()
         mapping = self._healthy()
         mapping[("systemctl", "is-enabled", "fprintd")] = (0, "static\n")
@@ -1960,7 +1997,7 @@ class FingerprintReaderTests(unittest.TestCase):
         with patch.object(
             fold.subprocess, "run", side_effect=self._run(self._healthy())
         ):
-            report = reader.as_dict(force=True)
+            report = reader.as_dict(probe=True, force=True)
         self.assertTrue(report["ok"])
         self.assertEqual(report["reason"], "")
         self.assertTrue(report["sensor"]["present"])
@@ -1979,7 +2016,7 @@ class FingerprintReaderTests(unittest.TestCase):
         mapping = self._healthy()
         mapping[("systemctl", "is-enabled", "fprintd")] = (0, "static\n")
         with patch.object(fold.subprocess, "run", side_effect=self._run(mapping)):
-            report = reader.as_dict(force=True)
+            report = reader.as_dict(probe=True, force=True)
         self.assertTrue(report["ok"])
         self.assertEqual(report["reason"], "")
         self.assertTrue(report["service"]["enabled"])
@@ -1992,7 +2029,7 @@ class FingerprintReaderTests(unittest.TestCase):
         with patch.object(
             fold.subprocess, "run", side_effect=self._run(self._healthy(sensor=False))
         ):
-            report = reader.as_dict(force=True)
+            report = reader.as_dict(probe=True, force=True)
         self.assertFalse(report["ok"])
         self.assertIn("138a:0090", report["reason"])
 
@@ -2001,7 +2038,7 @@ class FingerprintReaderTests(unittest.TestCase):
         mapping[("systemctl", "is-enabled", "fprintd")] = (1, "masked\n")
         mapping[("systemctl", "is-active", "fprintd")] = (0, "inactive\n")
         with patch.object(fold.subprocess, "run", side_effect=self._run(mapping)):
-            report = reader.as_dict(force=True)
+            report = reader.as_dict(probe=True, force=True)
         self.assertIn("masked", report["reason"])
         self.assertIsNone(report["enrolled"])
 
@@ -2016,6 +2053,50 @@ class FingerprintReaderTests(unittest.TestCase):
             calls = len(run.call_args_list)
             reader.as_dict(force=True)
             self.assertGreater(len(run.call_args_list), calls)
+
+    def test_status_report_never_probes_enrollment(self):
+        # The 30 s TTL used to end in `fprintd-list`, waking a static fprintd
+        # whose teardown resets the Validity USB device about a second later
+        # (#11). Expire the cache by hand so no test has to sleep or patch time.
+        reader = self._reader()
+        with patch.object(
+            fold.subprocess, "run", side_effect=self._run(self._healthy())
+        ) as run:
+            for _ in range(3):
+                report = reader.as_dict()
+                reader._cached_at = 0.0
+        self.assertFalse(
+            any(call.args[0][:1] == ["fprintd-list"] for call in run.call_args_list)
+        )
+        self.assertIsNone(report["enrolled"])
+        self.assertFalse(report["enrolledProbed"])
+
+    def test_explicit_probe_still_reports_enrollment(self):
+        reader = self._reader()
+        with patch.object(
+            fold.subprocess, "run", side_effect=self._run(self._healthy())
+        ) as run:
+            report = reader.as_dict(probe=True, force=True)
+        self.assertEqual(report["enrolled"], 2)
+        self.assertTrue(report["enrolledProbed"])
+        self.assertTrue(
+            any(call.args[0][:1] == ["fprintd-list"] for call in run.call_args_list)
+        )
+
+    def test_probe_result_never_leaks_into_cached_status(self):
+        reader = self._reader()
+        with patch.object(
+            fold.subprocess, "run", side_effect=self._run(self._healthy())
+        ) as run:
+            reader.as_dict()
+            reader.as_dict(probe=True, force=True)
+            report = reader.as_dict()
+        self.assertIsNone(report["enrolled"])
+        self.assertFalse(report["enrolledProbed"])
+        self.assertEqual(
+            sum(call.args[0][:1] == ["fprintd-list"] for call in run.call_args_list),
+            1,
+        )
 
 
 class FoldDaemonStepTests(unittest.TestCase):
@@ -2813,6 +2894,25 @@ class CLITests(unittest.TestCase):
         # them, so an empty dict raised KeyError on 'accelName' and the report it
         # exists to print was never produced by any test.
         self.assertIn(fold.main(["doctor"]), (0, 1))
+
+    def test_cmd_fingerprint_probes_once_and_reports_health(self):
+        out = io.StringIO()
+        healthy = {
+            "sensor": {"present": True, "usbId": "138a:0090"},
+            "ok": True,
+            "enrolled": 2,
+            "enrolledProbed": True,
+        }
+        with (
+            patch.object(
+                fold.FingerprintReader, "as_dict", return_value=healthy
+            ) as probe,
+            contextlib.redirect_stdout(out),
+        ):
+            rc = fold.main(["fingerprint"])
+        self.assertEqual(rc, 0)
+        probe.assert_called_once_with(probe=True, force=True)
+        self.assertEqual(json.loads(out.getvalue())["enrolled"], 2)
 
     def test_cmd_self_test(self):
         rc = fold.cmd_self_test()
