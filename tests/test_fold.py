@@ -26,8 +26,12 @@ from typing import ClassVar
 from unittest.mock import MagicMock, patch
 
 SCRIPT = Path(__file__).resolve().parent.parent / "bin" / "omarchy-yoga260-fold"
+# The script has no .py suffix, so spec_from_file_location cannot infer a loader
+# and SourceFileLoader has to be passed explicitly. mypy's stub narrows that
+# parameter to a private protocol SourceFileLoader does not structurally match.
 spec = importlib.util.spec_from_loader(
-    "fold", importlib.machinery.SourceFileLoader("fold", str(SCRIPT))
+    "fold",
+    importlib.machinery.SourceFileLoader("fold", str(SCRIPT)),  # type: ignore[arg-type]
 )
 # spec_from_loader only returns None for a loader it cannot describe, which a
 # SourceFileLoader is not -- the guards are for the type checker, which only
