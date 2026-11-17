@@ -303,10 +303,19 @@ manifest.json                     the plugin contract
 Service.qml                       mounts the daemon once, owns the state
 Fold.qml                          the bar button and its panel
 bin/omarchy-yoga260-fold          the daemon and CLI, Python 3, no dependencies
+tools/check                       every gate that can block a push, in one command
 tests/                            354 tests + 16 subtests; the arithmetic is the point
 docs/hardware.md                  this machine, in the detail it deserves
 docs/calibration.md               how to confirm it by hand
 ```
+
+## Development
+
+Run `tools/check` before committing: it runs `ruff check`, `ruff format --check`,
+`mypy .` and the test suite — the format check is the one that has blocked a
+push before. Local hooks live in the template-controlled `.githooks/` (not
+committed); on a fresh clone enable them with `git config core.hooksPath
+.githooks`, and expect a template update to replace them.
 
 ## License
 

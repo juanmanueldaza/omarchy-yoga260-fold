@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# One command for every gate that can block a push.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+echo "== ruff check =="
+ruff check .
+echo "== ruff format --check =="
+ruff format --check .
+echo "== mypy =="
+mypy .
+echo "== pytest =="
+python3 -m pytest -q
