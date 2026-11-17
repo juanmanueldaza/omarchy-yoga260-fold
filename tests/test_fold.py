@@ -1851,7 +1851,7 @@ class OnScreenKeyboardTests(unittest.TestCase):
         self.assertIn("installed", d)
         self.assertFalse(d["drivable"])
 
-    def _osk_with_piccolo(self):
+    def _osk_with_piccolo(self, **overrides):
         plugdir = Path(self._plug_td.name) / "piccolo.osk"
         plugdir.mkdir(exist_ok=True)
         (plugdir / "manifest.json").write_text(
@@ -1866,6 +1866,7 @@ class OnScreenKeyboardTests(unittest.TestCase):
         )
         settings = dict(self.settings)
         settings["oskPlugins"] = {"piccolo.osk": "omarchy-shell osk toggle"}
+        settings.update(overrides)
         osk = fold.OnScreenKeyboard(settings)
         osk.plugin_root = Path(self._plug_td.name)
         return osk
@@ -1889,6 +1890,109 @@ class OnScreenKeyboardTests(unittest.TestCase):
             self.assertIsNone(self._osk_with_piccolo().is_shown())
             run.return_value = MagicMock(returncode=0, stdout="not json")
             self.assertIsNone(self._osk_with_piccolo().is_shown())
+
+    def test_missing_executable_returns_a_structured_failure(self):
+        with patch.object(
+            fold.subprocess, "run", side_effect=FileNotFoundError("no such binary")
+        ):
+            result = self._osk_with_piccolo().show()
+        self.assertFalse(result["ok"])
+        self.assertIn("no such binary", result["reason"])
+        self.assertEqual(result["pluginId"], "piccolo.osk")
+
+    def test_timeout_returns_a_structured_failure(self):
+        timeout = fold.subprocess.TimeoutExpired(["omarchy-shell", "osk"], 10)
+        with patch.object(fold.subprocess, "run", side_effect=timeout):
+            result = self._osk_with_piccolo().show()
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["reason"])
+
+    def test_other_subprocess_error_returns_a_structured_failure(self):
+        with patch.object(
+            fold.subprocess,
+            "run",
+            side_effect=fold.subprocess.SubprocessError("broken pipe"),
+        ):
+            result = self._osk_with_piccolo().hide()
+        self.assertFalse(result["ok"])
+        self.assertIn("broken pipe", result["reason"])
+
+    def test_unbalanced_quote_command_returns_a_structured_failure(self):
+        # A manifest/shell.json with a broken quote used to raise ValueError
+        # out of toggle() and take the daemon loop down with it.
+        osk = self._osk_with_piccolo(oskCommand='omarchy-shell osk "toggle')
+        with patch.object(fold.subprocess, "run") as run:
+            result = osk.toggle()
+        self.assertFalse(result["ok"])
+        self.assertIn("cannot parse command", result["reason"])
+        run.assert_not_called()
+
+    def test_whitespace_only_command_returns_a_structured_failure(self):
+        # Free-form str validation accepts "   ", but shlex.split turns it
+        # into [] and subprocess.run([]) raises IndexError inside Popen -- not
+        # an OSError or SubprocessError, so it used to escape the daemon loop.
+        osk = self._osk_with_piccolo(oskShowCommand="   ")
+        with patch.object(fold.subprocess, "run") as run:
+            result = osk.show()
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "empty command")
+        self.assertEqual(result["pluginId"], "piccolo.osk")
+        run.assert_not_called()
+
+    def test_nul_byte_command_returns_a_structured_failure(self):
+        # An embedded NUL makes subprocess.run raise ValueError, which is also
+        # outside the old catch. Let the real call raise it: no process is
+        # spawned, and this pins the exact input that used to crash.
+        osk = self._osk_with_piccolo(oskShowCommand="omarchy-shell\x00 osk show")
+        result = osk.show()
+        self.assertFalse(result["ok"])
+        self.assertIn("null byte", result["reason"])
+        self.assertEqual(result["pluginId"], "piccolo.osk")
+
+    def test_nonzero_exit_is_a_structured_failure_with_output(self):
+        with patch.object(fold.subprocess, "run") as run:
+            run.return_value = MagicMock(returncode=1, stdout="", stderr="failed")
+            result = self._osk_with_piccolo().show()
+        self.assertFalse(result["ok"])
+        self.assertIn("failed", result["output"])
+        self.assertEqual(result["pluginId"], "piccolo.osk")
+
+    def test_is_shown_timeout_returns_none(self):
+        timeout = fold.subprocess.TimeoutExpired(["omarchy-shell", "osk"], 10)
+        with patch.object(fold.subprocess, "run", side_effect=timeout):
+            self.assertIsNone(self._osk_with_piccolo().is_shown())
+
+    def test_show_hide_and_toggle_use_their_dedicated_commands(self):
+        osk = self._osk_with_piccolo(
+            oskShowCommand="omarchy-shell osk show",
+            oskHideCommand="omarchy-shell osk hide",
+        )
+        with patch.object(fold.subprocess, "run") as run:
+            run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+            self.assertTrue(osk.show()["ok"])
+            self.assertEqual(run.call_args.args[0], ["omarchy-shell", "osk", "show"])
+            self.assertTrue(osk.hide()["ok"])
+            self.assertEqual(run.call_args.args[0], ["omarchy-shell", "osk", "hide"])
+            self.assertTrue(osk.toggle()["ok"])
+            self.assertEqual(run.call_args.args[0], ["omarchy-shell", "osk", "toggle"])
+
+    def test_show_and_hide_fall_back_to_the_plugin_toggle_command(self):
+        # Default installs have no dedicated show/hide command. An empty
+        # setting must not turn them into no-ops.
+        osk = self._osk_with_piccolo()
+        with patch.object(fold.subprocess, "run") as run:
+            run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+            osk.show()
+            self.assertEqual(run.call_args.args[0], ["omarchy-shell", "osk", "toggle"])
+            osk.hide()
+            self.assertEqual(run.call_args.args[0], ["omarchy-shell", "osk", "toggle"])
+
+    def test_show_and_hide_without_a_plugin_are_structured_failures(self):
+        for action in ("show", "hide"):
+            with self.subTest(action=action):
+                result = getattr(self._osk(), action)()
+                self.assertFalse(result["ok"])
+                self.assertTrue(result["reason"])
 
 
 class FingerprintReaderTests(unittest.TestCase):
@@ -2495,6 +2599,7 @@ class FoldDaemonStepTests(unittest.TestCase):
         self.daemon.settings["oskAuto"] = True
         self.daemon.osk = MagicMock()
         self.daemon.osk.is_shown.return_value = True
+        self.daemon.osk.hide.return_value = {"ok": True}
         self.daemon.osk.as_dict.return_value = {
             "installed": [],
             "pluginId": None,
@@ -2506,7 +2611,7 @@ class FoldDaemonStepTests(unittest.TestCase):
         self.daemon.reload_settings = MagicMock()
         result = self.daemon.step()
         self.assertIsInstance(result, bool)
-        self.daemon.osk.toggle.assert_called_once_with()
+        self.daemon.osk.hide.assert_called_once_with()
         self.assertFalse(self.daemon.state.osk_asked)
 
     def test_step_unfold_skips_hide_when_keyboard_hidden(self):
@@ -2526,15 +2631,16 @@ class FoldDaemonStepTests(unittest.TestCase):
         self.daemon.reload_settings = MagicMock()
         result = self.daemon.step()
         self.assertIsInstance(result, bool)
-        self.daemon.osk.toggle.assert_not_called()
+        self.daemon.osk.hide.assert_not_called()
         self.assertFalse(self.daemon.state.osk_asked)
 
     def test_step_unfold_hides_when_visibility_unknown(self):
         # Boards with no state query (abdxdev): the common flow is unfolding
-        # with the auto-summoned board still up, so the toggle fires blind.
+        # with the auto-summoned board still up, so the hide fires blind.
         self.daemon.settings["oskAuto"] = True
         self.daemon.osk = MagicMock()
         self.daemon.osk.is_shown.return_value = None
+        self.daemon.osk.hide.return_value = {"ok": True}
         self.daemon.osk.as_dict.return_value = {
             "installed": [],
             "pluginId": None,
@@ -2546,7 +2652,7 @@ class FoldDaemonStepTests(unittest.TestCase):
         self.daemon.reload_settings = MagicMock()
         result = self.daemon.step()
         self.assertIsInstance(result, bool)
-        self.daemon.osk.toggle.assert_called_once_with()
+        self.daemon.osk.hide.assert_called_once_with()
         self.assertFalse(self.daemon.state.osk_asked)
 
     def test_step_folding_holds_rotation(self):
@@ -2595,7 +2701,7 @@ class FoldDaemonStepTests(unittest.TestCase):
         self.daemon.settings["oskAuto"] = True
         self.daemon.state.osk_asked = False
         self.daemon.osk = MagicMock()
-        self.daemon.osk.toggle.return_value = {"ok": True}
+        self.daemon.osk.show.return_value = {"ok": True}
         self.daemon.osk.as_dict.return_value = {
             "installed": [],
             "drivable": False,
@@ -2607,7 +2713,133 @@ class FoldDaemonStepTests(unittest.TestCase):
         self.assertIsInstance(result, bool)
         self.assertTrue(self.daemon.state.osk_asked)
 
+    def test_step_failed_show_does_not_latch_and_is_retried(self):
+        self.daemon.hinge.read_fold.return_value = fold.HingeSample(
+            200.0, 200.0, 359.0, 200.0, 1.0, True
+        )
+        self.daemon.settings["oskAuto"] = True
+        self.daemon.state.osk_asked = False
+        self.daemon.osk = MagicMock()
+        self.daemon.osk.show.return_value = {"ok": False, "reason": "no such binary"}
+        self.daemon.osk.as_dict.return_value = {
+            "installed": [],
+            "drivable": False,
+            "auto": True,
+            "pluginId": None,
+        }
+        self.daemon.reload_settings = MagicMock()
+        self.daemon.step()
+        self.assertFalse(self.daemon.state.osk_asked)
+        self.assertEqual(self.daemon.state.last_error, "no such binary")
+        self.daemon.osk.show.assert_called_once_with()
+
+        # The next tablet pass must try again, not believe the failed show.
+        self.daemon.osk.show.return_value = {"ok": True}
+        self.daemon.step()
+        self.assertEqual(self.daemon.osk.show.call_count, 2)
+        self.assertTrue(self.daemon.state.osk_asked)
+
+    def test_step_show_nonzero_output_becomes_last_error(self):
+        # A command that ran and exited nonzero has output but no reason. That
+        # output still has to reach the panel through lastError.
+        self.daemon.hinge.read_fold.return_value = fold.HingeSample(
+            200.0, 200.0, 359.0, 200.0, 1.0, True
+        )
+        self.daemon.settings["oskAuto"] = True
+        self.daemon.osk = MagicMock()
+        self.daemon.osk.show.return_value = {"ok": False, "output": "permission denied"}
+        self.daemon.osk.as_dict.return_value = {
+            "installed": [],
+            "drivable": False,
+            "auto": True,
+            "pluginId": None,
+        }
+        self.daemon.reload_settings = MagicMock()
+        self.daemon.step()
+        self.assertEqual(self.daemon.state.last_error, "permission denied")
+        self.assertFalse(self.daemon.state.osk_asked)
+
+    def test_step_unfold_after_failed_show_does_not_hide(self):
+        # A failed show left the latch False. Unfolding must not blind-hide a
+        # board the user never saw summoned.
+        self.daemon.settings["oskAuto"] = True
+        self.daemon.state.osk_asked = False
+        self.daemon.osk = MagicMock()
+        self.daemon.osk.is_shown.return_value = True
+        self.daemon.osk.as_dict.return_value = {
+            "installed": [],
+            "drivable": False,
+            "auto": True,
+            "pluginId": None,
+        }
+        self.daemon.reload_settings = MagicMock()
+        self.daemon.step()
+        self.daemon.osk.hide.assert_not_called()
+        self.daemon.osk.show.assert_not_called()
+
+    def test_step_unfold_hide_failure_keeps_latch_and_reports_error(self):
+        self.daemon.settings["oskAuto"] = True
+        self.daemon.state.osk_asked = True
+        self.daemon.osk = MagicMock()
+        self.daemon.osk.is_shown.return_value = None
+        self.daemon.osk.hide.return_value = {"ok": False, "reason": "hide failed"}
+        self.daemon.osk.as_dict.return_value = {
+            "installed": [],
+            "drivable": False,
+            "auto": True,
+            "pluginId": None,
+        }
+        self.daemon.reload_settings = MagicMock()
+        self.daemon.step()
+        self.daemon.osk.hide.assert_called_once_with()
+        self.assertTrue(self.daemon.state.osk_asked)
+        self.assertEqual(self.daemon.state.last_error, "hide failed")
+
+    def test_step_survives_empty_and_nul_osk_commands(self):
+        # The two inputs that used to escape _run: whitespace only (empty argv
+        # -> IndexError inside Popen) and an embedded NUL (ValueError). Both
+        # must become structured failures in lastError with osk_asked clear,
+        # never an exception out of step().
+        self.daemon.hinge.read_fold.return_value = fold.HingeSample(
+            200.0, 200.0, 359.0, 200.0, 1.0, True
+        )
+        self.daemon.settings["oskAuto"] = True
+        self.daemon.reload_settings = MagicMock()
+        for bad_command, expected_reason in (
+            ("   ", "empty command"),
+            ("omarchy-shell\x00 osk show", "null byte"),
+        ):
+            with self.subTest(bad_command=bad_command):
+                with tempfile.TemporaryDirectory() as td:
+                    plugdir = Path(td) / "piccolo.osk"
+                    plugdir.mkdir()
+                    (plugdir / "manifest.json").write_text(
+                        json.dumps(
+                            {"id": "piccolo.osk", "name": "Piccolo", "kinds": ["panel"]}
+                        )
+                    )
+                    settings = dict(self.daemon.settings)
+                    settings["oskPlugins"] = {"piccolo.osk": "omarchy-shell osk toggle"}
+                    settings["oskShowCommand"] = bad_command
+                    osk = fold.OnScreenKeyboard(settings)
+                    osk.plugin_root = Path(td)
+                    self.daemon.osk = osk
+                    self.daemon.state.osk_asked = False
+                    self.daemon.state.last_error = ""
+                    self.daemon.step()
+                self.assertFalse(self.daemon.state.osk_asked)
+                self.assertIn(expected_reason, self.daemon.state.last_error)
+
     def test_step_non_tablet_resets_osk_asked(self):
+        self.daemon.osk = MagicMock()
+        self.daemon.osk.is_shown.return_value = False
+        self.daemon.osk.as_dict.return_value = {
+            "installed": [],
+            "drivable": False,
+            "auto": False,
+            "pluginId": None,
+        }
+        self.daemon.reload_settings = MagicMock()
         self.daemon.state.osk_asked = True
         result = self.daemon.step()
         self.assertIsInstance(result, bool)
@@ -2886,6 +3118,39 @@ class FoldDaemonStepTests(unittest.TestCase):
             os.utime(fold.SHELL_JSON, ns=(stamp + 1_000_000_000, stamp + 1_000_000_000))
             self.daemon.reload_settings()
             self.assertEqual(self.daemon.settings["oskPlugin"], "plugin-two")
+            fold.SHELL_JSON = real
+
+    def test_reload_settings_picks_up_changed_osk_commands(self):
+        # The two dedicated commands are SETTING_KEYS like any other setting:
+        # a panel edit must reach the live settings and rebuild the keyboard
+        # object on the next pass, not wait for a daemon restart.
+        with tempfile.TemporaryDirectory() as td:
+            real = fold.SHELL_JSON
+            fold.SHELL_JSON = Path(td) / "shell.json"
+            fold.SHELL_JSON.write_text(
+                self._shell_with(
+                    {"oskShowCommand": "osk show-a", "oskHideCommand": "osk hide-a"}
+                )
+            )
+            self.daemon._settings_stamp = None
+            old_osk = self.daemon.osk
+            self.daemon.reload_settings()
+            self.assertEqual(self.daemon.settings["oskShowCommand"], "osk show-a")
+            self.assertEqual(self.daemon.settings["oskHideCommand"], "osk hide-a")
+            self.assertIsNot(self.daemon.osk, old_osk)
+
+            # Force the mtime forward: a coarse filesystem could otherwise put
+            # both writes in one tick and silently skip the second reload.
+            fold.SHELL_JSON.write_text(
+                self._shell_with(
+                    {"oskShowCommand": "osk show-b", "oskHideCommand": "osk hide-b"}
+                )
+            )
+            stamp = fold.SHELL_JSON.stat().st_mtime_ns
+            os.utime(fold.SHELL_JSON, ns=(stamp + 1_000_000_000, stamp + 1_000_000_000))
+            self.daemon.reload_settings()
+            self.assertEqual(self.daemon.settings["oskShowCommand"], "osk show-b")
+            self.assertEqual(self.daemon.settings["oskHideCommand"], "osk hide-b")
             fold.SHELL_JSON = real
 
     def test_reload_settings_matrix_only_reaches_both_sensors(self):
@@ -3328,6 +3593,51 @@ class CLITests(unittest.TestCase):
                 rc = fold.cmd_keyboard({}, "toggle")
         self.assertEqual(rc, 1)
 
+    def test_keyboard_actions_dispatch_through_main(self):
+        for action in ("show", "hide", "toggle"):
+            with (
+                self.subTest(action=action),
+                patch.object(fold, "OnScreenKeyboard") as cls,
+            ):
+                osk = cls.return_value
+                osk.target.return_value = {"id": "piccolo.osk", "command": "osk"}
+                for name in ("show", "hide", "toggle"):
+                    getattr(osk, name).return_value = {
+                        "ok": True,
+                        "pluginId": "piccolo.osk",
+                    }
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    rc = fold.main(["keyboard", action])
+                self.assertEqual(rc, 0)
+                getattr(osk, action).assert_called_once_with()
+                for other in ("show", "hide", "toggle"):
+                    if other != action:
+                        getattr(osk, other).assert_not_called()
+                self.assertTrue(json.loads(out.getvalue())["ok"])
+
+    def test_keyboard_action_failure_returns_one_and_prints_json(self):
+        with patch.object(fold, "OnScreenKeyboard") as cls:
+            osk = cls.return_value
+            osk.target.return_value = {"id": "piccolo.osk", "command": "osk"}
+            osk.show.return_value = {"ok": False, "reason": "no such binary"}
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = fold.main(["keyboard", "show"])
+        self.assertEqual(rc, 1)
+        self.assertEqual(json.loads(out.getvalue())["reason"], "no such binary")
+
+    def test_keyboard_no_plugin_returns_one_with_guidance(self):
+        with patch.object(fold, "OnScreenKeyboard") as cls:
+            osk = cls.return_value
+            osk.target.return_value = None
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = fold.main(["keyboard", "show"])
+        self.assertEqual(rc, 1)
+        self.assertIn("No on-screen keyboard plugin", err.getvalue())
+        osk.show.assert_not_called()
+
     def test_cmd_setting(self):
         rc = fold.cmd_setting({}, "mapping", "standard")
         self.assertEqual(rc, 1)
@@ -3761,7 +4071,9 @@ class SettingValidationTests(unittest.TestCase):
 
     def test_setting_keys_are_derived_from_the_spec(self):
         self.assertEqual(fold.SETTING_KEYS, tuple(fold.SETTING_SPEC))
-        self.assertEqual(len(fold.SETTING_KEYS), 11)
+        self.assertEqual(len(fold.SETTING_KEYS), 13)
+        self.assertIn("oskShowCommand", fold.SETTING_KEYS)
+        self.assertIn("oskHideCommand", fold.SETTING_KEYS)
         self.assertNotIn("mountMatrix", fold.SETTING_KEYS)
 
     def test_every_default_validates_to_itself(self):
@@ -3787,6 +4099,8 @@ class SettingValidationTests(unittest.TestCase):
             ("yawSign", 1, 1),
             ("mapping", "portrait-swapped", "portrait-swapped"),
             ("oskPlugin", "any.plugin.id", "any.plugin.id"),
+            ("oskShowCommand", "omarchy-shell osk show", "omarchy-shell osk show"),
+            ("oskHideCommand", "omarchy-shell osk hide", "omarchy-shell osk hide"),
         )
         for key, raw, expected in cases:
             with self.subTest(key=key, raw=raw):
