@@ -417,9 +417,18 @@ def is_rotation(matrix: Any) -> bool:
     """
     try:
         rows = [[float(v) for v in row] for row in matrix]
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # A hand-edited shell.json can hold a 400-digit integer, which Python
+        # parses as an int but float() cannot represent. That must be refused
+        # like any other bad cell, not raised out of daemon startup.
         return False
     if len(rows) != 3 or any(len(row) != 3 for row in rows):
+        return False
+    # NaN and Infinity have to be caught before any of the checks below: every
+    # one of them is an `abs(...) > tolerance` comparison, and NaN > x is False
+    # in both directions. A matrix with a single NaN cell would otherwise sail
+    # through as a rotation and poison every angle derived from it.
+    if any(not math.isfinite(value) for row in rows for value in row):
         return False
     if abs(determinant(rows) - 1.0) > 1e-6:
         return False
@@ -2169,8 +2178,8 @@ class FoldDaemon:
             return "no touchscreen found in Hyprland"
         if not self.state.pen:
             return "no pen found in Hyprland"
-        if abs(determinant(self.accel.matrix) - 1.0) > 1e-6:
-            return "the mount matrix is not a rotation (determinant != 1)"
+        if not is_rotation(self.accel.matrix):
+            return "the mount matrix is not a proper rotation (finite, orthonormal, det +1)"
         return None
 
     # -- sampling ---------------------------------------------------------
@@ -3086,6 +3095,24 @@ class FoldDaemon:
         self._last_wall, self._last_mono = wall, mono
         return gap > 2.0
 
+    def _rebuild_matrices(self, matrix: Any) -> None:
+        """Replace only the cached mount matrix on both base-frame sensors.
+
+        `Accelerometer` and `Motion` each copied the matrix at construction, so
+        changing `settings['mountMatrix']` alone leaves both reading through the
+        old calibration. Nothing else on either sensor is touched: the reader,
+        the scales and the stillness threshold came from the hardware and are
+        not settings a calibration write can change. An invalid matrix is a
+        no-op rather than an exception -- `load_settings` has already vetted it,
+        and the daemon must keep acting on the last good matrix if anything
+        downstream disagrees.
+        """
+        if not is_rotation(matrix):
+            return
+        rows = [tuple(float(value) for value in row) for row in matrix]
+        self.accel.matrix = [tuple(row) for row in rows]
+        self.motion.matrix = [tuple(row) for row in rows]
+
     def reload_settings(self) -> None:
         """Re-read the panel's settings from disk, but only when they change.
 
@@ -3108,14 +3135,25 @@ class FoldDaemon:
         # `oskPlugin`, so changing the preferred keyboard from the panel did
         # not take effect until the daemon restarted. `.get` on both sides
         # because `fresh` can be a fallback copy that lacks keys.
-        if any(fresh.get(key) != self.settings.get(key) for key in SETTING_KEYS):
+        settings_changed = any(
+            fresh.get(key) != self.settings.get(key) for key in SETTING_KEYS
+        )
+        # `calibrate --write` changes this key alone, which used to be invisible
+        # here: no SETTING_KEYS value moved, so the daemon kept both cached
+        # matrices and the calibration appeared to do nothing until a restart.
+        matrix_changed = fresh.get("mountMatrix") != self.settings.get("mountMatrix")
+        if settings_changed or matrix_changed:
             self.settings = fresh
-            # A new mapping or a changed lock has to be able to move the screen
-            # on the very next pass, so make sure the loop looks again. Updating
-            # the dictionary alone changed the truth the panel saw without ever
-            # opening the gate; a panel tap could wait forever for sensor jitter.
-            self.pending.add(PENDING_SETTINGS)
-            self.osk = OnScreenKeyboard(self.settings)
+            if settings_changed:
+                # A new mapping or a changed lock has to be able to move the
+                # screen on the very next pass, so make sure the loop looks
+                # again. Updating the dictionary alone changed the truth the
+                # panel saw without ever opening the gate; a panel tap could
+                # wait forever for sensor jitter.
+                self.pending.add(PENDING_SETTINGS)
+                self.osk = OnScreenKeyboard(self.settings)
+            if matrix_changed:
+                self._rebuild_matrices(fresh.get("mountMatrix"))
 
     def run(self) -> int:
         def bail(signum, frame):
