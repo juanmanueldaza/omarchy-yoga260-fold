@@ -2842,6 +2842,12 @@ class FoldDaemon:
                     self.osk.toggle()
                 self.state.osk_asked = False
 
+        # The pass has now consumed these. A key that this pass could not
+        # satisfy (a failed device write, an incomplete rotation) was never in
+        # this list, so it stays pending for a later pass.
+        self.pending.discard(PENDING_SETTINGS)
+        self.pending.discard(PENDING_YAW)
+        self.pending.discard(PENDING_RESUME)
         self.verify()
         return self._publish()
 
@@ -2938,6 +2944,19 @@ class FoldDaemon:
         # it here too is what dropped the decision on the very pass it came due.
         return self.decision != self.state.transform
 
+    def due_pending(self, now: float) -> bool:
+        """Whether any pending work is ready to open the loop's gate.
+
+        A device retry carries a cooldown so a compositor that keeps refusing
+        the call is not hit at the sensor rate. Other keys are ready as soon as
+        they are set; if one of those is present the gate opens regardless of
+        the device cooldown.
+        """
+        ready = self.pending.copy()
+        if now < self.next_device_retry:
+            ready.discard(PENDING_DEVICE)
+        return bool(ready)
+
     def check_resume(self) -> bool:
         """Notice that the machine was asleep, and say so.
 
@@ -3011,7 +3030,7 @@ class FoldDaemon:
                 # Reading it separately for those two questions is what put twelve
                 # reads and two possible poses on every pass.
                 pose = self.read_pose()
-                if self.changed(pose) or self.settling():
+                if self.changed(pose) or self.settling() or self.due_pending(time.monotonic()):
                     self.step(pose)
                     after = (self.state.mode, self.state.transform, self.state.orientation)
                     if after != announced and not self.state.messages:
