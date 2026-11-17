@@ -247,6 +247,9 @@ PENDING_DIGITIZER = "digitizer"
 # A dead hyprctl must not be called ten times a second because a retry is
 # pending; one attempt a second is still far inside the response budget.
 DEVICE_RETRY_COOLDOWN = 1.0
+# An incomplete rotation is retried, but not once per 0.1 s pass: a missing
+# digitizer would otherwise be hammered while the compositor is reloading.
+ROTATION_RETRY_COOLDOWN = 1.0
 # Called only when no step ran. `_publish` dedupes identical payloads and caps
 # writes at one a second, so this keeps the panel honest without a hot loop.
 PUBLISH_HEARTBEAT_SEC = 0.5
@@ -1255,37 +1258,31 @@ class Hyprland:
 
     def rotate_transaction(
         self, panel: str, transform: int, devices: Sequence[str | None]
-    ) -> tuple[bool, str]:
-        """Turn the panel and both digitizer nodes in a single round trip.
+    ) -> dict[str, tuple[bool, str]]:
+        """Turn the panel and both digitizer nodes, reporting each leg.
 
-        This is the closest thing to what Windows did that Linux can do. There,
-        the display driver committed the panel, the pen and the touch surface
-        together, so there was no interval in which one had turned and the other
-        had not. Here every call is a separate `hyprctl eval`, so three
-        sequential calls can land either side of a compositor reload and leave
-        the pen rotated against the picture.
+        This used to be one `hyprctl eval` carrying three Lua statements. That
+        is one round trip but not one commit: if the panel statement landed and
+        a digitizer statement failed, the compositor answered `ok` and the
+        daemon recorded a successful rotation with a turned picture and an
+        unturned pen. There is no way to ask Hyprland afterwards which way a
+        tablet's transform points -- `devices -j` emits only its address and
+        name -- so the only honest way to know is to make each call separately
+        and keep its result.
 
-        Hyprland's Lua config is evaluated as a chunk, not as an expression, so
-        several statements separated by `;` go in one `eval` and the compositor
-        sees one request. Verified on 0.56.2 before being relied on: three
-        statements (panel, finger, pen) in one call returns `ok` and applies.
-
-        Device enable/disable is deliberately NOT folded in here. That is a
-        different kind of change with its own lock-screen guard, and the
-        ordering between them is load-bearing; see `set_devices`.
+        The cost is two extra round trips on a rotation, not on idle passes.
+        What it buys is knowing which leg failed, and therefore which one to
+        retry. Device enable/disable stays out of here: it has its own
+        lock-screen guard and ordering; see `set_devices`.
         """
-        call = self.monitor_call(panel, transform)
-        if call is None:
-            return False, f"monitor {panel} not found"
-        statements = [call]
-        for name in devices:
-            if name:
-                statements.append(
-                    f"hl.device({{ name = {json.dumps(name)}, "
-                    f"transform = {transform}, output = {json.dumps(panel)} }})"
-                )
-        code, out = self.run(["eval", "; ".join(statements)])
-        return code == 0, out
+        results: dict[str, tuple[bool, str]] = {}
+        results["panel"] = self.set_transform(panel, transform)
+        touch, pen = (list(devices) + [None, None])[:2]
+        if touch:
+            results["finger"] = self.set_device_transform(touch, transform, panel)
+        if pen:
+            results["pen"] = self.set_device_transform(pen, transform, panel)
+        return results
 
     def set_transform(self, panel: str, transform: int) -> tuple[bool, str]:
         """Turn the panel, carrying over everything else it is set to."""
@@ -1905,6 +1902,10 @@ class State:
     held_for: float = 0.0
     osk_asked: bool = False
     tilt_note: str = ""
+    # Per-leg outcome of the last rotation attempt. A boolean for the whole
+    # transaction cannot say whether the pen followed the panel, and Hyprland
+    # reports no transform for tablets afterwards, so this is the record.
+    rotation_legs: dict[str, bool] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -1924,6 +1925,7 @@ class State:
             "want": self.want,
             "reason": self.reason,
             "verified": self.verified,
+            "rotationLegs": dict(self.rotation_legs),
             "still": self.still,
             "rotationRateDeg": round(self.rotation_rate, 2),
             "axis": f"{self.axis}{'+' if self.signed > 0 else '-'}",
@@ -1982,6 +1984,7 @@ class FoldDaemon:
         self.stop = False
         self.pending: set[str] = set()
         self.next_device_retry = 0.0
+        self.next_rotation_retry = 0.0
         self.next_heartbeat = 0.0
         self.decision: int | None = None
         self.decision_since = time.monotonic()
@@ -2431,29 +2434,50 @@ class FoldDaemon:
     def apply(self, transform: int) -> None:
         panel = self.state.panel
         self.state.want = transform
-        self.state.transform = transform
-        # Panel, pen and finger in one `hyprctl eval`, so there is no interval
-        # in which the picture has turned and the input has not. This was three
-        # sequential calls plus a `monitors -j` to build them: four round trips
-        # to the compositor, spread far enough apart to straddle a reload.
-        ok, message = self.hypr.rotate_transaction(
+        results = self.hypr.rotate_transaction(
             panel, transform, [self.state.touch, self.state.pen]
         )
-        if not ok:
-            self.state.last_error = f"panel: {message}"  # pragma: no cover
-            self.state.verified = False  # pragma: no cover
-            return  # pragma: no cover
+        self.state.rotation_legs = {
+            leg: ok for leg, (ok, _message) in results.items()
+        }
+        failed = [
+            f"{leg}: {message}"
+            for leg, (ok, message) in results.items()
+            if not ok
+        ]
+        if failed:
+            # Do not record the requested transform as the applied one. The
+            # panel may have turned while a digitizer did not; keeping the old
+            # value makes the next pass retry all three legs instead of
+            # believing a rotation that only partly happened.
+            self.state.last_error = "; ".join(failed)
+            self.state.verified = False
+            self.next_rotation_retry = time.monotonic() + ROTATION_RETRY_COOLDOWN
+            self.pending.add(PENDING_DIGITIZER)
+            return
+        self.state.transform = transform
         self.state.applied = transform
         self.state.last_error = ""
         self.state.verified = True
+        self.pending.discard(PENDING_DIGITIZER)
         self.state.held_for = time.monotonic() - self.decision_since
         self.last_applied = time.monotonic()
 
     def verify(self) -> None:
-        if PENDING_SETTINGS in self.pending or PENDING_DIGITIZER in self.pending:
-            # Re-asserting the current transform over a settings change or an
-            # incomplete rotation would put back the very state the pending
-            # pass is trying to replace. Let that pass run first.
+        if PENDING_SETTINGS in self.pending:
+            # A settings change still owes a pass that may choose a different
+            # transform; reasserting the old one now would fight it.
+            return
+        if PENDING_DIGITIZER in self.pending:
+            # An incomplete rotation is not a settled state to compare against
+            # the panel -- it is work to finish. Retry the whole set on the
+            # rotation cooldown, not the panel-only comparison below.
+            if time.monotonic() >= self.next_rotation_retry:
+                # `transform` still holds the last value every leg reached;
+                # `want` is the requested one that the failed attempt did not
+                # commit. Retrying `transform` would re-apply the old picture
+                # and call the incomplete rotation finished.
+                self.apply(self.state.want)
             return
         current = self.hypr.current_transform(self.state.panel)
         if current is None:
@@ -2463,10 +2487,6 @@ class FoldDaemon:
             # reload, a monitor re-creation, a monitor rule being rebuilt. Put
             # it back rather than waiting for a tilt that may never come.
             self.apply(self.state.transform)
-            if self.state.last_error:
-                self.pending.add(PENDING_DIGITIZER)
-            else:
-                self.pending.discard(PENDING_DIGITIZER)
 
     def restore_devices(self) -> bool:
         """Assert that every internal input device is enabled.
@@ -2812,7 +2832,8 @@ class FoldDaemon:
             # Track the real attitude even while locked or undecided, so the
             # panel can say which way the machine is actually being held.
             self.state.orientation = pose["orientation"]
-            if transform != self.state.transform or not self.state.verified:
+            needs_apply = transform != self.state.transform or not self.state.verified
+            if needs_apply and time.monotonic() >= self.next_rotation_retry:
                 self.apply(transform)
             else:
                 self.state.want = transform  # pragma: no cover
@@ -4093,31 +4114,40 @@ def cmd_rotate(settings: dict[str, Any], position: str, force: bool = False) -> 
     if transform == current and not force:
         print(json.dumps({"transform": transform, "panel": panel, "changed": False}))  # pragma: no cover
         return 0  # pragma: no cover
-    # The lock is written before the turn, not after. The daemon re-asserts the
-    # transform it thinks is right, and a turn issued without the lock already
-    # in place is a turn it will undo on its next pass.
-    if not write_shell_entry({"locked": True}):
-        print("could not record the rotation lock; the screen may not stay put", file=sys.stderr)  # pragma: no cover
     result = _apply_rotation(settings, transform, panel=panel, hypr=hypr)
-    if result == 0:
-        # A hand turn locks the rotation, the way a tablet does, so the sensor
-        # does not turn the screen straight back. That is also how a person
-        # ends up stuck staring at a portrait screen wondering why. So say so,
-        # on the bar, with the way out -- silence here is what made it a
-        # mystery the first time.
-        name = {0: "Landscape", 1: "Portrait", 2: "Upside down", 3: "Portrait"}
-        # This names a binding that lives in the user's ~/.config/hypr/bindings.lua,
-        # not in anything this plugin ships: Omarchy 4.x configures Hyprland
-        # through Lua, and a plugin cannot declare bindings in its manifest. The
-        # bar's Lock button is the unconditional way out; the combo is the fast
-        # one, and it is the user's to have set.
-        _osd(
-            f"{name.get(transform, transform)} · locked — "
-            "SUPER+ALT+SHIFT+R to unlock, or the bar's Lock button",
-            ICONS["lock"],
-            hypr.env,
+    if result != 0:
+        # A failed or partial turn must not leave rotation locked. The daemon
+        # stays free to retry, which is safer than a screen frozen at a
+        # transform the digitizers never reached.
+        return result
+    # Written only after every leg succeeded. The lock used to go in first, so
+    # a failed pen transform still left the user locked in portrait with an
+    # unturned digitizer. The window between the turn and this write is the
+    # few milliseconds of a settings write; the daemon's re-assert runs on a
+    # timer and reads the same file, so it sees the lock on its next pass.
+    if not write_shell_entry({"locked": True}):
+        print(
+            "rotation applied but the lock could not be recorded; the screen may turn again",
+            file=sys.stderr,
         )
-    return result
+        return 1
+    # A hand turn locks the rotation, the way a tablet does, so the sensor does
+    # not turn the screen straight back. That is also how a person ends up
+    # stuck staring at a portrait screen wondering why. So say so, on the bar,
+    # with the way out -- silence here is what made it a mystery the first time.
+    name = {0: "Landscape", 1: "Portrait", 2: "Upside down", 3: "Portrait"}
+    # This names a binding that lives in the user's ~/.config/hypr/bindings.lua,
+    # not in anything this plugin ships: Omarchy 4.x configures Hyprland
+    # through Lua, and a plugin cannot declare bindings in its manifest. The
+    # bar's Lock button is the unconditional way out; the combo is the fast
+    # one, and it is the user's to have set.
+    _osd(
+        f"{name.get(transform, transform)} · locked — "
+        "SUPER+ALT+SHIFT+R to unlock, or the bar's Lock button",
+        ICONS["lock"],
+        hypr.env,
+    )
+    return 0
 
 
 def _osd(message: str, icon: str, env: dict[str, str]) -> None:
@@ -4150,14 +4180,37 @@ def _apply_rotation(
         return 1  # pragma: no cover
     hypr = hypr or daemon.hypr
     panel = panel or daemon.state.panel
-    ok, message = hypr.set_transform(panel, transform)
-    if not ok:
-        print(message, file=sys.stderr)  # pragma: no cover
-        return 1  # pragma: no cover
-    for name in (daemon.state.touch, daemon.state.pen):
-        if name:
-            hypr.set_device_transform(name, transform, panel)
-    print(json.dumps({"transform": transform, "panel": panel, "changed": True}))
+    results = hypr.rotate_transaction(
+        panel, transform, [daemon.state.touch, daemon.state.pen]
+    )
+    failed = [
+        f"{leg}: {message}"
+        for leg, (ok, message) in results.items()
+        if not ok
+    ]
+    if failed:
+        print("rotation incomplete — " + "; ".join(failed), file=sys.stderr)
+        print(
+            json.dumps(
+                {
+                    "transform": transform,
+                    "panel": panel,
+                    "changed": False,
+                    "failedLegs": [leg for leg, (ok, _) in results.items() if not ok],
+                }
+            )
+        )
+        return 1
+    print(
+        json.dumps(
+            {
+                "transform": transform,
+                "panel": panel,
+                "changed": True,
+                "legs": {leg: ok for leg, (ok, _) in results.items()},
+            }
+        )
+    )
     return 0
 
 

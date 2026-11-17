@@ -468,6 +468,7 @@ class FlatTurnTracking(unittest.TestCase):
         daemon = fold.FoldDaemon.__new__(fold.FoldDaemon)
         daemon.pending = set()
         daemon.next_device_retry = 0.0
+        daemon.next_rotation_retry = 0.0
         daemon.next_heartbeat = 0.0
         daemon.settings = fold.load_settings()
         daemon.state = fold.State()
@@ -704,6 +705,7 @@ class Mode(unittest.TestCase):
         self.daemon = fold.FoldDaemon.__new__(fold.FoldDaemon)
         self.daemon.pending = set()
         self.daemon.next_device_retry = 0.0
+        self.daemon.next_rotation_retry = 0.0
         self.daemon.next_heartbeat = 0.0
         self.daemon.settings = {
             "bookExitDeg": 190.0,
@@ -750,6 +752,7 @@ class BookMode(unittest.TestCase):
         daemon = fold.FoldDaemon.__new__(fold.FoldDaemon)
         daemon.pending = set()
         daemon.next_device_retry = 0.0
+        daemon.next_rotation_retry = 0.0
         daemon.next_heartbeat = 0.0
         daemon.settings = {"locked": True}
         daemon.hypr = self.StubHypr(2)
@@ -763,6 +766,7 @@ class BookMode(unittest.TestCase):
         daemon = fold.FoldDaemon.__new__(fold.FoldDaemon)
         daemon.pending = set()
         daemon.next_device_retry = 0.0
+        daemon.next_rotation_retry = 0.0
         daemon.next_heartbeat = 0.0
         daemon.settings = {"locked": True}
         daemon.hypr = self.StubHypr(3)
@@ -786,6 +790,7 @@ def bare_daemon(**settings):
     daemon = fold.FoldDaemon.__new__(fold.FoldDaemon)
     daemon.pending = set()
     daemon.next_device_retry = 0.0
+    daemon.next_rotation_retry = 0.0
     daemon.next_heartbeat = 0.0
     daemon.settings = {
         "mapping": "standard",
@@ -1135,6 +1140,7 @@ class HingeTelemetryCadenceTests(unittest.TestCase):
         daemon = fold.FoldDaemon.__new__(fold.FoldDaemon)
         daemon.pending = set()
         daemon.next_device_retry = 0.0
+        daemon.next_rotation_retry = 0.0
         daemon.next_heartbeat = 0.0
         daemon.settings = fold.load_settings()
         daemon.state = fold.State()
@@ -1441,17 +1447,12 @@ class HyprlandTests(unittest.TestCase):
 
 
 class RotationTransactionTests(unittest.TestCase):
-    """Panel, pen and finger must move together, in one round trip.
+    """Panel, pen and finger each report their own result.
 
-    On Windows the display driver committed all three at once, so there was no
-    interval in which the picture had turned and the input had not. Here each
-    call is its own `hyprctl eval`, so three sequential ones can land either
-    side of a compositor reload and leave the pen rotated against the panel.
-
-    Hyprland's Lua config is evaluated as a chunk rather than an expression, so
-    several statements separated by `;` go in one `eval`. That was verified
-    against the running compositor before being relied on: panel + finger + pen
-    in a single call returns `ok` and applies.
+    One Lua chunk is one round trip but not one commit: a failed digitizer
+    statement still lets the compositor answer `ok`, and Hyprland reports no
+    tablet transform afterwards to catch it. Per-leg calls are the only way to
+    know which leg needs retrying.
     """
 
     TOUCH = "wacom-pen-and-multitouch-sensor-finger"
@@ -1479,33 +1480,45 @@ class RotationTransactionTests(unittest.TestCase):
         }
         return hypr
 
-    def test_the_whole_rotation_is_a_single_call(self):
+    def test_each_leg_is_a_call_with_its_own_result(self):
         hypr = self._hypr()
-        ok, msg = hypr.rotate_transaction("eDP-1", 3, [self.TOUCH, self.PEN])
-        self.assertTrue(ok, msg)
-        self.assertEqual(len(self.calls), 1)
+        results = hypr.rotate_transaction("eDP-1", 3, [self.TOUCH, self.PEN])
+        self.assertEqual(set(results), {"panel", "finger", "pen"})
+        self.assertTrue(all(ok for ok, _ in results.values()))
+        self.assertEqual(len(self.calls), 3)
 
-    def test_that_one_call_carries_the_panel_and_both_nodes(self):
+    def test_the_calls_carry_the_panel_and_both_nodes(self):
         hypr = self._hypr()
         hypr.rotate_transaction("eDP-1", 3, [self.TOUCH, self.PEN])
-        lua = self.calls[0][1]
+        lua = "\n".join(call[1] for call in self.calls)
         self.assertIn("hl.monitor(", lua)
         self.assertIn("transform = 3", lua)
         self.assertIn(self.TOUCH, lua)
         self.assertIn(self.PEN, lua)
-        # Three statements in one chunk, not three evaluations.
-        self.assertEqual(lua.count("hl."), 3)
 
     def test_a_missing_device_is_skipped_rather_than_failing_the_rotation(self):
-        # The daemon only knows about the nodes Hyprland reported. An absent
-        # one must not leave a stray `hl.device({ name = , ...})` in the chunk,
-        # which is a Lua syntax error and would take the panel down with it.
         hypr = self._hypr()
-        ok, _ = hypr.rotate_transaction("eDP-1", 0, [None, self.PEN])
-        self.assertTrue(ok)
-        lua = self.calls[0][1]
+        results = hypr.rotate_transaction("eDP-1", 0, [None, self.PEN])
+        self.assertEqual(set(results), {"panel", "pen"})
+        lua = "\n".join(call[1] for call in self.calls)
         self.assertNotIn("name = null", lua)
         self.assertEqual(lua.count("hl.device("), 1)
+
+    def test_a_failed_leg_is_reported_without_hiding_the_others(self):
+        hypr = self._hypr()
+
+        def failing_run(argv, timeout=5.0):
+            self.calls.append(argv)
+            if self.TOUCH in str(argv):
+                return 1, "device disappeared"
+            return 0, "ok"
+
+        hypr.run = failing_run
+        results = hypr.rotate_transaction("eDP-1", 3, [self.TOUCH, self.PEN])
+        self.assertTrue(results["panel"][0])
+        self.assertEqual(results["finger"], (False, "device disappeared"))
+        self.assertTrue(results["pen"][0])
+        self.assertEqual(len(self.calls), 3)
 
     def test_the_monitor_geometry_is_looked_up_once_not_per_rotation(self):
         # Re-deriving mode/position/scale means a `monitors -j` before every
@@ -1535,8 +1548,9 @@ class RotationTransactionTests(unittest.TestCase):
     def test_an_unknown_panel_fails_instead_of_emitting_a_broken_call(self):
         hypr = self._hypr()
         hypr.monitor = lambda name: None
-        ok, _msg = hypr.rotate_transaction("nope", 0, [])
-        self.assertFalse(ok)
+        results = hypr.rotate_transaction("nope", 0, [])
+        self.assertFalse(results["panel"][0])
+        self.assertIn("nope", results["panel"][1])
         self.assertEqual(self.calls, [])
 
 
@@ -1555,6 +1569,7 @@ class ModeBandTests(unittest.TestCase):
         daemon = fold.FoldDaemon.__new__(fold.FoldDaemon)
         daemon.pending = set()
         daemon.next_device_retry = 0.0
+        daemon.next_rotation_retry = 0.0
         daemon.next_heartbeat = 0.0
         daemon.settings = {
             "bookExitDeg": 190.0,
@@ -2140,6 +2155,7 @@ class FoldDaemonStepTests(unittest.TestCase):
         self.daemon = fold.FoldDaemon.__new__(fold.FoldDaemon)
         self.daemon.pending = set()
         self.daemon.next_device_retry = 0.0
+        self.daemon.next_rotation_retry = 0.0
         self.daemon.next_heartbeat = 0.0
         self.daemon.settings = {
             "bookExitDeg": 190.0,
@@ -2235,7 +2251,11 @@ class FoldDaemonStepTests(unittest.TestCase):
         self.daemon.state.pen = "wacom-pen-and-multitouch-sensor-pen"
         self.daemon.state.panel = "eDP-1"
         self.daemon.emit = lambda payload: None
-        self.daemon.hypr.rotate_transaction.return_value = (True, "")
+        self.daemon.hypr.rotate_transaction.return_value = {
+            "panel": (True, ""),
+            "finger": (True, ""),
+            "pen": (True, ""),
+        }
         self.daemon.hypr.set_device_transform.return_value = (True, "")
         self.daemon.hypr.set_device_enabled.return_value = (True, "")
         # The shape `Hyprland.device_names()` actually returns: one key per kind
@@ -3099,6 +3119,7 @@ class FoldDaemonStepTests(unittest.TestCase):
             # than sleeping a real second.
             if number >= 2:
                 self.daemon.next_device_retry = 0.0
+                self.daemon.next_rotation_retry = 0.0
 
         with patch.object(self.daemon, "restore_devices", return_value=True):
             self._drive_loop(4, on_pose=expire_cooldown)
@@ -4177,10 +4198,9 @@ class CmdRotateTests(unittest.TestCase):
         entry = written["bar"]["layout"]["right"][0]
         self.assertIs(entry["locked"], True)
 
-    def test_the_lock_is_written_before_the_turn(self):
-        # The daemon re-asserts the transform it thinks is right, so a turn
-        # issued without the lock already in place is a turn it undoes on its
-        # next pass.
+    def test_the_lock_is_written_after_a_successful_turn(self):
+        # It used to go in first, so a failed pen transform still left the
+        # screen locked with an unturned digitizer.
         settings = fold.load_settings()
         self.assertIs(settings["locked"], False)
         with tempfile.TemporaryDirectory() as td:
@@ -4201,6 +4221,40 @@ class CmdRotateTests(unittest.TestCase):
                 self.assertIs(entry["locked"], True)
             finally:
                 fold.SHELL_JSON = real
+
+    def test_a_failed_leg_leaves_rotation_unlocked_and_reports_the_leg(self):
+        with tempfile.TemporaryDirectory() as td:
+            real = fold.SHELL_JSON
+            fold.SHELL_JSON = Path(td) / "shell.json"
+            fold.SHELL_JSON.write_text(
+                json.dumps(
+                    {
+                        "bar": {
+                            "layout": {"right": [{"id": "juanmanueldaza.yoga260-fold"}]}
+                        }
+                    }
+                )
+            )
+            failed = {
+                "panel": (True, ""),
+                "finger": (False, "device disappeared"),
+                "pen": (True, ""),
+            }
+            errors = io.StringIO()
+            try:
+                with (
+                    patch.object(
+                        fold.Hyprland, "rotate_transaction", return_value=failed
+                    ),
+                    contextlib.redirect_stderr(errors),
+                ):
+                    rc = fold.cmd_rotate(fold.load_settings(), "next", force=True)
+                entry = fold.shell_entry()
+            finally:
+                fold.SHELL_JSON = real
+        self.assertNotEqual(rc, 0)
+        self.assertIsNot(entry.get("locked"), True)
+        self.assertIn("finger", errors.getvalue())
 
 
 class CmdDebugTests(unittest.TestCase):
@@ -4336,6 +4390,7 @@ class FoldDaemonRunTests(unittest.TestCase):
         daemon = fold.FoldDaemon.__new__(fold.FoldDaemon)
         daemon.pending = set()
         daemon.next_device_retry = 0.0
+        daemon.next_rotation_retry = 0.0
         daemon.next_heartbeat = 0.0
         daemon.settings = {"pollSec": 0.001, "verifySec": 0.001}
         daemon.state = fold.State()
@@ -4485,6 +4540,7 @@ class PollLockStateTests(unittest.TestCase):
         daemon = fold.FoldDaemon.__new__(fold.FoldDaemon)
         daemon.pending = set()
         daemon.next_device_retry = 0.0
+        daemon.next_rotation_retry = 0.0
         daemon.next_heartbeat = 0.0
         daemon.state = fold.State()
         script = {"values": list(locked)}
@@ -4536,6 +4592,7 @@ class AnnounceTests(unittest.TestCase):
         self.daemon = fold.FoldDaemon.__new__(fold.FoldDaemon)
         self.daemon.pending = set()
         self.daemon.next_device_retry = 0.0
+        self.daemon.next_rotation_retry = 0.0
         self.daemon.next_heartbeat = 0.0
         self.daemon.state = fold.State()
         self.daemon.state.folded = False
@@ -4570,18 +4627,82 @@ class AnnounceTests(unittest.TestCase):
         run_mock.assert_not_called()
 
 
+class RotationLegTests(unittest.TestCase):
+    """A rotation is only complete when panel, pen and finger all agree."""
+
+    TOUCH = "wacom-pen-and-multitouch-sensor-finger"
+    PEN = "wacom-pen-and-multitouch-sensor-pen"
+
+    def setUp(self):
+        self.daemon = fold.FoldDaemon.__new__(fold.FoldDaemon)
+        self.daemon.pending = set()
+        self.daemon.next_device_retry = 0.0
+        self.daemon.next_rotation_retry = 0.0
+        self.daemon.next_heartbeat = 0.0
+        self.daemon.state = fold.State()
+        self.daemon.state.panel = "eDP-1"
+        self.daemon.state.touch = self.TOUCH
+        self.daemon.state.pen = self.PEN
+        self.daemon.state.transform = 0
+        self.daemon.decision_since = time.monotonic()
+        self.daemon.hypr = MagicMock()
+        self.daemon.hypr.rotate_transaction.return_value = {
+            "panel": (True, ""),
+            "finger": (False, "device disappeared"),
+            "pen": (True, ""),
+        }
+
+    def test_a_partial_rotation_is_not_recorded_as_applied(self):
+        self.daemon.apply(3)
+        self.assertEqual(self.daemon.state.transform, 0)
+        self.assertFalse(self.daemon.state.verified)
+        self.assertIn("finger", self.daemon.state.last_error)
+        self.assertFalse(self.daemon.state.rotation_legs["finger"])
+        self.assertTrue(self.daemon.state.rotation_legs["panel"])
+        self.assertIn(fold.PENDING_DIGITIZER, self.daemon.pending)
+        self.assertGreater(self.daemon.next_rotation_retry, time.monotonic())
+
+    def test_an_incomplete_rotation_is_retried_after_the_cooldown(self):
+        self.daemon.apply(3)
+        calls = self.daemon.hypr.rotate_transaction.call_count
+        self.daemon.verify()
+        self.assertEqual(self.daemon.hypr.rotate_transaction.call_count, calls)
+        self.daemon.hypr.rotate_transaction.return_value = {
+            "panel": (True, ""),
+            "finger": (True, ""),
+            "pen": (True, ""),
+        }
+        self.daemon.next_rotation_retry = 0.0
+        self.daemon.verify()
+        self.assertEqual(self.daemon.state.transform, 3)
+        self.assertTrue(self.daemon.state.verified)
+        self.assertNotIn(fold.PENDING_DIGITIZER, self.daemon.pending)
+
+    def test_each_leg_is_published_in_status(self):
+        self.daemon.apply(3)
+        legs = self.daemon.state.as_dict()["rotationLegs"]
+        self.assertEqual(set(legs), {"panel", "finger", "pen"})
+        self.assertFalse(legs["finger"])
+        self.assertTrue(legs["panel"])
+
+
 class VerifyTests(unittest.TestCase):
     def setUp(self):
         self.daemon = fold.FoldDaemon.__new__(fold.FoldDaemon)
         self.daemon.pending = set()
         self.daemon.next_device_retry = 0.0
+        self.daemon.next_rotation_retry = 0.0
         self.daemon.next_heartbeat = 0.0
         self.daemon.state = fold.State()
         self.daemon.state.panel = "eDP-1"
         self.daemon.state.transform = 0
         self.daemon.hypr = MagicMock()
         self.daemon.hypr.current_transform.return_value = 0
-        self.daemon.hypr.rotate_transaction.return_value = (True, "")
+        self.daemon.hypr.rotate_transaction.return_value = {
+            "panel": (True, ""),
+            "finger": (True, ""),
+            "pen": (True, ""),
+        }
         self.daemon.hypr.set_device_transform.return_value = (True, "")
         self.daemon.state.touch = None
         self.daemon.state.pen = None
@@ -4606,6 +4727,7 @@ class ResolveDevicesTests(unittest.TestCase):
         self.daemon = fold.FoldDaemon.__new__(fold.FoldDaemon)
         self.daemon.pending = set()
         self.daemon.next_device_retry = 0.0
+        self.daemon.next_rotation_retry = 0.0
         self.daemon.next_heartbeat = 0.0
         self.daemon.state = fold.State()
         self.daemon.settings = {

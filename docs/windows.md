@@ -127,23 +127,30 @@ the pass that detects a change is the pass that acts on it.
 **Result: 107 ms -> 53.55 ms per pass. A 2.0x cut in detection latency**, and
 the pass now fits inside the 100 ms schedule instead of overrunning it.
 
-## Taken: one transaction per rotation
+## Taken: one cached geometry, three leg results
 
 `apply()` cost four round-trips: a `monitors -j` to rebuild the
 mode/position/scale, then one `hyprctl eval` each for the panel, the pen and
-the finger.
+the finger. The invariant half of the monitor call is cached, and dropped
+whenever the monitor is re-read so a resolution change cannot leave a stale
+spec behind. A rotation therefore costs three `hyprctl` calls, not four.
 
-Hyprland's Lua config is evaluated as a chunk rather than an expression, so
-several statements separated by `;` go in a single `eval`. That was verified
-against the running compositor before being relied on — panel + finger + pen in
-one call returns `ok` and applies. The invariant half of the monitor call is
-cached, and dropped whenever the monitor is re-read so a resolution change
-cannot leave a stale spec behind.
+Those three were briefly collapsed into one `eval` carrying a Lua chunk with
+all three statements. It was one round trip but not one commit: if the panel
+statement landed and a digitizer statement failed, the compositor still
+answered `ok`, and the daemon recorded a complete rotation with a turned
+picture and an unturned pen. Hyprland reports no transform for tablets in
+`devices -j`, so there is no way to check afterwards which leg missed. The
+chunk was split back into per-leg calls so each result is known, published as
+`state.rotationLegs`, and retried on a one-second cooldown while any leg is
+outstanding. A manual `rotate` writes the lock only after all three legs
+succeed, rather than locking a screen whose pen never turned.
 
-**Result, measured on the running compositor: 4 `hyprctl` calls -> 1** (warm),
-carrying all three statements in one chunk.
+**Result: 4 `hyprctl` calls -> 3** (warm), with per-leg success instead of a
+single optimistic boolean. The missing round trip was bought back; the ability
+to know the rotation actually happened was not negotiable.
 
-Device enable/disable is deliberately *not* folded into that call. It is a
+Device enable/disable is deliberately *not* folded into those calls. It is a
 different kind of change with its own lock-screen guard, and the ordering
 between them is load-bearing. See `set_devices`.
 

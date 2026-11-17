@@ -106,8 +106,10 @@ Note that the two nodes need turning **separately**. They are one physical
 digitizer read out twice, Hyprland treats them as two devices, and the pen will
 not follow the panel on its own.
 
-`$fold rotate right --force` turns the panel and both digitizer nodes, in three
-separate `hyprctl eval` calls rather than the daemon's single transaction chunk.
+`$fold rotate right --force` turns the panel and both digitizer nodes, in the
+same three separate `hyprctl eval` calls the daemon uses. Each leg reports its
+own result: a failed digitizer stops the command before the rotation lock is
+written, instead of leaving a turned panel with an unturned pen.
 It does **not** put anything back when you are done: there is no restore path. A
 hand turn writes `locked: true` into `shell.json` and leaves the panel turned,
 which is how a tablet behaves and also how you end up stuck looking at a portrait
