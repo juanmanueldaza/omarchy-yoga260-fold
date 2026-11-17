@@ -4346,15 +4346,11 @@ def _apply_rotation(
 
 
 def cmd_lock(settings: dict[str, Any], action: str) -> int:
-    entry = shell_entry()
-    # `shell_entry` returns None when shell.json could not be read at all -- it is
-    # missing, or a read caught the shell halfway through rewriting it. That is
-    # exactly the moment the bar's Lock button can be pressed, and this used to
-    # raise AttributeError on the None, so the one control that has to survive a
-    # torn read died on it. Read the current value only if there is a read to
-    # read, and let the write below report the failure properly: it cannot succeed
-    # either, and it already says why.
-    current = bool(entry.get("locked")) if entry else False
+    # `settings` comes from load_settings(), which already coerces a hand-edited
+    # "false"/"off"/0 to False. Reading the raw shell entry here made the string
+    # "false" truthy and toggled the wrong way, and raised on the None a torn read
+    # returns. The write below reports its own failure.
+    current = bool(settings.get("locked"))
     if action == "toggle":
         value = not current
     else:

@@ -3289,6 +3289,25 @@ class CLITests(unittest.TestCase):
         rc = fold.cmd_lock({}, "toggle")
         self.assertEqual(rc, 1)
 
+    def test_cmd_lock_toggle_uses_validated_settings_not_raw_json(self):
+        # A hand-edited "locked": "false" is a truthy string in raw JSON. The
+        # validated settings dict has already coerced it to False, so a toggle
+        # must lock, and the raw entry must not be consulted at all.
+        with (
+            patch.object(fold, "write_shell_entry", return_value=True) as write,
+            patch.object(fold, "shell_entry", return_value={"locked": "false"}) as raw,
+        ):
+            rc = fold.cmd_lock({"locked": False}, "toggle")
+        self.assertEqual(rc, 0)
+        raw.assert_not_called()
+        write.assert_called_once_with({"locked": True})
+
+    def test_cmd_lock_toggle_from_validated_true_unlocks(self):
+        with patch.object(fold, "write_shell_entry", return_value=True) as write:
+            rc = fold.cmd_lock({"locked": True}, "toggle")
+        self.assertEqual(rc, 0)
+        write.assert_called_once_with({"locked": False})
+
     def test_cmd_mapping(self):
         rc = fold.cmd_mapping({}, "standard")
         self.assertEqual(rc, 1)
